@@ -3920,6 +3920,37 @@ def test_dispatch_max_in_progress_spawns_up_to_cap(kanban_home, all_assignees_sp
     assert len(spawns) == 2, f"expected 2 spawns (cap 3 - 1 running), got {len(spawns)}"
 
 
+def test_dispatch_combined_caps_fill_single_remaining_slot(
+    kanban_home, all_assignees_spawnable
+):
+    """max_spawn + max_in_progress must refill a partially occupied board."""
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        for index, assignee in enumerate(["alice", "bob", "carol"]):
+            task_id = kb.create_task(
+                conn,
+                title=f"running-{index}",
+                assignee=assignee,
+            )
+            kb.claim_task(conn, task_id)
+        ready = kb.create_task(conn, title="ready", assignee="dana")
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_spawn=4,
+            max_in_progress=4,
+        )
+
+        assert spawns == [ready]
+        assert [task_id for task_id, _, _ in result.spawned] == [ready]
+        assert kb.get_task(conn, ready).status == "running"
+
+
 def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_spawnable):
     """Default None means no limit — all ready tasks are spawned."""
     spawns = []
