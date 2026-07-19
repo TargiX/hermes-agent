@@ -384,6 +384,7 @@ def _handle_show(args: dict, **kw) -> str:
             runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
+            relations = kb.list_task_relations(conn, tid)
 
             def _task_dict(t):
                 return {
@@ -406,6 +407,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "status": r.status, "outcome": r.outcome,
                     "summary": r.summary, "error": r.error,
                     "metadata": r.metadata,
+                    "session_id": r.session_id,
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
@@ -413,6 +415,16 @@ def _handle_show(args: dict, **kw) -> str:
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
+                "relations": [
+                    {
+                        "source_task_id": relation.source_task_id,
+                        "target_task_id": relation.target_task_id,
+                        "relation": relation.relation,
+                        "created_by": relation.created_by,
+                        "created_at": relation.created_at,
+                    }
+                    for relation in relations
+                ],
                 "comments": [
                     {"author": c.author, "body": c.body,
                      "created_at": c.created_at}
@@ -1079,6 +1091,7 @@ def _handle_create(args: dict, **kw) -> str:
         )
     body = args.get("body")
     parents = args.get("parents") or []
+    relations = args.get("relations") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
@@ -1122,6 +1135,21 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+    if not isinstance(relations, (list, tuple)):
+        return tool_error(
+            f"relations must be a list of objects, got {type(relations).__name__}"
+        )
+    relation_specs: list[tuple[str, str]] = []
+    for item in relations:
+        if not isinstance(item, dict):
+            return tool_error("each relations item must be an object")
+        source_task_id = str(item.get("source_task_id") or "").strip()
+        relation = str(item.get("relation") or "").strip().casefold()
+        if not source_task_id or not relation:
+            return tool_error(
+                "each relations item requires source_task_id and relation"
+            )
+        relation_specs.append((source_task_id, relation))
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1145,6 +1173,7 @@ def _handle_create(args: dict, **kw) -> str:
                 body=body,
                 assignee=str(assignee),
                 parents=tuple(parents),
+                relations=relation_specs,
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
@@ -1760,6 +1789,35 @@ KANBAN_CREATE_SCHEMA = {
                     "auto-promotes to 'ready'. Typical fan-in: list "
                     "all the researcher task ids when creating a "
                     "synthesizer task."
+                ),
+            },
+            "relations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "source_task_id": {"type": "string"},
+                        "relation": {
+                            "type": "string",
+                            "enum": [
+                                "informs",
+                                "implements",
+                                "reviews",
+                                "publishes",
+                                "recovers",
+                                "continues",
+                            ],
+                        },
+                    },
+                    "required": ["source_task_id", "relation"],
+                },
+                "description": (
+                    "Non-gating provenance edges from existing tasks to the "
+                    "new task. Use this when stages are related but dispatch "
+                    "must not wait for the source to become done: e.g. a "
+                    "review companion uses [{source_task_id: implementation, "
+                    "relation: 'reviews'}]. These edges power the exact PR "
+                    "hierarchy and never change readiness."
                 ),
             },
             "tenant": {

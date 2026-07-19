@@ -68,6 +68,51 @@ def _ra():
     return run_agent
 
 
+def _bind_kanban_run_session(session_id: str) -> None:
+    """Best-effort trusted join from a worker run to its Hermes session.
+
+    PR provenance fails closed later if this receipt is missing; agent startup
+    itself remains available so a temporary Kanban write problem can still be
+    diagnosed and reported by the worker.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    if not task_id or not raw_run_id or not session_id:
+        return
+    try:
+        run_id = int(raw_run_id)
+    except ValueError:
+        logger.warning(
+            "Kanban provenance: invalid HERMES_KANBAN_RUN_ID=%r", raw_run_id
+        )
+        return
+    try:
+        from hermes_cli import kanban_db
+
+        conn = kanban_db.connect()
+        try:
+            if not kanban_db.bind_run_session(
+                conn, task_id, run_id, session_id
+            ):
+                logger.warning(
+                    "Kanban provenance: refused session bind "
+                    "task=%s run=%s session=%s",
+                    task_id,
+                    run_id,
+                    session_id,
+                )
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning(
+            "Kanban provenance: failed to bind task=%s run=%s session=%s",
+            task_id,
+            run_id,
+            session_id,
+            exc_info=True,
+        )
+
+
 def _build_codex_gpt5_autoraise_notice(autoraise: Dict[str, Any]) -> str:
     """Build the one-time notice shown when Codex gpt-5.x raises compaction.
 
@@ -1290,6 +1335,8 @@ def init_agent(
         set_current_session_id(agent.session_id)
     except Exception:
         os.environ["HERMES_SESSION_ID"] = agent.session_id
+
+    _bind_kanban_run_session(agent.session_id)
 
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()

@@ -2101,6 +2101,22 @@ def _run_single_child(
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
+                "model": (
+                    getattr(child, "model", None)
+                    if isinstance(getattr(child, "model", None), str)
+                    else None
+                ),
+                "provider": (
+                    getattr(child, "provider", None)
+                    if isinstance(getattr(child, "provider", None), str)
+                    else None
+                ),
+                "session_id": (
+                    getattr(child, "session_id", None)
+                    if isinstance(getattr(child, "session_id", None), str)
+                    else None
+                ),
+                "role": getattr(child, "_delegate_role", None),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
@@ -2188,6 +2204,9 @@ def _run_single_child(
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
+        _provider = getattr(child, "provider", None)
+        _session_id = getattr(child, "session_id", None)
+        _role = getattr(child, "_delegate_role", None)
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
@@ -2196,6 +2215,9 @@ def _run_single_child(
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
+            "provider": _provider if isinstance(_provider, str) else None,
+            "session_id": _session_id if isinstance(_session_id, str) else None,
+            "role": _role if isinstance(_role, str) else None,
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (

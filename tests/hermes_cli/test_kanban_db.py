@@ -10,6 +10,7 @@ import sys
 import time
 import types
 import unittest.mock
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -2818,6 +2819,84 @@ def test_create_task_session_id_defaults_to_none(kanban_home):
         t = kb.get_task(conn, tid)
     assert t is not None
     assert t.session_id is None
+
+
+def test_bind_run_session_records_trusted_runtime_join(kanban_home):
+    with closing(kb.connect()) as conn:
+        tid = kb.create_task(conn, title="observable run", assignee="worker")
+        claimed = kb.claim_task(conn, tid, claimer="dispatcher")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        assert run_id is not None
+
+        assert kb.bind_run_session(conn, tid, run_id, "session-exact") is True
+        run = kb.get_run(conn, run_id)
+        assert run is not None
+        assert run.session_id == "session-exact"
+        assert any(
+            event.kind == "run_session_bound"
+            and event.run_id == run_id
+            and event.payload == {"session_id": "session-exact"}
+            for event in kb.list_events(conn, tid)
+        )
+
+
+def test_bind_run_session_refuses_stale_or_conflicting_identity(kanban_home):
+    with closing(kb.connect()) as conn:
+        tid = kb.create_task(conn, title="observable run", assignee="worker")
+        claimed = kb.claim_task(conn, tid, claimer="dispatcher")
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+
+        assert kb.bind_run_session(conn, tid, run_id, "session-one") is True
+        assert kb.bind_run_session(conn, tid, run_id, "session-two") is False
+        assert kb.bind_run_session(conn, tid, run_id + 1, "session-one") is False
+        assert kb.get_run(conn, run_id).session_id == "session-one"
+
+
+def test_agent_init_binds_scoped_worker_session(monkeypatch, kanban_home):
+    from agent.agent_init import _bind_kanban_run_session
+
+    with closing(kb.connect()) as conn:
+        tid = kb.create_task(conn, title="observable worker", assignee="worker")
+        claimed = kb.claim_task(conn, tid, claimer="dispatcher")
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    _bind_kanban_run_session("runtime-session")
+
+    with closing(kb.connect()) as conn:
+        assert kb.get_run(conn, run_id).session_id == "runtime-session"
+
+
+def test_semantic_task_relation_is_machine_readable_and_does_not_gate(kanban_home):
+    with closing(kb.connect()) as conn:
+        implementation = kb.create_task(
+            conn,
+            title="implementation awaiting review",
+            assignee="builder",
+            initial_status="blocked",
+        )
+        review = kb.create_task(
+            conn,
+            title="independent review",
+            assignee="reviewer",
+            relations=[(implementation, "reviews")],
+            created_by="lead",
+        )
+
+        # Unlike a dependency parent, the blocked implementation does not
+        # prevent the review companion from dispatching.
+        assert kb.get_task(conn, review).status == "ready"
+        assert kb.parent_ids(conn, review) == []
+        relations = kb.list_task_relations(conn, review)
+        assert len(relations) == 1
+        assert relations[0].source_task_id == implementation
+        assert relations[0].target_task_id == review
+        assert relations[0].relation == "reviews"
+        assert relations[0].created_by == "lead"
 
 
 def test_session_id_filters_listings(kanban_home):

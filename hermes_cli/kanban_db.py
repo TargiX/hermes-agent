@@ -133,6 +133,14 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_TASK_RELATIONS = {
+    "informs",
+    "implements",
+    "reviews",
+    "publishes",
+    "recovers",
+    "continues",
+}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
@@ -1029,6 +1037,7 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    session_id: Optional[str]
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -1053,6 +1062,11 @@ class Run:
             summary=row["summary"],
             metadata=meta,
             error=row["error"],
+            session_id=(
+                row["session_id"]
+                if "session_id" in row.keys() and row["session_id"]
+                else None
+            ),
         )
 
 
@@ -1062,6 +1076,15 @@ class Comment:
     task_id: str
     author: str
     body: str
+    created_at: int
+
+
+@dataclass
+class TaskRelation:
+    source_task_id: str
+    target_task_id: str
+    relation: str
+    created_by: Optional[str]
     created_at: int
 
 
@@ -1185,6 +1208,18 @@ CREATE TABLE IF NOT EXISTS task_links (
     PRIMARY KEY (parent_id, child_id)
 );
 
+-- Semantic provenance edges. Unlike task_links these NEVER gate dispatch;
+-- they record stage ownership such as evidence -> implementation -> review ->
+-- publication even when the source card must remain blocked during review.
+CREATE TABLE IF NOT EXISTS task_relations (
+    source_task_id TEXT NOT NULL,
+    target_task_id TEXT NOT NULL,
+    relation       TEXT NOT NULL,
+    created_by     TEXT,
+    created_at     INTEGER NOT NULL,
+    PRIMARY KEY (source_task_id, target_task_id, relation)
+);
+
 CREATE TABLE IF NOT EXISTS task_comments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -1228,7 +1263,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Trusted runtime session id bound by the worker after AIAgent creates
+    -- its session. This is the join key into state.db/session_model_usage for
+    -- exact provider/model provenance; it must never be supplied by a model.
+    session_id          TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1268,6 +1307,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
+CREATE INDEX IF NOT EXISTS idx_relations_source      ON task_relations(source_task_id);
+CREATE INDEX IF NOT EXISTS idx_relations_target      ON task_relations(target_task_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
@@ -2016,6 +2057,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
+    # Runs gained a trusted runtime-session join key after the original v1
+    # schema shipped. Historical rows remain NULL; completed workers that
+    # predate this column may still expose ``metadata.worker_session_id`` to
+    # provenance readers as an explicitly legacy fallback.
+    runs_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if runs_table_exists:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "session_id" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "session_id", "session_id TEXT"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_session_id "
+            "ON task_runs(session_id)"
+        )
+
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -2035,9 +2096,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # against any concurrent dispatcher, and the per-row UPDATE uses
     # ``current_run_id IS NULL`` as a CAS guard so a racing claim can't
     # produce an orphaned row if it interleaves with the backfill pass.
-    runs_exist = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
-    ).fetchone() is not None
+    runs_exist = runs_table_exists
     if runs_exist:
         with write_txn(conn):
             inflight = conn.execute(
@@ -2140,10 +2199,11 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, session_id TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
+            "CREATE INDEX idx_runs_session_id ON task_runs(session_id)",
         ),
     ),
     "kanban_notify_subs": (
@@ -2397,6 +2457,7 @@ def create_task(
     tenant: Optional[str] = None,
     priority: int = 0,
     parents: Iterable[str] = (),
+    relations: Iterable[tuple[str, str]] = (),
     triage: bool = False,
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
@@ -2491,6 +2552,18 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+    relation_specs: tuple[tuple[str, str], ...] = tuple(
+        (str(source).strip(), str(relation).strip().casefold())
+        for source, relation in relations
+        if source and relation
+    )
+    invalid_relations = sorted(
+        {relation for _, relation in relation_specs if relation not in VALID_TASK_RELATIONS}
+    )
+    if invalid_relations:
+        raise ValueError(
+            "invalid task relation(s): " + ", ".join(invalid_relations)
+        )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2611,6 +2684,14 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
+                if relation_specs:
+                    relation_sources = tuple(source for source, _ in relation_specs)
+                    missing = _find_missing_parents(conn, relation_sources)
+                    if missing:
+                        raise ValueError(
+                            "unknown related task(s): " + ", ".join(missing)
+                        )
+
                 # Project-linked worktree: a fresh worktree dir under the repo
                 # plus a deterministic branch (project slug + task id). Together
                 # these kill the random ``wt/<task-id>`` worker fallback and the
@@ -2667,6 +2748,13 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                for source_task_id, relation in relation_specs:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO task_relations "
+                        "(source_task_id, target_task_id, relation, created_by, created_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (source_task_id, task_id, relation, created_by, now),
+                    )
                 _append_event(
                     conn,
                     task_id,
@@ -2675,6 +2763,10 @@ def create_task(
                         "assignee": assignee,
                         "status": task_status,
                         "parents": list(parents),
+                        "relations": [
+                            {"source_task_id": source, "relation": relation}
+                            for source, relation in relation_specs
+                        ],
                         "tenant": tenant,
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
@@ -2899,6 +2991,83 @@ def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
         (task_id,),
     ).fetchall()
     return [r["child_id"] for r in rows]
+
+
+def add_task_relation(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    target_task_id: str,
+    relation: str,
+    *,
+    created_by: Optional[str] = None,
+) -> bool:
+    """Add a non-gating semantic edge between two real tasks.
+
+    Dependency links answer *when may this run?*; relations answer *what did
+    this stage do to that stage?* Keeping those concerns separate lets a
+    blocked implementation be reviewed without accidentally gating its review
+    companion while still preserving an exact, machine-readable audit graph.
+    """
+    relation = str(relation or "").strip().casefold()
+    if relation not in VALID_TASK_RELATIONS:
+        raise ValueError(
+            f"relation must be one of {sorted(VALID_TASK_RELATIONS)}"
+        )
+    if source_task_id == target_task_id:
+        raise ValueError("a task relation cannot point to itself")
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE id IN (?, ?)",
+            (source_task_id, target_task_id),
+        ).fetchall()
+        if {row["id"] for row in existing} != {source_task_id, target_task_id}:
+            raise ValueError("task relation source and target must both exist")
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO task_relations "
+            "(source_task_id, target_task_id, relation, created_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                source_task_id,
+                target_task_id,
+                relation,
+                created_by,
+                int(time.time()),
+            ),
+        )
+        if cur.rowcount:
+            _append_event(
+                conn,
+                target_task_id,
+                "related",
+                {
+                    "source_task_id": source_task_id,
+                    "relation": relation,
+                    "created_by": created_by,
+                },
+            )
+        return cur.rowcount > 0
+
+
+def list_task_relations(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[TaskRelation]:
+    rows = conn.execute(
+        "SELECT * FROM task_relations "
+        "WHERE source_task_id=? OR target_task_id=? "
+        "ORDER BY created_at, source_task_id, target_task_id, relation",
+        (task_id, task_id),
+    ).fetchall()
+    return [
+        TaskRelation(
+            source_task_id=row["source_task_id"],
+            target_task_id=row["target_task_id"],
+            relation=row["relation"],
+            created_by=row["created_by"],
+            created_at=int(row["created_at"]),
+        )
+        for row in rows
+    ]
 
 
 def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
@@ -3295,6 +3464,56 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
+
+
+def bind_run_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    session_id: str,
+) -> bool:
+    """Bind a dispatcher-owned run to its trusted Hermes runtime session.
+
+    The dispatcher knows the task/run pair before the child starts, while the
+    child only knows its session id after :class:`AIAgent` initialisation. This
+    narrow CAS join is the authoritative bridge between those two stores. It
+    refuses stale runs and never overwrites a different session id, so a retry
+    cannot steal another attempt's provenance.
+    """
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return False
+    try:
+        run_id = int(run_id)
+    except (TypeError, ValueError):
+        return False
+
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE task_runs
+               SET session_id = ?
+             WHERE id = ?
+               AND task_id = ?
+               AND ended_at IS NULL
+               AND (session_id IS NULL OR session_id = ?)
+               AND EXISTS (
+                   SELECT 1 FROM tasks
+                    WHERE id = ? AND current_run_id = ?
+               )
+            """,
+            (session_id, run_id, task_id, session_id, task_id, run_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "run_session_bound",
+            {"session_id": session_id},
+            run_id=run_id,
+        )
+    return True
 
 
 def _synthesize_ended_run(
