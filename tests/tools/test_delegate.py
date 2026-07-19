@@ -753,6 +753,7 @@ class TestDelegateObservability(unittest.TestCase):
             mock_child.provider = "anthropic"
             mock_child.session_id = "child-session-exact"
             mock_child._delegate_role = "leaf"
+            mock_child.reasoning_config = {"enabled": True, "effort": "high"}
             mock_child.session_prompt_tokens = 5000
             mock_child.session_completion_tokens = 1200
             mock_child.run_conversation.return_value = {
@@ -779,6 +780,7 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertEqual(entry["provider"], "anthropic")
             self.assertEqual(entry["session_id"], "child-session-exact")
             self.assertEqual(entry["role"], "leaf")
+            self.assertEqual(entry["reasoning_effort"], "high")
             self.assertEqual(entry["exit_reason"], "completed")
             self.assertEqual(entry["tokens"]["input"], 5000)
             self.assertEqual(entry["tokens"]["output"], 1200)

@@ -1801,6 +1801,13 @@ def _run_single_child(
     """
     child_start = time.monotonic()
 
+    def _child_reasoning_effort() -> Optional[str]:
+        config = getattr(child, "reasoning_config", None)
+        if not isinstance(config, dict) or config.get("enabled") is False:
+            return None
+        effort = config.get("effort")
+        return str(effort) if effort else None
+
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
 
@@ -2117,6 +2124,7 @@ def _run_single_child(
                     else None
                 ),
                 "role": getattr(child, "_delegate_role", None),
+                "reasoning_effort": _child_reasoning_effort(),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
@@ -2218,6 +2226,7 @@ def _run_single_child(
             "provider": _provider if isinstance(_provider, str) else None,
             "session_id": _session_id if isinstance(_session_id, str) else None,
             "role": _role if isinstance(_role, str) else None,
+            "reasoning_effort": _child_reasoning_effort(),
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
