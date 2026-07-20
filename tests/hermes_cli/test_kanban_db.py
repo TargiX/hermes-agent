@@ -3004,6 +3004,32 @@ def test_agent_init_binds_scoped_worker_session(monkeypatch, kanban_home):
         assert kb.get_run(conn, run_id).session_id == "runtime-session"
 
 
+def test_background_review_does_not_rebind_worker_run(monkeypatch, kanban_home):
+    from agent.agent_init import _bind_kanban_run_session
+    from tools.skill_provenance import (
+        BACKGROUND_REVIEW,
+        reset_current_write_origin,
+        set_current_write_origin,
+    )
+
+    with closing(kb.connect()) as conn:
+        tid = kb.create_task(conn, title="observable worker", assignee="worker")
+        claimed = kb.claim_task(conn, tid, claimer="dispatcher")
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    token = set_current_write_origin(BACKGROUND_REVIEW)
+    try:
+        _bind_kanban_run_session("synthetic-review-session")
+    finally:
+        reset_current_write_origin(token)
+
+    with closing(kb.connect()) as conn:
+        assert kb.get_run(conn, run_id).session_id is None
+
+
 def test_semantic_task_relation_is_machine_readable_and_does_not_gate(kanban_home):
     with closing(kb.connect()) as conn:
         implementation = kb.create_task(

@@ -989,13 +989,31 @@ def spawn_background_review_thread(
         # deleted TERMINAL_CWD. The review has no terminal/file tool access and
         # skip_context_files=True, so it neither needs nor should inherit the
         # product workspace.
+        origin_token = None
         try:
             from agent.runtime_cwd import set_session_cwd
+            from tools.skill_provenance import (
+                BACKGROUND_REVIEW,
+                set_current_write_origin,
+            )
 
             set_session_cwd(str(Path.home()))
+            # Mark the fork before constructing AIAgent, not only before its
+            # first tool call. Agent initialization uses this to avoid binding
+            # the fork's synthetic session to the worker's Kanban run.
+            origin_token = set_current_write_origin(BACKGROUND_REVIEW)
         except Exception:
             pass
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        try:
+            _run_review_in_thread(agent, messages_snapshot, prompt)
+        finally:
+            if origin_token is not None:
+                try:
+                    from tools.skill_provenance import reset_current_write_origin
+
+                    reset_current_write_origin(origin_token)
+                except Exception:
+                    pass
 
     return _target, prompt
 

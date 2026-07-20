@@ -75,6 +75,19 @@ def _bind_kanban_run_session(session_id: str) -> None:
     itself remains available so a temporary Kanban write problem can still be
     diagnosed and reported by the worker.
     """
+    # A self-improvement fork inherits the worker's process environment but is
+    # not a new execution of that Kanban run. Binding its freshly generated
+    # constructor session would create noisy CAS failures (or steal provenance
+    # if the real worker had not bound yet). The fork is marked before AIAgent
+    # construction by agent.background_review.
+    try:
+        from tools.skill_provenance import is_background_review
+
+        if is_background_review():
+            return
+    except Exception:
+        pass
+
     task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
     raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
     if not task_id or not raw_run_id or not session_id:

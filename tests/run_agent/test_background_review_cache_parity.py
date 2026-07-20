@@ -224,6 +224,7 @@ def test_review_thread_rebinds_deleted_task_cwd(tmp_path, monkeypatch):
     """A completed scratch task must not break the self-improvement fork."""
     import agent.background_review as bg_review
     from agent.runtime_cwd import session_cwd_binding, set_session_cwd
+    from tools.skill_provenance import is_background_review
 
     stable_home = tmp_path / "stable-home"
     stable_home.mkdir()
@@ -234,6 +235,7 @@ def test_review_thread_rebinds_deleted_task_cwd(tmp_path, monkeypatch):
 
     def _capture(*_args, **_kwargs):
         captured["cwd"] = session_cwd_binding()
+        captured["is_background_review"] = is_background_review()
 
     with patch.object(bg_review, "_run_review_in_thread", _capture):
         target, _ = bg_review.spawn_background_review_thread(
@@ -242,6 +244,7 @@ def test_review_thread_rebinds_deleted_task_cwd(tmp_path, monkeypatch):
         target()
 
     assert captured["cwd"] == str(stable_home)
+    assert captured["is_background_review"] is True
 
 
 def test_review_fork_inherits_parent_reasoning_config():
