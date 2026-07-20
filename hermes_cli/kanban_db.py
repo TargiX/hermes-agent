@@ -7662,6 +7662,7 @@ def _record_task_failure(
     error: str,
     *,
     outcome: str,
+    summary: Optional[str] = None,
     failure_limit: int = None,
     force_trip: bool = False,
     release_claim: bool = False,
@@ -7691,6 +7692,12 @@ def _record_task_failure(
       run with the appropriate outcome. This just increments the
       counter; if the breaker trips, the task is re-transitioned
       ``ready → blocked`` and a ``gave_up`` event is emitted.
+
+    ``summary`` preserves a worker-produced checkpoint when the run ended
+    unsuccessfully after doing useful work (for example, the toolless summary
+    produced on iteration-budget exhaustion).  ``build_worker_context`` then
+    surfaces that checkpoint to the retry worker instead of making it restart
+    from the task body plus a generic timeout error.
 
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
@@ -7763,6 +7770,7 @@ def _record_task_failure(
                 run_id = _end_run(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
+                    summary=summary,
                     error=error[:500],
                     metadata={
                         "failures": failures,
@@ -7808,6 +7816,7 @@ def _record_task_failure(
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
+                    summary=summary,
                     error=error[:500],
                     metadata={"failures": failures},
                 )

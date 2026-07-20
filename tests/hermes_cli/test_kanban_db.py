@@ -1247,6 +1247,34 @@ def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
         assert task.consecutive_failures == 0
 
 
+def test_timed_out_attempt_preserves_retry_checkpoint_in_context(kanban_home):
+    """A budget-exhausted worker's summary is durable retry context."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ship the slice", assignee="worker")
+        kb.claim_task(conn, task_id)
+
+        tripped = kb._record_task_failure(
+            conn,
+            task_id,
+            error="Iteration budget exhausted (60/60)",
+            outcome="timed_out",
+            summary=(
+                "Implementation is complete in the persistent worktree; "
+                "resume from final browser verification."
+            ),
+            release_claim=True,
+            end_run=True,
+            failure_limit=2,
+        )
+
+        assert tripped is False
+        kb.claim_task(conn, task_id)
+        context = kb.build_worker_context(conn, task_id)
+        assert "Attempt 1 — timed_out" in context
+        assert "Implementation is complete in the persistent worktree" in context
+        assert "resume from final browser verification" in context
+
+
 def test_recompute_ready_recovers_below_limit(kanban_home):
     """recompute_ready auto-recovers blocked tasks that haven't hit the
     failure limit yet — the counter is preserved across recovery."""

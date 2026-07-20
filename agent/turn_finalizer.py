@@ -167,6 +167,12 @@ def finalize_turn(
                             "iterations"
                         ),
                         outcome="timed_out",
+                        summary=(
+                            final_response.strip()
+                            if isinstance(final_response, str)
+                            and final_response.strip()
+                            else None
+                        ),
                         release_claim=True,
                         end_run=True,
                         event_payload_extra={
