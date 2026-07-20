@@ -391,22 +391,21 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
-    runs (attempt history), and the last N events."""
+    runs (attempt history), and the last N events. ``compact=true`` returns
+    only the task, graph edges, latest run receipt, and history counts."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
     board = args.get("board")
+    compact = bool(args.get("compact", False))
     try:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
             if task is None:
                 return tool_error(f"task {tid} not found")
-            comments = kb.list_comments(conn, tid)
-            events = kb.list_events(conn, tid)
-            runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
             relations = kb.list_task_relations(conn, tid)
@@ -436,20 +435,52 @@ def _handle_show(args: dict, **kw) -> str:
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
+            relation_rows = [
+                {
+                    "source_task_id": relation.source_task_id,
+                    "target_task_id": relation.target_task_id,
+                    "relation": relation.relation,
+                    "created_by": relation.created_by,
+                    "created_at": relation.created_at,
+                }
+                for relation in relations
+            ]
+
+            if compact:
+                latest_run = kb.latest_run(conn, tid)
+                counts = conn.execute(
+                    """
+                    SELECT
+                      (SELECT COUNT(*) FROM task_comments WHERE task_id = ?) AS comments,
+                      (SELECT COUNT(*) FROM task_events WHERE task_id = ?) AS events,
+                      (SELECT COUNT(*) FROM task_runs WHERE task_id = ?) AS runs
+                    """,
+                    (tid, tid, tid),
+                ).fetchone()
+                return json.dumps({
+                    "task": _task_dict(task),
+                    "parents": parents,
+                    "children": children,
+                    "relations": relation_rows,
+                    "latest_run": (
+                        _run_dict(latest_run) if latest_run is not None else None
+                    ),
+                    "history_counts": {
+                        "comments": int(counts["comments"]),
+                        "events": int(counts["events"]),
+                        "runs": int(counts["runs"]),
+                    },
+                })
+
+            comments = kb.list_comments(conn, tid)
+            events = kb.list_events(conn, tid)
+            runs = kb.list_runs(conn, tid)
+
             return json.dumps({
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
-                "relations": [
-                    {
-                        "source_task_id": relation.source_task_id,
-                        "target_task_id": relation.target_task_id,
-                        "relation": relation.relation,
-                        "created_by": relation.created_by,
-                        "created_at": relation.created_at,
-                    }
-                    for relation in relations
-                ],
+                "relations": relation_rows,
                 "comments": [
                     {"author": c.author, "body": c.body,
                      "created_at": c.created_at}
@@ -1436,12 +1467,15 @@ def _board_schema_prop() -> dict[str, str]:
 KANBAN_SHOW_SCHEMA = {
     "name": "kanban_show",
     "description": (
-        "Read a task's full state — title, body, assignee, parent task "
+        "Read a task's state — title, body, assignee, parent task "
         "handoffs, your prior attempts on this task if any, comments, "
         "and recent events. Use this to (re)orient yourself before "
         "starting work, especially on retries. The response includes a "
         "pre-formatted ``worker_context`` string suitable for inclusion "
-        "verbatim in your reasoning."
+        "verbatim in your reasoning. Orchestrators should start with "
+        "``compact=true`` to read only the latest structured run receipt "
+        "and graph edges, then request full history only when that receipt "
+        "is missing, malformed, or contradicts live state."
     ),
     "parameters": {
         "type": "object",
@@ -1449,6 +1483,15 @@ KANBAN_SHOW_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "compact": {
+                "type": "boolean",
+                "description": (
+                    "Return a metadata-first view containing the task, graph "
+                    "edges, latest run, and history counts, while omitting "
+                    "comments, event history, prior runs, and worker_context. "
+                    "Defaults to false for backward compatibility."
+                ),
             },
             "board": _board_schema_prop(),
         },

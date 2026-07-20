@@ -239,6 +239,32 @@ def test_show_explicit_task_id(worker_env):
     assert d["task"]["id"] == other
 
 
+def test_show_compact_returns_latest_receipt_without_full_history(worker_env):
+    from tools import kanban_tools as kt
+
+    completed = json.loads(kt._handle_complete({
+        "summary": "compact handoff",
+        "metadata": {
+            "schema": "phosphene-review/v1",
+            "verdict": "APPROVE",
+        },
+    }))
+    assert completed.get("ok") is True
+
+    shown = json.loads(kt._handle_show({
+        "task_id": worker_env,
+        "compact": True,
+    }))
+    assert shown["task"]["status"] == "done"
+    assert shown["latest_run"]["summary"] == "compact handoff"
+    assert shown["latest_run"]["metadata"]["verdict"] == "APPROVE"
+    assert shown["history_counts"]["runs"] == 1
+    assert "comments" not in shown
+    assert "events" not in shown
+    assert "runs" not in shown
+    assert "worker_context" not in shown
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
