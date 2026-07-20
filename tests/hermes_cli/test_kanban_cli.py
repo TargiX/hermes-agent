@@ -236,6 +236,26 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_list_json_exposes_typed_review_handoff(kanban_home):
+    """Supervisors can distinguish frozen review state from human blockers."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="frozen implementation", assignee="alice")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="review-required: frozen head",
+            kind="review_required",
+        )
+
+    payload = json.loads(kc.run_slash("list --json"))
+    task = next(row for row in payload if row["id"] == task_id)
+    assert task["status"] == "blocked"
+    assert task["block_kind"] == "review_required"
+    assert task["block_recurrences"] == 0
+
+
 def test_run_slash_usage_error_returns_message(kanban_home):
     # Missing required argument for create
     out = kc.run_slash("create")

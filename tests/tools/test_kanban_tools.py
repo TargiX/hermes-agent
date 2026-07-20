@@ -848,6 +848,28 @@ def test_block_goal_mode_allows_needs_input_kind(monkeypatch, tmp_path):
         conn.close()
 
 
+def test_block_goal_mode_allows_review_required_kind(monkeypatch, tmp_path):
+    """A completed goal may stop at its independent-review boundary."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    out = kt._handle_block(
+        {"reason": "review-required: frozen head", "kind": "review_required"}
+    )
+    data = json.loads(out)
+    assert data.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "review_required"
+        assert task.block_recurrences == 0
+    finally:
+        conn.close()
+
+
 def test_block_non_goal_mode_task_unaffected_by_new_gate(worker_env):
     """The new gate only applies to goal_mode tasks — plain tasks must keep
     blocking freely with no kind, exactly as before this fix."""

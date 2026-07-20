@@ -179,7 +179,9 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset(
+    {"dependency", "needs_input", "review_required"}
+)
 
 
 def _goal_judge_available() -> bool:
@@ -1558,10 +1560,12 @@ KANBAN_BLOCK_SCHEMA = {
         "goes to todo and auto-resumes when that task finishes, no human "
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
-        "``reason`` is shown to the human on the board. If a task keeps "
-        "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
+        "no agent can do), 'transient' (a flaky failure that may clear), or "
+        "'review_required' (implementation is frozen and awaiting an "
+        "independent review; this is lifecycle state, not a failure). "
+        "``reason`` is shown to the human on the board. Repeated same-kind "
+        "failure/input re-blocks auto-escalate to triage; review handoffs do "
+        "not. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
     ),
     "parameters": {
@@ -1581,10 +1585,18 @@ KANBAN_BLOCK_SCHEMA = {
             },
             "kind": {
                 "type": "string",
-                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "enum": [
+                    "dependency",
+                    "needs_input",
+                    "capability",
+                    "transient",
+                    "review_required",
+                ],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
+                    "resumes automatically; 'review_required' parks a frozen "
+                    "artifact without failure escalation; the others surface "
+                    "to a human. "
                     "Omit only if none apply."
                 ),
             },

@@ -10,6 +10,8 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 * ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
   each same-cause re-block after an unblock increments ``block_recurrences``,
   and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+* ``review_required`` blocks are healthy frozen-artifact handoffs. They stay
+  blocked without accumulating failure recurrences across review/rework cycles.
 * ``unblock_task`` deliberately does NOT reset ``block_recurrences`` (the
   amnesia that let the loop run unbounded).
 * A successful ``complete_task`` resets the loop memory.
@@ -128,6 +130,42 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         payload = events[-1].payload or {}
         assert payload.get("recurrences") == 2
         assert payload.get("kind") == "capability"
+
+
+def test_review_required_reblock_never_routes_to_triage(kanban_home: Path) -> None:
+    """A REQUEST_CHANGES cycle is normal lifecycle progress, not a block loop."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="review-required: frozen head one",
+            kind="review_required",
+        )
+        first = kb.get_task(conn, tid)
+        assert first.status == "blocked"
+        assert first.block_kind == "review_required"
+        assert first.block_recurrences == 0
+
+        assert kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="review-required: corrected frozen head two",
+            kind="review_required",
+        )
+        second = kb.get_task(conn, tid)
+        assert second.status == "blocked"
+        assert second.block_kind == "review_required"
+        assert second.block_recurrences == 0
+        blocked_events = [
+            event
+            for event in kb.list_events(conn, tid)
+            if event.kind == "blocked"
+        ]
+        assert blocked_events
+        assert blocked_events[-1].payload.get("kind") == "review_required"
 
 
 # ---------------------------------------------------------------------------

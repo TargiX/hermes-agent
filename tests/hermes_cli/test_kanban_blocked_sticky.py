@@ -64,6 +64,7 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
         assert kb.block_task(
             conn, tid,
             reason="review-required: please verify ACL change",
+            kind="review_required",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.get_task(conn, tid).status == "blocked"
@@ -90,6 +91,7 @@ def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Pa
         kb.block_task(
             conn, child,
             reason="review-required: child needs sign-off",
+            kind="review_required",
             expected_run_id=kb.get_task(conn, child).current_run_id,
         )
         assert kb.get_task(conn, child).status == "blocked"
@@ -186,6 +188,7 @@ def test_unblock_clears_sticky_state_and_lets_block_recover(kanban_home: Path) -
         kb.block_task(
             conn, tid,
             reason="review-required: ...",
+            kind="review_required",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.unblock_task(conn, tid)

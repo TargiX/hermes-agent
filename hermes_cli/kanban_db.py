@@ -122,7 +122,13 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {
+    "dependency",
+    "needs_input",
+    "capability",
+    "transient",
+    "review_required",
+}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -5483,6 +5489,12 @@ def block_task(
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
 
+    * ``review_required`` — implementation is complete and frozen, but an
+      independent reviewer must inspect the artifact before publication. This
+      is a normal lifecycle handoff rather than a failure or human-input loop,
+      so it stays sticky in ``blocked`` and never accumulates recurrences or
+      routes to ``triage`` when a REQUEST_CHANGES cycle returns a new head.
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
@@ -5542,6 +5554,53 @@ def block_task(
                 {"reason": reason, "kind": kind}, run_id=run_id,
             )
             routed_to = "todo"
+            _blocked_task = get_task(conn, task_id)
+            _fire_kanban_lifecycle_hook(
+                "kanban_task_blocked",
+                task_id,
+                board=get_current_board(),
+                assignee=_blocked_task.assignee if _blocked_task else None,
+                run_id=run_id,
+                reason=reason,
+            )
+            return True
+
+        # A frozen implementation waiting for independent review is healthy
+        # lifecycle state, not an error loop. The same implementation card can
+        # legitimately travel through review -> REQUEST_CHANGES -> rework ->
+        # review again, so recurrence counting would eventually misclassify
+        # successful iteration as a triage incident.
+        if kind == "review_required":
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'blocked',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL,
+                       block_kind    = ?,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                (kind, task_id) if expected_run_id is None
+                else (kind, task_id, int(expected_run_id)),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn, task_id,
+                outcome="blocked", status="blocked",
+                summary=reason,
+            )
+            if run_id is None and reason:
+                run_id = _synthesize_ended_run(
+                    conn, task_id, outcome="blocked", summary=reason,
+                )
+            _append_event(
+                conn, task_id, "blocked",
+                {"reason": reason, "kind": kind}, run_id=run_id,
+            )
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",

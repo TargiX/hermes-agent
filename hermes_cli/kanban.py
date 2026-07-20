@@ -78,6 +78,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
         "session_id": t.session_id,
+        "block_kind": t.block_kind,
+        "block_recurrences": t.block_recurrences,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
@@ -582,9 +584,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help=(
             "Typed block reason. 'dependency' waits in todo (auto-promoted "
             "when parents finish, no human); 'needs_input'/'capability' go to "
-            "blocked for a human; 'transient' marks a maybe-flaky failure. "
-            "Repeated same-kind re-blocks after unblock route the task to "
-            "triage to break unblock loops. Omit for a generic block."
+            "blocked for a human; 'transient' marks a maybe-flaky failure; "
+            "'review_required' parks a frozen implementation for independent "
+            "review without counting it as an unblock loop. "
+            "Repeated same-kind failure/input re-blocks after unblock route "
+            "the task to triage. Omit for a generic block."
         ),
     )
 
