@@ -1112,6 +1112,52 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch
         assert kb.get_task(conn, t).status == "running"
 
 
+def test_max_runtime_preserves_explicit_heartbeat_as_retry_checkpoint(
+    kanban_home, monkeypatch,
+):
+    """An OS-level timeout should not discard a worker-authored checkpoint."""
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        task_id = kb.create_task(
+            conn,
+            title="checkpoint before timeout",
+            assignee="a",
+            max_runtime_seconds=10,
+        )
+        kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        run_id = kb.latest_run(conn, task_id).id
+        assert kb.heartbeat_worker(
+            conn,
+            task_id,
+            note="Mapped the failing route; only the focused browser proof remains.",
+            expected_run_id=run_id,
+        )
+        old_started = int(time.time()) - 20
+        conn.execute(
+            "UPDATE tasks SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 999999, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 999999, run_id),
+        )
+
+        timed_out = kb.enforce_max_runtime(
+            conn,
+            signal_fn=lambda _pid, _sig: None,
+        )
+
+        assert timed_out == [task_id]
+        latest = kb.latest_run(conn, task_id)
+        assert latest.outcome == "timed_out"
+        assert latest.summary == (
+            "Mapped the failing route; only the focused browser proof remains."
+        )
+
+
 def test_heartbeat_extends_claim(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")

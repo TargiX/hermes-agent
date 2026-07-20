@@ -3767,6 +3767,37 @@ def _append_respawn_guard_event(
     return True
 
 
+def _latest_run_checkpoint(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+) -> Optional[str]:
+    """Return the latest explicit heartbeat note for one run.
+
+    Automatic liveness heartbeats have no note and are intentionally ignored.
+    A worker-authored note is already durable board state; copying it into an
+    abnormal run summary lets the next attempt resume from that checkpoint
+    instead of paying to rediscover the same work.
+    """
+
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'heartbeat' "
+        "  AND payload IS NOT NULL "
+        "ORDER BY id DESC",
+        (task_id, int(run_id)),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            continue
+        note = payload.get("note") if isinstance(payload, dict) else None
+        if isinstance(note, str) and note.strip():
+            return note.strip()[:4000]
+    return None
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3793,6 +3824,11 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    if (
+        outcome in {"crashed", "timed_out", "gave_up", "reclaimed"}
+        and not str(summary or "").strip()
+    ):
+        summary = _latest_run_checkpoint(conn, task_id, run_id)
     conn.execute(
         """
         UPDATE task_runs
