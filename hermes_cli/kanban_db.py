@@ -58,14 +58,14 @@ worktrees so that research / ops / digital-twin workloads work alongside
 coding workloads.  See ``docs/hermes-kanban-v1-spec.pdf`` for the full
 design specification.
 
-Concurrency strategy: WAL mode + ``BEGIN IMMEDIATE`` for write
-transactions + compare-and-swap (CAS) updates on ``tasks.status`` and
-``tasks.claim_lock``.  SQLite serializes writers via its WAL lock, so at
-most one claimer can win any given task.  Losers observe zero affected
-rows and move on -- no retry loops, no distributed-lock machinery.
-The CAS coordination is **per-board** — each board is a separate DB,
-so multi-board installs get the same atomicity guarantees without any
-new locking.
+Concurrency strategy: rollback journal + a host-wide write lock +
+``BEGIN IMMEDIATE`` + compare-and-swap (CAS) updates on ``tasks.status``
+and ``tasks.claim_lock``. The DB mutations are tiny relative to model work,
+so serializing physical writers costs negligible throughput while avoiding
+the recurrent multi-runtime WAL/checkpoint corruption seen in heterogeneous
+gateway, worker, external-adapter, and dashboard fleets. At most one claimer
+can win any task; losers observe zero affected rows and move on. Coordination
+is **per-board** — each board is a separate DB and lock file.
 """
 
 from __future__ import annotations
@@ -1324,6 +1324,7 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
+_WRITE_LOCK_STATE = threading.local()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
@@ -1334,14 +1335,16 @@ DEFAULT_BUSY_TIMEOUT_MS = 120_000
 # lock (the in-process _INIT_LOCK + idempotent init remain the backstop).
 _INIT_LOCK_TIMEOUT_SECONDS = 10.0
 _INIT_LOCK_POLL_SECONDS = 0.05
+_WRITE_LOCK_POLL_SECONDS = 0.05
 
 
 def _resolve_busy_timeout_ms() -> int:
     """Return the SQLite busy timeout for Kanban connections.
 
     Kanban is the shared cross-profile dispatch bus, so worker stampedes are
-    expected.  A long busy timeout lets SQLite serialize writers via WAL rather
-    than surfacing transient ``database is locked`` failures during bursts.
+    expected. A long busy timeout lets rollback-journal readers drain and the
+    host-wide writer queue progress instead of surfacing transient
+    ``database is locked`` failures during bursts.
     """
     raw = os.environ.get("HERMES_KANBAN_BUSY_TIMEOUT_MS", "").strip()
     if raw:
@@ -1369,16 +1372,30 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _apply_kanban_journal_mode(conn: sqlite3.Connection) -> None:
+    """Pin Kanban to SQLite's rollback journal and verify the result.
+
+    Kanban writes are short control-plane transactions, while agent work runs
+    outside SQLite. DELETE mode therefore gives stronger compatibility across
+    mixed SQLite runtimes without constraining useful worker concurrency.
+    """
+    row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+    mode = str(row[0] if row else "").casefold()
+    if mode != "delete":
+        raise sqlite3.OperationalError(
+            f"kanban journal mode transition to DELETE failed; SQLite returned {mode!r}"
+        )
+
+
 @contextlib.contextmanager
 def _cross_process_init_lock(path: Path):
-    """Serialize first-connect WAL/schema/integrity setup across processes.
+    """Serialize first-connect journal/schema/integrity setup across processes.
 
     ``_INIT_LOCK`` only protects threads inside one Python process. During a
     dispatcher burst, many worker processes can all hit a fresh/legacy board at
     once and each process has an empty ``_INITIALIZED_PATHS`` cache. This file
-    lock keeps header validation, integrity probing, WAL activation, and
-    additive migrations single-file/single-writer across the whole host while
-    leaving normal post-init DB usage concurrent under SQLite WAL.
+    lock keeps header validation, integrity probing, journal-mode transition,
+    and additive migrations single-file/single-writer across the whole host.
 
     The acquire is **bounded** (issue #36644): the original bare blocking
     ``flock(LOCK_EX)`` had no timeout, so a single process stalled inside the
@@ -1437,6 +1454,88 @@ def _cross_process_init_lock(path: Path):
         yield
     finally:
         try:
+            if acquired:
+                if _IS_WINDOWS:
+                    import msvcrt
+
+                    handle.seek(0)
+                    locking = getattr(msvcrt, "locking")
+                    unlock_mode = getattr(msvcrt, "LK_UNLCK")
+                    locking(handle.fileno(), unlock_mode, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+@contextlib.contextmanager
+def _cross_process_write_lock(path: Path):
+    """Serialize every Kanban write transaction across host processes.
+
+    SQLite normally serializes writers itself. The Kanban board is also
+    opened by long-lived gateways, short-lived profile workers, external CLI
+    adapters, and dashboards that may embed different SQLite runtimes.  A
+    tiny host-level critical section around ``BEGIN IMMEDIATE`` through
+    ``COMMIT`` keeps that heterogeneous fleet to one physical writer without
+    reducing model/workspace concurrency.  Unlike the init lock, timing out
+    fails closed: proceeding without the lock would defeat the safety
+    boundary it exists to provide.
+    """
+    resolved = path.resolve()
+    lock_key = str(resolved)
+    held_paths = getattr(_WRITE_LOCK_STATE, "held_paths", set())
+    if lock_key in held_paths:
+        # Schema migrations can reuse write_txn while first-connect already
+        # owns the board lock. Re-enter on the same thread without opening a
+        # second flock handle (which would self-deadlock on macOS).
+        yield
+        return
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = resolved.with_name(resolved.name + ".write.lock")
+    handle = lock_path.open("a+b")
+    acquired = False
+    deadline = time.monotonic() + (_resolve_busy_timeout_ms() / 1000.0)
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            locking = getattr(msvcrt, "locking")
+            nb_lock = getattr(msvcrt, "LK_NBLCK")
+            while True:
+                try:
+                    handle.seek(0)
+                    locking(handle.fileno(), nb_lock, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(_WRITE_LOCK_POLL_SECONDS)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except (BlockingIOError, OSError):
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(_WRITE_LOCK_POLL_SECONDS)
+        if not acquired:
+            raise TimeoutError(
+                f"kanban write lock {lock_path} was not acquired within "
+                f"{_resolve_busy_timeout_ms()}ms; refusing an unlocked write"
+            )
+        _WRITE_LOCK_STATE.held_paths = {*held_paths, lock_key}
+        yield
+    finally:
+        try:
+            current_paths = getattr(_WRITE_LOCK_STATE, "held_paths", set())
+            _WRITE_LOCK_STATE.held_paths = current_paths - {lock_key}
             if acquired:
                 if _IS_WINDOWS:
                     import msvcrt
@@ -1559,7 +1658,7 @@ def _validate_sqlite_header(path: Path) -> None:
 
     ``sqlite3.connect()`` creates missing and zero-byte files, so those are
     allowed. Existing non-empty files must have the SQLite header before we
-    hand them to SQLite/WAL setup. This keeps corrupted page-0 failures from
+    hand them to SQLite setup. This keeps corrupted page-0 failures from
     being collapsed into a generic PRAGMA error and lets the gateway's corrupt
     board handling identify the board by fingerprint.
     """
@@ -1589,7 +1688,7 @@ def _validate_sqlite_header(path: Path) -> None:
     )
 
 
-class KanbanDbCorruptError(RuntimeError):
+class KanbanDbCorruptError(RuntimeError, sqlite3.DatabaseError):
     """Raised when an existing kanban DB file fails integrity checks.
 
     Fail-closed guard against silent recreation of a corrupt board file,
@@ -1597,15 +1696,124 @@ class KanbanDbCorruptError(RuntimeError):
     original path and the timestamped backup we made before refusing.
     """
 
-    def __init__(self, db_path: Path, backup_path: Optional[Path], reason: str):
+    def __init__(
+        self,
+        db_path: Path,
+        backup_path: Optional[Path],
+        reason: str,
+        *,
+        quarantine_path: Optional[Path] = None,
+    ):
         self.db_path = db_path
         self.backup_path = backup_path
         self.reason = reason
-        backup_str = str(backup_path) if backup_path is not None else "<backup failed>"
+        self.quarantine_path = quarantine_path
+        preservation = (
+            f"backup at {backup_path}"
+            if backup_path is not None
+            else "no new backup was created by this process"
+        )
+        quarantine = (
+            f" Board is quarantined by {quarantine_path}; archive that marker "
+            "only after replacing the DB with a separately validated recovery."
+            if quarantine_path is not None
+            else ""
+        )
         super().__init__(
             f"Refusing to open corrupt kanban DB at {db_path}: {reason}. "
-            f"Original preserved; backup at {backup_str}."
+            f"Original preserved; {preservation}.{quarantine}"
         )
+
+
+def _db_quarantine_path(path: Path) -> Path:
+    resolved = path.resolve()
+    return resolved.with_name(resolved.name + ".quarantine.json")
+
+
+def _read_db_quarantine_reason(path: Path) -> Optional[str]:
+    marker = _db_quarantine_path(path)
+    try:
+        raw = marker.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"quarantine marker exists but could not be read: {exc}"
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return "quarantine marker exists with unreadable metadata"
+    if not isinstance(payload, dict):
+        return "quarantine marker exists with invalid metadata"
+    reason = payload.get("reason")
+    return str(reason or "another process quarantined this board")[:2_000]
+
+
+def _mark_db_quarantined(path: Path, reason: str) -> Path:
+    """Atomically publish a fleet-wide fail-closed corruption verdict."""
+    resolved = path.resolve()
+    marker = _db_quarantine_path(resolved)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(
+        {
+            "schema": "hermes-kanban-quarantine/v1",
+            "db_path": str(resolved),
+            "reason": str(reason)[:2_000],
+            "created_at": int(time.time()),
+            "pid": os.getpid(),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ) + "\n"
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return marker
+    except OSError as exc:
+        _log.critical(
+            "could not create kanban quarantine marker %s: %s",
+            marker,
+            exc,
+        )
+        return marker
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+        raise
+    _INITIALIZED_PATHS.discard(str(resolved))
+    return marker
+
+
+def _raise_if_db_quarantined(path: Path) -> None:
+    reason = _read_db_quarantine_reason(path)
+    if reason is None:
+        return
+    resolved = path.resolve()
+    raise KanbanDbCorruptError(
+        resolved,
+        None,
+        f"board quarantined after a corruption verdict: {reason}",
+        quarantine_path=_db_quarantine_path(resolved),
+    )
+
+
+def _raise_corrupt_db(path: Path, reason: str) -> None:
+    """Quarantine first, preserve bytes second, then raise the verdict."""
+    resolved = path.resolve()
+    marker = _mark_db_quarantined(resolved, reason)
+    backup = _backup_corrupt_db(resolved)
+    raise KanbanDbCorruptError(
+        resolved,
+        backup,
+        reason,
+        quarantine_path=marker,
+    )
 
 
 def _backup_corrupt_db(path: Path) -> Optional[Path]:
@@ -1662,6 +1870,59 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     return candidate
 
 
+def clear_db_quarantine_after_recovery(path: Path) -> Path:
+    """Validate a recovered DB, then archive (never delete) its marker.
+
+    This is the only supported programmatic path out of fleet quarantine. It
+    deliberately does not repair in place: callers must first stop writers,
+    replace the DB with a separately recovered candidate, and then invoke this
+    gate.  The returned marker archive is retained as an audit receipt.
+    """
+    resolved = path.resolve()
+    marker = _db_quarantine_path(resolved)
+    if not marker.is_file():
+        raise FileNotFoundError(f"kanban quarantine marker not found: {marker}")
+    with _cross_process_init_lock(resolved):
+        with _cross_process_write_lock(resolved):
+            try:
+                _validate_sqlite_header(resolved)
+                probe = _sqlite_connect(resolved)
+                try:
+                    integrity = probe.execute("PRAGMA integrity_check").fetchone()
+                    foreign_keys = probe.execute("PRAGMA foreign_key_check").fetchall()
+                finally:
+                    probe.close()
+            except (OSError, sqlite3.DatabaseError) as exc:
+                raise KanbanDbCorruptError(
+                    resolved,
+                    None,
+                    f"recovery validation failed: {exc}",
+                    quarantine_path=marker,
+                ) from exc
+            if not integrity or (integrity[0] or "").casefold() != "ok":
+                raise KanbanDbCorruptError(
+                    resolved,
+                    None,
+                    f"recovery validation failed: integrity_check returned "
+                    f"{integrity[0] if integrity else '<no row>'!r}",
+                    quarantine_path=marker,
+                )
+            if foreign_keys:
+                raise KanbanDbCorruptError(
+                    resolved,
+                    None,
+                    f"recovery validation failed: foreign_key_check returned "
+                    f"{len(foreign_keys)} violation(s)",
+                    quarantine_path=marker,
+                )
+            archived = marker.with_name(
+                f"{marker.name}.cleared.{int(time.time())}.{os.getpid()}"
+            )
+            marker.replace(archived)
+            _INITIALIZED_PATHS.discard(str(resolved))
+            return archived
+
+
 def _guard_existing_db_is_healthy(path: Path) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
@@ -1693,6 +1954,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         resolved = path.resolve()
     except OSError:
         return
+    _raise_if_db_quarantined(resolved)
     try:
         if not resolved.exists() or resolved.stat().st_size == 0:
             return
@@ -1716,8 +1978,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
-    backup = _backup_corrupt_db(resolved)
-    raise KanbanDbCorruptError(resolved, backup, reason)
+    _raise_corrupt_db(resolved, reason)
 
 
 def connect(
@@ -1727,8 +1988,8 @@ def connect(
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
-    WAL mode is enabled on every connection; it's a no-op after the first
-    time but keeps the code robust if the DB file is ever re-created.
+    Rollback-journal mode is established during serialized first-connect
+    maintenance and verified on steady-state connections.
 
     The first connection to a given path auto-runs :func:`init_db` so
     fresh installs and test harnesses that construct `connect()`
@@ -1748,6 +2009,8 @@ def connect(
     else:
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_path = path.resolve()
+    _raise_if_db_quarantined(resolved_path)
 
     # Fast path: once THIS process has initialized this path, the expensive
     # first-open work (header validation, integrity probe, schema + additive
@@ -1758,17 +2021,21 @@ def connect(
     # unbounded flock with no timeout, no LOCK_NB, no recovery (#36644). On the
     # steady-state path there is nothing for the cross-process lock to protect
     # (no schema/migration writes run), so skip it entirely and just open the
-    # connection with WAL/pragmas under the cheap in-process _INIT_LOCK.
-    resolved = str(path.resolve())
+    # connection with verified journal/pragmas under the cheap in-process _INIT_LOCK.
+    resolved = str(resolved_path)
     if resolved in _INITIALIZED_PATHS:
         conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                mode_row = conn.execute("PRAGMA journal_mode").fetchone()
+                mode = str(mode_row[0] if mode_row else "").casefold()
+                if mode != "delete":
+                    raise sqlite3.OperationalError(
+                        f"kanban journal mode drifted to {mode!r}; refusing "
+                        "an unserialized mode transition on the fast path"
+                    )
                 conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute("PRAGMA secure_delete=ON")
                 conn.execute("PRAGMA cell_size_check=ON")
@@ -1778,51 +2045,54 @@ def connect(
         return conn
 
     with _cross_process_init_lock(path):
+        _raise_if_db_quarantined(path)
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
-        _validate_sqlite_header(path)
+        try:
+            _validate_sqlite_header(path)
+        except sqlite3.DatabaseError as exc:
+            _raise_corrupt_db(path, str(exc))
         # Full integrity probe — catches corruption past the header (malformed
         # pages, broken internal metadata). Cached per-path after first success
         # via _INITIALIZED_PATHS so it only runs once per process per path.
         _guard_existing_db_is_healthy(path)
         resolved = str(path.resolve())
-        conn = _sqlite_connect(path)
-        try:
-            conn.row_factory = sqlite3.Row
-            with _INIT_LOCK:
-                # WAL activation can take an exclusive lock while SQLite creates the
-                # sidecar files for a fresh database. Keep it in the same process-local
-                # critical section as schema initialization so concurrent gateway
-                # startup threads do not race before _INITIALIZED_PATHS is populated.
-                # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
-                # falls back to DELETE with one WARNING so kanban stays usable there.
-                # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-                # FULL (was NORMAL): fsync before each checkpoint to narrow the
-                # crash window that can leave a b-tree page header torn.
-                conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
-                conn.execute("PRAGMA foreign_keys=ON")
-                # Zero freed pages so a later torn write cannot expose stale
-                # cell content; persisted in the DB header for new DBs.
-                conn.execute("PRAGMA secure_delete=ON")
-                # Surface corrupt cells as read errors instead of silent
-                # wrong-data returns.
-                conn.execute("PRAGMA cell_size_check=ON")
-                needs_init = resolved not in _INITIALIZED_PATHS
-                if needs_init:
-                    # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
-                    # migrations. Cached so subsequent connect() calls in the same
-                    # process are cheap. The lock prevents same-process dispatcher
-                    # threads from racing through the additive ALTER TABLE pass with
-                    # stale PRAGMA snapshots during gateway startup.
-                    conn.executescript(SCHEMA_SQL)
-                    _migrate_add_optional_columns(conn)
-                    _INITIALIZED_PATHS.add(resolved)
-        except Exception:
-            conn.close()
-            raise
+        # Journal transition and schema maintenance are writes too. Serialize them
+        # with ordinary task mutations so a fresh worker process cannot run
+        # connection maintenance beside a gateway commit.
+        with _cross_process_write_lock(path):
+            _raise_if_db_quarantined(path)
+            conn = _sqlite_connect(path)
+            try:
+                conn.row_factory = sqlite3.Row
+                with _INIT_LOCK:
+                    # Journal-mode transitions require an exclusive SQLite lock.
+                    # Keep the transition inside both host locks so only one
+                    # process can perform connection maintenance at a time.
+                    _apply_kanban_journal_mode(conn)
+                    # FULL (was NORMAL): fsync before each checkpoint to narrow the
+                    # crash window that can leave a b-tree page header torn.
+                    conn.execute("PRAGMA synchronous=FULL")
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    # Zero freed pages so a later torn write cannot expose stale
+                    # cell content; persisted in the DB header for new DBs.
+                    conn.execute("PRAGMA secure_delete=ON")
+                    # Surface corrupt cells as read errors instead of silent
+                    # wrong-data returns.
+                    conn.execute("PRAGMA cell_size_check=ON")
+                    needs_init = resolved not in _INITIALIZED_PATHS
+                    if needs_init:
+                        # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
+                        # migrations. Cached so subsequent connect() calls in the same
+                        # process are cheap. The lock prevents same-process dispatcher
+                        # threads from racing through the additive ALTER TABLE pass with
+                        # stale PRAGMA snapshots during gateway startup.
+                        conn.executescript(SCHEMA_SQL)
+                        _migrate_add_optional_columns(conn)
+                        _INITIALIZED_PATHS.add(resolved)
+            except Exception:
+                conn.close()
+                raise
     return conn
 
 
@@ -2364,6 +2634,43 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
+def _connection_db_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """Return the main on-disk DB path for ``conn`` when one exists."""
+    row = conn.execute("PRAGMA database_list").fetchone()
+    if row is None or not row[2]:
+        return None
+    return Path(str(row[2])).resolve()
+
+
+def _is_corruption_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int) and (code & 0xFF) in {
+        sqlite3.SQLITE_CORRUPT,
+        sqlite3.SQLITE_NOTADB,
+    }:
+        return True
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "database disk image is malformed",
+            "database corruption",
+            "file is not a database",
+            "malformed database schema",
+        )
+    )
+
+
+def _raise_if_sqlite_corrupt(
+    path: Optional[Path],
+    exc: BaseException,
+) -> None:
+    if path is not None and _is_corruption_error(exc):
+        _raise_corrupt_db(path, f"sqlite write failed: {exc}")
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection):
     """Context manager for an IMMEDIATE write transaction.
@@ -2376,32 +2683,52 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
-    try:
-        yield conn
-    except Exception:
+    db_path = _connection_db_path(conn)
+    lock = (
+        _cross_process_write_lock(db_path)
+        if db_path is not None
+        else contextlib.nullcontext()
+    )
+    with lock:
+        if db_path is not None:
+            _raise_if_db_quarantined(db_path)
         try:
-            conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            # SQLite has already auto-rolled-back the transaction (typical
-            # under EIO, lock contention, or corruption). Nothing to undo;
-            # do not let this secondary failure shadow the real one.
-            pass
-        raise
-    else:
+            _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+        except Exception as exc:
+            _raise_if_sqlite_corrupt(db_path, exc)
+            raise
         try:
-            _execute_boundary_with_retry(conn, "COMMIT")
-        except Exception:
-            # COMMIT exhausted retries with the txn still open; roll back so the
-            # connection isn't poisoned for the next BEGIN IMMEDIATE.
+            yield conn
+        except Exception as exc:
             try:
                 conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
+                # SQLite has already auto-rolled-back the transaction (typical
+                # under EIO, lock contention, or corruption). Nothing to undo;
+                # do not let this secondary failure shadow the real one.
                 pass
+            _raise_if_sqlite_corrupt(db_path, exc)
             raise
-        # Post-commit file-length check: header page_count must match actual file pages.
-        # A discrepancy means a torn-extend — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        else:
+            try:
+                if db_path is not None:
+                    # A different process may have published a corruption verdict
+                    # while this transaction was open. Roll back instead of adding
+                    # another commit after quarantine.
+                    _raise_if_db_quarantined(db_path)
+                _execute_boundary_with_retry(conn, "COMMIT")
+            except Exception as exc:
+                # COMMIT exhausted retries with the txn still open; roll back so the
+                # connection isn't poisoned for the next BEGIN IMMEDIATE.
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                _raise_if_sqlite_corrupt(db_path, exc)
+                raise
+            # Post-commit file-length check: header page_count must match actual file pages.
+            # A discrepancy means a torn-extend — raise now rather than silently corrupt.
+            _check_file_length_invariant(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -3400,6 +3727,38 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+
+
+def _append_respawn_guard_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+) -> bool:
+    """Record a guard transition without emitting one event per dispatch tick.
+
+    The newest task event represents the last operator-visible state.  If it
+    is already the same respawn guard, another identical row adds no signal
+    and can make a correctly idle queue look active.  Any intervening event
+    re-arms the diagnostic, so a guard that clears and later returns remains
+    visible.
+
+    Called from within an already-open write transaction.  Returns whether a
+    new event was appended.
+    """
+    latest = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is not None and latest["kind"] == "respawn_guarded":
+        try:
+            payload = json.loads(latest["payload"]) if latest["payload"] else {}
+        except (TypeError, ValueError):
+            payload = {}
+        if payload.get("reason") == reason:
+            return False
+    _append_event(conn, task_id, "respawn_guarded", {"reason": reason})
+    return True
 
 
 def _end_run(
@@ -7600,20 +7959,20 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    whose assignee maps to a real Hermes profile and whose respawn guard is
+    currently clear.
 
     Used by the gateway- and CLI-embedded dispatchers' health telemetry to
-    decide whether ``0 spawned`` is a "stuck" condition (real spawnable
-    work waiting) or a "correctly idle" condition (only control-plane
-    lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
-    that pull tasks via ``claim_task`` directly).
+    decide whether ``0 spawned`` is a "stuck" condition (real spawnable work
+    waiting) or a "correctly idle" condition (only control-plane lanes or
+    intentionally guarded tasks waiting on an external condition).
 
     Falls back to "any ready+assigned" if ``profile_exists`` is not
     importable (e.g. partial install) — preserves the old behavior so
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
@@ -7625,7 +7984,10 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if (
+            profile_exists(row["assignee"])
+            and check_respawn_guard(conn, row["id"]) is None
+        ):
             return True
     return False
 
@@ -7955,15 +8317,11 @@ def _dispatch_once_locked(
         guard_reason = check_respawn_guard(conn, row["id"])
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
-            # Emit an event so operators can see why the task was
-            # skipped when reading `hermes kanban tail` — without
-            # this the task appears stuck in ready with no diagnosis.
+            # Emit the state transition so operators can diagnose the skip,
+            # but do not append an identical row on every dispatcher tick.
             if not dry_run:
                 with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
-                    )
+                    _append_respawn_guard_event(conn, row["id"], guard_reason)
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
@@ -8383,6 +8741,70 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _resolve_external_worker_spec(
+    assignee: str,
+) -> Optional[tuple[list[str], dict[str, str]]]:
+    """Resolve an argv-only external Kanban worker for ``assignee``.
+
+    Shell command strings are intentionally rejected.  External workers get
+    task and lifecycle context through the same ``HERMES_KANBAN_*`` variables
+    as native profile workers, while the adapter remains responsible for
+    calling ``complete_task`` or ``block_task``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        kanban_cfg = cfg.get("kanban") if isinstance(cfg, dict) else None
+        workers = (
+            kanban_cfg.get("external_workers")
+            if isinstance(kanban_cfg, dict)
+            else None
+        )
+        raw = workers.get(assignee) if isinstance(workers, dict) else None
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"kanban.external_workers.{assignee} must be an object"
+            )
+        command = raw.get("command")
+        if (
+            not isinstance(command, list)
+            or not command
+            or any(not isinstance(part, str) or not part.strip() for part in command)
+        ):
+            raise ValueError(
+                f"kanban.external_workers.{assignee}.command must be a non-empty argv list"
+            )
+        raw_env = raw.get("env") or {}
+        if not isinstance(raw_env, dict):
+            raise ValueError(
+                f"kanban.external_workers.{assignee}.env must be an object"
+            )
+        worker_env: dict[str, str] = {}
+        for key, value in raw_env.items():
+            if not isinstance(key, str) or not key or "=" in key or "\x00" in key:
+                raise ValueError(
+                    f"kanban.external_workers.{assignee}.env contains an invalid name"
+                )
+            if not isinstance(value, (str, int, float, bool)):
+                raise ValueError(
+                    f"kanban.external_workers.{assignee}.env.{key} must be scalar"
+                )
+            worker_env[key] = str(value)
+        return ([part.strip() for part in command], worker_env)
+    except ValueError:
+        raise
+    except Exception as exc:
+        _log.debug(
+            "kanban worker: could not resolve external worker for %r (%s)",
+            assignee,
+            exc,
+        )
+        return None
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8491,6 +8913,8 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    if task.model_override:
+        env["HERMES_KANBAN_MODEL_OVERRIDE"] = task.model_override
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
@@ -8500,41 +8924,47 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = [
-        *_resolve_hermes_argv(),
-        "-p", profile_arg,
-        "--cli",
-        # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
-        # so they see that profile's shell-hook allowlist instead of the
-        # dispatcher's root allowlist. Pass --accept-hooks explicitly so
-        # profile-local worker sessions still register configured hooks.
-        "--accept-hooks",
-    ]
-    # Per-task force-loaded skills. Each name goes in its own
-    # `--skills X` pair rather than a single comma-joined arg: the CLI
-    # accepts both forms (action='append' + comma-split), but
-    # per-name pairs are easier to read in `ps` output and avoid any
-    # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
-        for sk in task.skills:
-            if sk:
-                cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-    if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend([
-        "chat",
-        "-q", prompt,
-    ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
+    external_worker = _resolve_external_worker_spec(profile_arg)
+    if external_worker is not None:
+        cmd, worker_env = external_worker
+        env.update(worker_env)
+        env["HERMES_EXTERNAL_WORKER"] = "1"
+    else:
+        cmd = [
+            *_resolve_hermes_argv(),
+            "-p", profile_arg,
+            "--cli",
+            # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
+            # so they see that profile's shell-hook allowlist instead of the
+            # dispatcher's root allowlist. Pass --accept-hooks explicitly so
+            # profile-local worker sessions still register configured hooks.
+            "--accept-hooks",
+        ]
+        # Per-task force-loaded skills. Each name goes in its own
+        # `--skills X` pair rather than a single comma-joined arg: the CLI
+        # accepts both forms (action='append' + comma-split), but
+        # per-name pairs are easier to read in `ps` output and avoid any
+        # quoting ambiguity if a skill name ever contains unusual chars.
+        if task.skills:
+            for sk in task.skills:
+                if sk:
+                    cmd.extend(["--skills", sk])
+        if task.model_override:
+            cmd.extend(["-m", task.model_override])
+        worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        if worker_toolsets:
+            cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+        cmd.extend([
+            "chat",
+            "-q", prompt,
+        ])
+        if task.goal_mode:
+            # Goal-mode workers must take the fully-quiet single-query path:
+            # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
+            # cli.py's quiet branch. Without -Q the worker gets exactly one
+            # turn, prints text, exits rc=0, and the dispatcher records a
+            # protocol violation (incident 2026-06-09 t_d9cbe312).
+            cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -8561,8 +8991,7 @@ def _default_spawn(
     except FileNotFoundError:
         log_f.close()
         raise RuntimeError(
-            "`hermes` executable not found on PATH. "
-            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+            f"worker executable {cmd[0]!r} was not found on PATH"
         )
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The

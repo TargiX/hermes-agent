@@ -1704,6 +1704,41 @@ def test_has_spawnable_ready_true_when_real_profile_present(kanban_home, monkeyp
         assert kb.has_spawnable_ready(conn) is True
 
 
+def test_has_spawnable_ready_false_when_only_real_profile_task_is_guarded(
+    kanban_home, monkeypatch
+):
+    """A ready task that cannot dispatch this tick is correctly idle, not stuck."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="already-published", assignee="daily")
+        kb.add_comment(
+            conn,
+            task_id,
+            "worker",
+            "Opened https://github.com/example/project/pull/123",
+        )
+        assert kb.has_spawnable_ready(conn) is False
+
+
+def test_has_spawnable_ready_true_when_guarded_and_clean_tasks_coexist(
+    kanban_home, monkeypatch
+):
+    """One guarded task must not hide another task that can really spawn."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        guarded_id = kb.create_task(conn, title="already-published", assignee="daily")
+        kb.add_comment(
+            conn,
+            guarded_id,
+            "worker",
+            "Opened https://github.com/example/project/pull/123",
+        )
+        kb.create_task(conn, title="new-work", assignee="daily")
+        assert kb.has_spawnable_ready(conn) is True
+
+
 def test_has_spawnable_ready_false_on_empty_queue(kanban_home):
     """Empty queue is the trivial false case — no ready tasks at all."""
     with kb.connect() as conn:
@@ -2097,6 +2132,30 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
     # Event.payload is already parsed as a dict by list_events.
     assert isinstance(guarded_evt.payload, dict)
     assert guarded_evt.payload.get("reason") == "recent_success"
+
+
+def test_dispatch_respawn_guard_deduplicates_consecutive_identical_events(
+    kanban_home, all_assignees_spawnable
+):
+    """Repeated dispatcher ticks must not turn one guard into event spam."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="event-dedupe", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "Opened https://github.com/example/project/pull/123",
+        )
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        events = [
+            event
+            for event in kb.list_events(conn, t)
+            if event.kind == "respawn_guarded"
+        ]
+
+    assert len(events) == 1
+    assert events[0].payload == {"reason": "active_pr"}
 
 
 # ---------------------------------------------------------------------------
@@ -3304,26 +3363,11 @@ def test_latest_summaries_batch_omits_tasks_without_summary(kanban_home):
 
 
 # ---------------------------------------------------------------------------
-# NFS / network-filesystem fallback (see hermes_state.apply_wal_with_fallback)
+# Rollback-journal compatibility
 # ---------------------------------------------------------------------------
 
-def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch, caplog):
-    """kanban_db.connect() must handle ``locking protocol`` on NFS/SMB.
-
-    Without this fallback, the gateway's kanban dispatcher crashes every
-    60s and the kanban migration (``consecutive_failures`` ADD COLUMN) is
-    retried forever — which is what the real-world user report shows
-    (see hermes-agent issue #22032).
-
-    NOTE: We do NOT use the ``kanban_home`` fixture here because that
-    fixture pre-initializes the DB via ``kb.init_db()`` — putting the
-    file in WAL on disk. The Bug D safety guard now refuses to downgrade
-    to DELETE when the on-disk header is already WAL, so testing the
-    NFS-fallback path requires a truly-fresh DB file (NFS scenario in
-    production: first connection of the first process ever to touch the
-    file, where downgrading is safe because nobody else has WAL state
-    yet).
-    """
+def test_connect_uses_delete_without_attempting_wal(tmp_path, monkeypatch):
+    """Kanban must never enter the recurrent multi-process WAL path."""
     import sqlite3 as _sqlite3
     from unittest.mock import patch as _patch
 
@@ -3337,31 +3381,21 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
 
     real_connect = _sqlite3.connect
 
-    class _WalBlockingConnection(_sqlite3.Connection):
+    class _WalRejectingConnection(_sqlite3.Connection):
         def execute(self, sql, *args, **kwargs):  # type: ignore[override]
             if "journal_mode=wal" in sql.lower().replace(" ", ""):
-                raise _sqlite3.OperationalError("locking protocol")
+                raise AssertionError("Kanban must not request WAL")
             return super().execute(sql, *args, **kwargs)
 
-    def wal_blocking_connect(*args, **kwargs):
+    def wal_rejecting_connect(*args, **kwargs):
         return real_connect(
-            *args, factory=_WalBlockingConnection, **kwargs
+            *args, factory=_WalRejectingConnection, **kwargs
         )
 
-    with _patch("hermes_cli.kanban_db.sqlite3.connect", side_effect=wal_blocking_connect):
-        with caplog.at_level("WARNING", logger="hermes_state"):
-            conn = kb.connect()
+    with _patch("hermes_cli.kanban_db.sqlite3.connect", side_effect=wal_rejecting_connect):
+        conn = kb.connect()
 
-    # One fallback warning, naming kanban.db
-    warnings = [
-        r for r in caplog.records
-        if r.levelname == "WARNING" and "kanban.db" in r.getMessage()
-    ]
-    assert len(warnings) >= 1, (
-        f"Expected a kanban.db WARNING, got: {[r.getMessage() for r in caplog.records]}"
-    )
-
-    # DB still usable end-to-end — create + list a task
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
     t = kb.create_task(conn, title="post-fallback task")
     tasks = kb.list_tasks(conn)
     assert any(row.id == t for row in tasks)
@@ -4442,8 +4476,8 @@ def test_connect_refuses_corrupt_existing_file(tmp_path):
         kb.connect(db_path=db_path)
 
 
-def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
-    """Repeated quarantines of the same corrupt bytes must not amplify disk usage.
+def test_repeated_corrupt_open_reuses_single_backup_and_marker(tmp_path):
+    """Repeated opens reuse one backup and one fleet-wide quarantine marker.
 
     Regression for the gateway dispatcher's 5-min retry loop on shared kanban
     DBs across multi-profile fleets: each retry on an unchanged corrupt file
@@ -4454,30 +4488,34 @@ def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
     db_path = tmp_path / "kanban.db"
     original = _write_corrupt_db(db_path)
 
-    backups: set[Path] = set()
-    for _ in range(10):
+    with pytest.raises(kb.KanbanDbCorruptError) as first_excinfo:
+        kb.connect(db_path=db_path)
+    first_backup = first_excinfo.value.backup_path
+    assert first_backup is not None
+
+    for _ in range(9):
         kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
         with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
             kb.connect(db_path=db_path)
-        assert excinfo.value.backup_path is not None
-        backups.add(excinfo.value.backup_path)
+        assert excinfo.value.quarantine_path == kb._db_quarantine_path(db_path)
 
-    assert len(backups) == 1, f"expected 1 deterministic backup, got {len(backups)}"
-    (backup,) = backups
+    backups = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert backups == [first_backup]
+    backup = first_backup
     assert backup.exists()
     assert backup.read_bytes() == original
 
-    # Mutate the corrupt bytes — fingerprint changes, separate backup preserved.
+    # Mutating a quarantined DB must not trick the fleet into probing/writing it
+    # again. A recovery operator must first archive the marker after validating
+    # a replacement DB.
     with db_path.open("r+b") as f:
         f.seek(4096)
         f.write(b"\xAB" * 64)
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     with pytest.raises(kb.KanbanDbCorruptError) as excinfo2:
         kb.connect(db_path=db_path)
-    second_backup = excinfo2.value.backup_path
-    assert second_backup is not None
-    assert second_backup != backup
-    assert second_backup.exists()
+    assert excinfo2.value.backup_path is None
+    assert list(tmp_path.glob("kanban.db.corrupt.*.bak")) == [backup]
 
 
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
@@ -4816,13 +4854,13 @@ def test_write_txn_post_commit_check_fires_every_call(tmp_path):
     conn.close()
 
 
-def test_connect_sets_wal_autocheckpoint_100(tmp_path):
-    """connect() sets wal_autocheckpoint to 100."""
+def test_connect_sets_delete_journal_mode(tmp_path):
+    """Kanban uses rollback journal even when SQLite defaults change."""
     from hermes_cli.kanban_db import connect
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
-    val = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
-    assert val == 100
+    mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode.lower() == "delete"
     conn.close()
 
 

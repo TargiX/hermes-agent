@@ -125,6 +125,80 @@ def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
     assert "HERMES_TUI" not in captured["env"]
 
 
+def test_default_spawn_routes_configured_external_worker_without_a_shell(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "cursor-grok"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text(
+        """
+kanban:
+  external_workers:
+    cursor-grok:
+      command:
+        - /opt/phosphene/cursor-worker
+        - --bounded
+      env:
+        CURSOR_KEYCHAIN_SERVICE: phosphene-hermes-cursor
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    pid = kb._default_spawn(
+        _make_task(kb, assignee="cursor-grok"), str(workspace), board="agency"
+    )
+
+    assert pid == 4245
+    assert captured["cmd"] == ["/opt/phosphene/cursor-worker", "--bounded"]
+    assert captured["env"]["HERMES_EXTERNAL_WORKER"] == "1"
+    assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert captured["env"]["HERMES_KANBAN_BOARD"] == "agency"
+    assert captured["env"]["CURSOR_KEYCHAIN_SERVICE"] == "phosphene-hermes-cursor"
+
+
+def test_external_worker_rejects_shell_command_strings(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    root.joinpath("config.yaml").write_text(
+        """
+kanban:
+  external_workers:
+    cursor-grok:
+      command: "cursor-worker; unsafe-command"
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    try:
+        kb._resolve_external_worker_spec("cursor-grok")
+    except ValueError as error:
+        assert "argv list" in str(error)
+    else:
+        raise AssertionError("shell command strings must be rejected")
+
+
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
     """The dispatcher's pre-``chat`` model flag must reach ``args.model``.
 
