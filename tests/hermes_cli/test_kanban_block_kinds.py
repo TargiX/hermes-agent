@@ -168,6 +168,29 @@ def test_review_required_reblock_never_routes_to_triage(kanban_home: Path) -> No
         assert blocked_events[-1].payload.get("kind") == "review_required"
 
 
+def test_review_required_preserves_structured_run_metadata(kanban_home: Path) -> None:
+    """Frozen implementation receipts survive the healthy block boundary."""
+    receipt = {
+        "schema": "phosphene-implementation/v1",
+        "diff_sha256": "abc123",
+        "changed_files": ["components/Create.vue"],
+        "next_owner": "agencyreviewer",
+    }
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="review-required: frozen implementation",
+            kind="review_required",
+            metadata=receipt,
+        )
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.status == "blocked"
+        assert run.metadata == receipt
+
+
 # ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------

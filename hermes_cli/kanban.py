@@ -591,6 +591,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "the task to triage. Omit for a generic block."
         ),
     )
+    p_block.add_argument(
+        "--metadata",
+        default=None,
+        help=(
+            "JSON dict of structured handoff facts stored on the closing run. "
+            "Useful for review_required receipts."
+        ),
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -2091,6 +2099,22 @@ def _cmd_block(args: argparse.Namespace) -> int:
     kind = getattr(args, "kind", None)
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    raw_meta = getattr(args, "metadata", None)
+    if len(ids) > 1 and raw_meta:
+        print(
+            "kanban: --metadata is per-task and can't be used with multiple ids",
+            file=sys.stderr,
+        )
+        return 2
+    metadata = None
+    if raw_meta:
+        try:
+            metadata = json.loads(raw_meta)
+            if not isinstance(metadata, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
@@ -2101,6 +2125,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 kind=kind,
+                metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)

@@ -5499,6 +5499,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -5580,10 +5581,12 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
-            if run_id is None and reason:
+            if run_id is None and (reason or metadata):
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
+                    metadata=metadata,
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
@@ -5628,10 +5631,12 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
-            if run_id is None and reason:
+            if run_id is None and (reason or metadata):
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
+                    metadata=metadata,
                 )
             _append_event(
                 conn, task_id, "blocked",
@@ -5681,10 +5686,12 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
-            if run_id is None and reason:
+            if run_id is None and (reason or metadata):
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
+                    metadata=metadata,
                 )
             _append_event(
                 conn, task_id, "block_loop_detected",
@@ -5735,14 +5742,16 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
-            if run_id is None and reason:
+            if run_id is None and (reason or metadata):
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",
                     summary=reason,
+                    metadata=metadata,
                 )
             _append_event(
                 conn, task_id, "blocked",

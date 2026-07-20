@@ -776,6 +776,47 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_block_preserves_structured_metadata_and_worker_session(
+    monkeypatch, worker_env,
+):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "receipt-session")
+    out = kt._handle_block({
+        "reason": "review-required: frozen head",
+        "kind": "review_required",
+        "metadata": {
+            "schema": "phosphene-implementation/v1",
+            "diff_sha256": "abc123",
+        },
+    })
+    assert json.loads(out).get("ok") is True
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.metadata == {
+            "schema": "phosphene-implementation/v1",
+            "diff_sha256": "abc123",
+            "worker_session_id": "receipt-session",
+        }
+    finally:
+        conn.close()
+
+
+def test_block_rejects_non_object_metadata(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_block({
+        "reason": "review-required: frozen head",
+        "kind": "review_required",
+        "metadata": ["not", "an", "object"],
+    })
+    assert "metadata must be an object" in json.loads(out)["error"]
+
+
 def test_block_rejects_empty_reason(worker_env):
     from tools import kanban_tools as kt
     for bad in ["", "   ", None]:

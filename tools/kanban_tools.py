@@ -728,6 +728,20 @@ def _handle_block(args: dict, **kw) -> str:
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
+    metadata = args.get("metadata")
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            return tool_error(
+                f"metadata must be an object/dict, got {type(metadata).__name__}"
+            )
+        meta_json = redact_sensitive_text(
+            json.dumps(metadata), force=True,
+        )
+        try:
+            metadata = json.loads(meta_json)
+        except json.JSONDecodeError:
+            pass
+    metadata = _stamp_worker_session_metadata(tid, metadata)
     kind = args.get("kind")
     board = args.get("board")
     try:
@@ -766,6 +780,7 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                metadata=metadata,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1627,6 +1642,17 @@ KANBAN_BLOCK_SCHEMA = {
                     "artifact without failure escalation; the others surface "
                     "to a human. "
                     "Omit only if none apply."
+                ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Optional machine-readable handoff facts stored on the "
+                    "closing run. Use this for structured receipts at lifecycle "
+                    "boundaries such as review_required — for example schema, "
+                    "base/head, diff fingerprint, changed_files, verification, "
+                    "next_owner, or a bounded blocker code. Keep reason short "
+                    "and human-readable."
                 ),
             },
             "board": _board_schema_prop(),
