@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -1387,7 +1388,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
 
 def _handle_unblock(args: dict, **kw) -> str:
-    """Transition a blocked task to ready, or todo while parents remain open."""
+    """Transition blocked work to ready/todo, or recover triage with proof."""
     guard = _require_orchestrator_tool("kanban_unblock")
     if guard:
         return guard
@@ -1401,6 +1402,80 @@ def _handle_unblock(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            task = kb.get_task(conn, str(tid))
+            if task is None:
+                return tool_error(f"could not unblock {tid} (unknown task)")
+            if task.status == "triage":
+                force = bool(args.get("force", False))
+                reason = str(args.get("reason") or "").strip()
+                evidence_task_id = str(
+                    args.get("evidence_task_id") or ""
+                ).strip()
+                if not force or not reason or not evidence_task_id:
+                    return tool_error(
+                        "triage recovery requires force=true, a non-empty "
+                        "reason, and evidence_task_id"
+                    )
+                evidence_task = kb.get_task(conn, evidence_task_id)
+                if evidence_task is None or evidence_task.status != "done":
+                    return tool_error(
+                        f"triage evidence {evidence_task_id} must be a done task"
+                    )
+                evidence_run = kb.latest_run(conn, evidence_task_id)
+                evidence_meta = (
+                    evidence_run.metadata
+                    if evidence_run is not None
+                    and isinstance(evidence_run.metadata, dict)
+                    else {}
+                )
+                if (
+                    evidence_meta.get("approved") is not True
+                    or evidence_meta.get("verdict") != "APPROVE"
+                ):
+                    return tool_error(
+                        f"triage evidence {evidence_task_id} has no APPROVE receipt"
+                    )
+                authorized = evidence_meta.get("authorized_next_task_ids")
+                authorized_ids = {
+                    str(value)
+                    for value in authorized
+                    if str(value).strip()
+                } if isinstance(authorized, list) else set()
+                acceptance = evidence_meta.get("acceptance")
+                acceptance_lines = (
+                    [str(value) for value in acceptance]
+                    if isinstance(acceptance, list)
+                    else []
+                )
+                legacy_text = "\n".join([
+                    str(evidence_run.summary or "") if evidence_run else "",
+                    *acceptance_lines,
+                ])
+                legacy_authorizes = re.search(
+                    rf"(?<![A-Za-z0-9_]){re.escape(str(tid))}(?![A-Za-z0-9_])",
+                    legacy_text,
+                ) is not None
+                if str(tid) not in authorized_ids and not legacy_authorizes:
+                    return tool_error(
+                        f"triage evidence {evidence_task_id} does not authorize {tid}"
+                    )
+                reason = redact_sensitive_text(reason, force=True)
+                ok, err = kb.promote_task(
+                    conn,
+                    str(tid),
+                    actor=os.environ.get("HERMES_PROFILE") or "orchestrator",
+                    reason=reason,
+                    force=True,
+                    evidence_task_id=evidence_task_id,
+                )
+                if not ok:
+                    return tool_error(f"could not recover triage task {tid}: {err}")
+                return _ok(
+                    task_id=str(tid),
+                    status="ready",
+                    recovered_from="triage",
+                    evidence_task_id=evidence_task_id,
+                )
             ok = kb.unblock_task(conn, str(tid))
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
@@ -2048,8 +2123,11 @@ KANBAN_CREATE_SCHEMA = {
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
-        "Unblock a Kanban task. It moves to ready when all parents are done, "
-        "or todo while any parent remains open. Orchestrator-only — only "
+        "Unblock a Kanban task. It moves blocked work to ready when all parents "
+        "are done, or todo while any parent remains open. A triage task can "
+        "return to ready only with force=true, an audit reason, and a done "
+        "approved evidence task whose receipt explicitly authorizes the target. "
+        "Orchestrator-only — only "
         "profiles with the kanban toolset can unblock routed work; "
         "dispatcher-spawned task workers never see this tool."
     ),
@@ -2059,6 +2137,27 @@ KANBAN_UNBLOCK_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": "Blocked task id to move to ready or parent-gated todo.",
+            },
+            "force": {
+                "type": "boolean",
+                "description": (
+                    "Required and true only for audited triage recovery. "
+                    "Ignored for ordinary blocked/scheduled tasks."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Required audit reason for triage recovery. Name the "
+                    "resolved blocker and why the evidence changes it."
+                ),
+            },
+            "evidence_task_id": {
+                "type": "string",
+                "description": (
+                    "Required for triage recovery: a done review/evidence task "
+                    "with approved=true and explicit authorization for task_id."
+                ),
             },
             "board": _board_schema_prop(),
         },

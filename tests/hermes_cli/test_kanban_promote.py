@@ -143,6 +143,55 @@ def test_promote_rejects_non_todo_status(conn):
     assert "'ready'" in err and "promote only applies" in err
 
 
+def test_promote_triage_requires_force_reason_and_evidence(conn):
+    tid = kb.create_task(conn, title="needs triage recovery")
+    conn.execute(
+        "UPDATE tasks SET status='triage', block_kind='capability', "
+        "block_recurrences=2 WHERE id=?",
+        (tid,),
+    )
+
+    ok, err = kb.promote_task(conn, tid, actor="tester")
+    assert ok is False and "force=True" in err
+    ok, err = kb.promote_task(conn, tid, actor="tester", force=True)
+    assert ok is False and "audit reason" in err
+    ok, err = kb.promote_task(
+        conn, tid, actor="tester", force=True, reason="review approved"
+    )
+    assert ok is False and "evidence_task_id" in err
+
+
+def test_promote_triage_with_evidence_resets_resolved_blocker(conn):
+    tid = kb.create_task(conn, title="recoverable triage")
+    conn.execute(
+        "UPDATE tasks SET status='triage', block_kind='capability', "
+        "block_recurrences=2, consecutive_failures=3 WHERE id=?",
+        (tid,),
+    )
+    ok, err = kb.promote_task(
+        conn,
+        tid,
+        actor="tester",
+        force=True,
+        reason="approved route recovery",
+        evidence_task_id="t_review",
+    )
+    assert ok and err is None
+    task = kb.get_task(conn, tid)
+    assert task.status == "ready"
+    assert task.block_kind is None
+    assert task.block_recurrences == 0
+    assert task.consecutive_failures == 0
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? "
+        "AND kind='promoted_manual' ORDER BY id DESC LIMIT 1",
+        (tid,),
+    ).fetchone()
+    payload = json.loads(event["payload"])
+    assert payload["from_status"] == "triage"
+    assert payload["evidence_task_id"] == "t_review"
+
+
 def test_promote_rejects_unknown_task(conn):
     ok, err = kb.promote_task(conn, "t_doesnotexist", actor="tester")
     assert ok is False

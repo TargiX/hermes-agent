@@ -5778,6 +5778,7 @@ def promote_task(
     actor: str,
     reason: Optional[str] = None,
     force: bool = False,
+    evidence_task_id: Optional[str] = None,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Manually promote a `todo` or `blocked` task to `ready`.
@@ -5797,10 +5798,17 @@ def promote_task(
         return False, f"task {task_id} not found"
 
     cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
+    if cur_status == "triage":
+        if not force:
+            return False, "triage recovery requires force=True"
+        if not str(reason or "").strip():
+            return False, "triage recovery requires a non-empty audit reason"
+        if not str(evidence_task_id or "").strip():
+            return False, "triage recovery requires evidence_task_id"
+    elif cur_status not in ("todo", "blocked"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo'/'blocked', or 'triage' with force and evidence"
         )
 
     if not force:
@@ -5824,18 +5832,37 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
-        upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
-            (task_id,),
-        )
+        if cur_status == "triage":
+            upd = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'ready',
+                       block_kind = NULL,
+                       block_recurrences = 0,
+                       consecutive_failures = 0
+                 WHERE id = ? AND status = 'triage'
+                """,
+                (task_id,),
+            )
+        else:
+            upd = conn.execute(
+                "UPDATE tasks SET status = 'ready' "
+                "WHERE id = ? AND status IN ('todo', 'blocked')",
+                (task_id,),
+            )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
         _append_event(
             conn,
             task_id,
             "promoted_manual",
-            {"actor": actor, "reason": reason, "forced": force},
+            {
+                "actor": actor,
+                "reason": reason,
+                "forced": force,
+                "from_status": cur_status,
+                "evidence_task_id": evidence_task_id,
+            },
         )
 
     return True, None

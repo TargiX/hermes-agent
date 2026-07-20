@@ -1460,6 +1460,121 @@ def test_unblock_happy_path(monkeypatch, worker_env):
         conn.close()
 
 
+def test_unblock_triage_requires_approved_authorizing_evidence(
+    monkeypatch, worker_env,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        target = kb.create_task(conn, title="recover canonical task", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status='triage', block_kind='capability', "
+            "block_recurrences=2 WHERE id=?",
+            (target,),
+        )
+        review = kb.create_task(conn, title="approved recovery review", assignee="reviewer")
+        kb.complete_task(
+            conn,
+            review,
+            summary=f"APPROVE: resume {target}",
+            metadata={
+                "schema": "phosphene-review/v1",
+                "approved": True,
+                "verdict": "APPROVE",
+                "authorized_next_task_ids": [target],
+            },
+        )
+    finally:
+        conn.close()
+
+    rejected = json.loads(kt._handle_unblock({"task_id": target}))
+    assert "triage recovery requires" in rejected["error"]
+
+    recovered = json.loads(kt._handle_unblock({
+        "task_id": target,
+        "force": True,
+        "reason": "approved connector route removes capability blocker",
+        "evidence_task_id": review,
+    }))
+    assert recovered.get("ok") is True
+    assert recovered["status"] == "ready"
+    assert recovered["recovered_from"] == "triage"
+
+
+def test_unblock_triage_rejects_approval_for_another_task(
+    monkeypatch, worker_env,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        target = kb.create_task(conn, title="target", assignee="worker")
+        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (target,))
+        review = kb.create_task(conn, title="unrelated approval", assignee="reviewer")
+        kb.complete_task(
+            conn,
+            review,
+            summary="APPROVE another task",
+            metadata={
+                "approved": True,
+                "verdict": "APPROVE",
+                "authorized_next_task_ids": ["t_somewhere_else"],
+            },
+        )
+    finally:
+        conn.close()
+
+    rejected = json.loads(kt._handle_unblock({
+        "task_id": target,
+        "force": True,
+        "reason": "wrong evidence",
+        "evidence_task_id": review,
+    }))
+    assert "does not authorize" in rejected["error"]
+
+
+def test_unblock_triage_rejects_nonapprove_receipt(
+    monkeypatch, worker_env,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        target = kb.create_task(conn, title="target", assignee="worker")
+        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (target,))
+        review = kb.create_task(conn, title="rejected recovery", assignee="reviewer")
+        kb.complete_task(
+            conn,
+            review,
+            summary=f"REQUEST_CHANGES for {target}",
+            metadata={
+                "approved": True,
+                "verdict": "REQUEST_CHANGES",
+                "authorized_next_task_ids": [target],
+            },
+        )
+    finally:
+        conn.close()
+
+    rejected = json.loads(kt._handle_unblock({
+        "task_id": target,
+        "force": True,
+        "reason": "bad verdict",
+        "evidence_task_id": review,
+    }))
+    assert "has no APPROVE receipt" in rejected["error"]
+
+
 def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / ".hermes"
