@@ -1546,11 +1546,11 @@ KANBAN_SHOW_SCHEMA = {
         "handoffs, your prior attempts on this task if any, comments, "
         "and recent events. Use this to (re)orient yourself before "
         "starting work, especially on retries. The response includes a "
-        "pre-formatted ``worker_context`` string suitable for inclusion "
-        "verbatim in your reasoning. Orchestrators should start with "
-        "``compact=true`` to read only the latest structured run receipt "
-        "and graph edges, then request full history only when that receipt "
-        "is missing, malformed, or contradicts live state."
+        "pre-formatted ``worker_context`` string suitable for recovery. "
+        "Workers and orchestrators should start with ``compact=true`` to read "
+        "only the task, latest structured run receipt, and graph edges, then "
+        "request full history only when that receipt is missing, malformed, "
+        "or contradicts live state."
     ),
     "parameters": {
         "type": "object",

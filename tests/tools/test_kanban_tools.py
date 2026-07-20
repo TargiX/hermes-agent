@@ -1735,8 +1735,11 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "Kanban task execution protocol" in prompt
     # Lifecycle signals
     assert "kanban_show()" in prompt
+    assert "kanban_show(compact=true)" in prompt
+    assert "kanban_show(compact=false)" in prompt
     assert "kanban_complete" in prompt
     assert "kanban_block" in prompt
+    assert "terminal run metadata is the canonical" in prompt
     assert "kanban_create" in prompt
     # Anti-shell guidance
     assert "Do not shell out" in prompt or "tools — they work" in prompt
