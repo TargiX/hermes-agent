@@ -57,6 +57,20 @@ def _session_cwd_override() -> str:
     return str(value).strip()
 
 
+def session_cwd_binding() -> str | None:
+    """Return this context's explicit cwd binding, or ``None`` if unbound.
+
+    Unlike ``_session_cwd_override()``, this preserves the distinction between
+    an explicitly empty binding (``""``: do not inherit a concurrent process
+    global) and a ContextVar that was never set (``None``: legacy CLI fallback
+    remains available).
+    """
+    value = _SESSION_CWD.get()
+    if value is _UNSET:
+        return None
+    return str(value or "").strip()
+
+
 def resolve_agent_cwd() -> Path:
     override = _session_cwd_override()
     if override:

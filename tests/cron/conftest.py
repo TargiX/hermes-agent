@@ -15,7 +15,14 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _default_cron_test_model(monkeypatch):
-    """Pin a default HERMES_MODEL so cron run_job tests have a resolvable model."""
+def _default_cron_test_model(monkeypatch, tmp_path):
+    """Pin model defaults and isolate the durable execution ledger."""
+    import cron.executions as executions
+
     monkeypatch.setenv("HERMES_MODEL", "test-cron-default-model")
+    monkeypatch.setattr(
+        executions,
+        "EXECUTIONS_FILE",
+        tmp_path / "cron" / "executions.db",
+    )
     yield

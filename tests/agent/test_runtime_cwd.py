@@ -10,6 +10,7 @@ from agent.runtime_cwd import (
     clear_session_cwd,
     resolve_agent_cwd,
     resolve_context_cwd,
+    session_cwd_binding,
     set_session_cwd,
 )
 
@@ -114,6 +115,18 @@ class TestSessionCwdOverride:
         try:
             assert resolve_agent_cwd() == tmp_path
             assert resolve_context_cwd() == tmp_path
+        finally:
+            rt._SESSION_CWD.reset(token)
+
+    def test_binding_distinguishes_unset_from_explicit_empty(self):
+        token = rt._SESSION_CWD.set(rt._UNSET)
+        try:
+            assert session_cwd_binding() is None
+            explicit = set_session_cwd("")
+            try:
+                assert session_cwd_binding() == ""
+            finally:
+                rt._SESSION_CWD.reset(explicit)
         finally:
             rt._SESSION_CWD.reset(token)
 

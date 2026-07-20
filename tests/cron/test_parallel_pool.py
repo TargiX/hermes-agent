@@ -171,13 +171,8 @@ class TestSyncMode:
         sched._shutdown_parallel_pool()
 
 
-class TestSequentialPool:
-    """Sequential (workdir) jobs use the persistent cron-seq pool.
-
-    Verifies the follow-up fix: env-mutating jobs no longer run inline
-    in the ticker thread, so a long workdir job can't starve the
-    schedule the same way the parallel path used to.
-    """
+class TestWorkdirParallelPool:
+    """Workdir jobs use the same non-blocking parallel pool."""
 
     def test_sequential_job_does_not_block_ticker(self, tmp_path, monkeypatch):
         """sync=False returns immediately even when a workdir job is slow."""
@@ -185,7 +180,6 @@ class TestSequentialPool:
 
         sched._parallel_pool = None
         sched._parallel_pool_max_workers = None
-        sched._sequential_pool = None
         sched._running_job_ids.clear()
 
         job = {
@@ -196,7 +190,7 @@ class TestSequentialPool:
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
-            "workdir": str(tmp_path),  # makes it sequential
+            "workdir": str(tmp_path),
         }
 
         barrier = threading.Barrier(2, timeout=5)
@@ -229,7 +223,6 @@ class TestSequentialPool:
 
         sched._parallel_pool = None
         sched._parallel_pool_max_workers = None
-        sched._sequential_pool = None
         sched._running_job_ids.clear()
 
         job = {
@@ -261,14 +254,43 @@ class TestSequentialPool:
         sched._running_job_ids.discard("guard-seq")
         sched._shutdown_parallel_pool()
 
-    def test_get_sequential_pool_is_persistent(self):
-        """_get_sequential_pool returns the same single-thread pool."""
+    def test_two_workdir_jobs_overlap(self, tmp_path, monkeypatch):
+        """A long side-project cron cannot queue the Phosphene cron behind it."""
         import cron.scheduler as sched
 
-        sched._sequential_pool = None
-        pool1 = sched._get_sequential_pool()
-        pool2 = sched._get_sequential_pool()
-        assert pool1 is pool2
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._running_job_ids.clear()
+        jobs = [
+            {
+                "id": f"workdir-{index}",
+                "name": f"workdir-{index}",
+                "prompt": "test",
+                "schedule": "every 5m",
+                "enabled": True,
+                "next_run_at": "2020-01-01T00:00:00",
+                "deliver": "local",
+                "workdir": str(tmp_path / f"project-{index}"),
+            }
+            for index in range(2)
+        ]
+        for job in jobs:
+            (tmp_path / job["id"].replace("workdir-", "project-")).mkdir()
+
+        barrier = threading.Barrier(3, timeout=5)
+
+        def overlapping_run(_job, *, defer_agent_teardown=None):
+            barrier.wait()
+            return True, "out", "resp", None
+
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
+        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "run_job", overlapping_run)
+        monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
+        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+
+        assert sched.tick(verbose=False, sync=False) == 2
+        barrier.wait()
 
         sched._shutdown_parallel_pool()
-        assert sched._sequential_pool is None

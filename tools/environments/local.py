@@ -447,6 +447,21 @@ def _inject_session_context_env(env: dict) -> None:
             # inherited global so a sibling session's value can't leak in.
             env.pop(var_name, None)
 
+    # TERMINAL_CWD has the same cross-session problem as the identity vars,
+    # but its authoritative value lives in agent.runtime_cwd. Bridge the
+    # context-local project root into children so a nested Codex/Claude/git
+    # command sees the same cwd as Hermes' own terminal and file tools.
+    try:
+        from agent.runtime_cwd import session_cwd_binding
+
+        context_cwd = session_cwd_binding()
+    except Exception:
+        context_cwd = None
+    if context_cwd:
+        env["TERMINAL_CWD"] = context_cwd
+    elif context_cwd is not None or _engaged:
+        env.pop("TERMINAL_CWD", None)
+
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
