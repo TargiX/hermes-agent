@@ -11,6 +11,7 @@ roughly the full uncached system-prompt cost per nudge (~26% end-to-end on
 Sonnet 4.5 per the contributor's measurement).
 """
 
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -213,6 +214,34 @@ def test_review_fork_inherits_parent_toolset_config():
         f"disabled_toolsets mismatch: {init_kwargs.get('disabled_toolsets')!r} "
         f"vs expected {agent.disabled_toolsets!r}"
     )
+    assert init_kwargs.get("skip_context_files") is True, (
+        "Background review must not re-read a completed task's possibly "
+        "deleted scratch workspace."
+    )
+
+
+def test_review_thread_rebinds_deleted_task_cwd(tmp_path, monkeypatch):
+    """A completed scratch task must not break the self-improvement fork."""
+    import agent.background_review as bg_review
+    from agent.runtime_cwd import session_cwd_binding, set_session_cwd
+
+    stable_home = tmp_path / "stable-home"
+    stable_home.mkdir()
+    deleted_workspace = tmp_path / "deleted-task-workspace"
+    monkeypatch.setattr(Path, "home", lambda: stable_home)
+    set_session_cwd(str(deleted_workspace))
+    captured = {}
+
+    def _capture(*_args, **_kwargs):
+        captured["cwd"] = session_cwd_binding()
+
+    with patch.object(bg_review, "_run_review_in_thread", _capture):
+        target, _ = bg_review.spawn_background_review_thread(
+            object(), [], review_skills=True
+        )
+        target()
+
+    assert captured["cwd"] == str(stable_home)
 
 
 def test_review_fork_inherits_parent_reasoning_config():

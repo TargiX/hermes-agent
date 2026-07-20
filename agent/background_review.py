@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
@@ -724,6 +725,11 @@ def _run_review_in_thread(
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
+                # The review has the completed turn snapshot and can only use
+                # memory/skill tools. Re-reading project context is redundant,
+                # and a task-scoped scratch workspace may already have been
+                # removed by kanban_complete before this daemon starts.
+                skip_context_files=True,
                 **_fork_kwargs,
             )
             review_agent._memory_write_origin = "background_review"
@@ -976,6 +982,19 @@ def spawn_background_review_thread(
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
     def _target() -> None:
+        # A task worker's ContextVars are intentionally propagated into this
+        # daemon, but kanban_complete removes managed scratch workspaces before
+        # the final response reaches the background-review cadence. Rebind to a
+        # stable, non-project directory so fork initialization cannot resolve a
+        # deleted TERMINAL_CWD. The review has no terminal/file tool access and
+        # skip_context_files=True, so it neither needs nor should inherit the
+        # product workspace.
+        try:
+            from agent.runtime_cwd import set_session_cwd
+
+            set_session_cwd(str(Path.home()))
+        except Exception:
+            pass
         _run_review_in_thread(agent, messages_snapshot, prompt)
 
     return _target, prompt
