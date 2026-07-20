@@ -2864,6 +2864,12 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # Task workers may normally create follow-up cards. Profiles whose
+        # independence depends on returning only a verdict (for example an
+        # external reviewer) can set this false in their profile config; the
+        # worker then keeps lifecycle/comment tools but does not receive or
+        # execute kanban_create. Orchestrator sessions are unaffected.
+        "allow_worker_fanout": True,
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.

@@ -62,6 +62,47 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_worker_profile_can_disable_kanban_create(monkeypatch, tmp_path):
+    """Independent worker profiles keep lifecycle tools but cannot fan out."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "kanban:\n  allow_worker_fanout: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from model_tools import _clear_tool_defs_cache
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    assert "kanban_create" not in names
+    assert {"kanban_complete", "kanban_block", "kanban_comment"} <= names
+
+
+def test_disabled_worker_fanout_is_enforced_in_handler(monkeypatch):
+    """A stale schema/tool call cannot bypass the reviewer capability gate."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review")
+    monkeypatch.setattr(
+        kt,
+        "load_config",
+        lambda: {"kanban": {"allow_worker_fanout": False}},
+    )
+
+    result = json.loads(
+        kt._handle_create({"title": "forbidden child", "assignee": "worker"})
+    )
+    assert "disabled for this task-worker profile" in result["error"]
+
+
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):
     """Dispatcher-spawned workers must get lifecycle tools even when the
     assignee profile restricts enabled toolsets and does not list kanban.

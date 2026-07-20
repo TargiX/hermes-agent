@@ -93,6 +93,29 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _worker_fanout_allowed() -> bool:
+    """Return whether this task-scoped profile may create follow-up cards."""
+
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return True
+    try:
+        cfg = load_config()
+        return bool(
+            cfg_get(cfg, "kanban", "allow_worker_fanout", default=True)
+        )
+    except Exception:
+        # Backward compatibility: an unreadable/legacy config keeps the
+        # historical worker surface. Explicit profile policy is fail-closed
+        # in the handler below once it can be read.
+        return True
+
+
+def _check_kanban_create_mode() -> bool:
+    """Expose kanban_create only when task-worker fan-out is permitted."""
+
+    return _check_kanban_mode() and _worker_fanout_allowed()
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -1082,6 +1105,12 @@ def _handle_create(args: dict, **kw) -> str:
     ``parents`` can be a list of task ids; dependency-gated promotion
     works as usual.
     """
+    if os.environ.get("HERMES_KANBAN_TASK") and not _worker_fanout_allowed():
+        return tool_error(
+            "kanban_create is disabled for this task-worker profile; return "
+            "a terminal verdict on the current card and let the orchestrator "
+            "create any follow-up stage"
+        )
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -2077,7 +2106,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_create_mode,
     emoji="➕",
 )
 
