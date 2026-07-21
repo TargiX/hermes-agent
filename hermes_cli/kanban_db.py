@@ -2862,13 +2862,13 @@ def create_task(
 
             with _pdb.connect_closing() as _pconn:
                 project_obj = _pdb.get_project(_pconn, project_id)
-        except Exception:
-            project_obj = None
+        except Exception as exc:
+            raise ValueError(f"could not resolve project {project_id}: {exc}") from exc
         if project_obj is None:
-            # A project id/slug that doesn't resolve must not crash task
-            # creation or persist a dangling reference — drop the link and
-            # create the task as an ordinary (scratch) task.
-            project_id = None
+            # An explicit project link is a repository-isolation boundary.
+            # Falling back to the current board repo can execute the task in
+            # an unrelated source tree while making the receipt look valid.
+            raise ValueError(f"no such project: {project_id}")
         else:
             # Canonicalise (a slug may have been passed) and anchor the
             # worktree under the project's primary repo.

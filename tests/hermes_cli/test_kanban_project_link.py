@@ -64,10 +64,10 @@ def test_unlinked_task_unchanged(kanban_conn):
     assert task.branch_name is None
 
 
-def test_unknown_project_id_falls_back_gracefully(kanban_conn):
-    # A project id that doesn't resolve must not crash task creation; the task
-    # is created as-is (scratch) and project_id stays unset.
-    tid = kb.create_task(kanban_conn, title="x", project_id="does-not-exist")
-    task = kb.get_task(kanban_conn, tid)
-    assert task.workspace_kind == "scratch"
-    assert task.project_id is None
+def test_unknown_project_id_fails_before_task_creation(kanban_conn):
+    # An explicit project link is an isolation boundary. Silently dropping a
+    # typo would let a repo-bound task fall back to the board's current repo.
+    with pytest.raises(ValueError, match="no such project: does-not-exist"):
+        kb.create_task(kanban_conn, title="x", project_id="does-not-exist")
+
+    assert kb.list_tasks(kanban_conn) == []

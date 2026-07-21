@@ -1269,6 +1269,25 @@ def test_create_no_worker_task_stays_scratch(monkeypatch, worker_env):
         conn.close()
 
 
+def test_create_rejects_unknown_explicit_project(monkeypatch, worker_env):
+    """A mistyped project must not fall back to the current board repo."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    result = json.loads(
+        kt._handle_create(
+            {
+                "title": "cross-project evidence",
+                "assignee": "peer",
+                "workspace_kind": "worktree",
+                "project_id": "does-not-exist",
+            }
+        )
+    )
+
+    assert "no such project: does-not-exist" in result["error"]
+
+
 def test_create_stamps_session_id_from_env(monkeypatch, worker_env):
     """When the agent loop runs under ACP, the server propagates the
     originating chat session id via HERMES_SESSION_ID. ``kanban_create``
