@@ -86,6 +86,75 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_kanban_worker_gets_terminal_followup_turn(self, monkeypatch):
+        """The app-server path must enforce the same terminal receipt as the native loop."""
+        calls: list[str] = []
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            calls.append(user_input)
+            if len(calls) == 1:
+                return TurnResult(
+                    final_text="CAPABILITY_READY",
+                    projected_messages=[
+                        {"role": "assistant", "content": "CAPABILITY_READY"},
+                    ],
+                    turn_id="turn-work",
+                    thread_id="thread-kanban",
+                )
+            return TurnResult(
+                final_text="Receipt recorded.",
+                projected_messages=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "mcp-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "mcp.hermes-tools.kanban_complete",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "name": "mcp.hermes-tools.kanban_complete",
+                        "tool_call_id": "mcp-1",
+                        "content": "done",
+                    },
+                    {"role": "assistant", "content": "Receipt recorded."},
+                ],
+                tool_iterations=1,
+                turn_id="turn-closeout",
+                thread_id="thread-kanban",
+            )
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_capability")
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-kanban"
+        )
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("work kanban task")
+
+        assert len(calls) == 2
+        assert "plain-text reply is NOT a terminal state" in calls[1]
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert result["final_response"] == "Receipt recorded."
+        terminal_calls = [
+            call
+            for message in result["messages"]
+            for call in (message.get("tool_calls") or [])
+            if call.get("function", {}).get("name")
+            == "mcp.hermes-tools.kanban_complete"
+        ]
+        assert terminal_calls
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
@@ -786,4 +855,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-

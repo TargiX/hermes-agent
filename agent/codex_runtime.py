@@ -714,6 +714,60 @@ def run_codex_app_server_turn(
             "error": str(exc),
         }
 
+    # Codex app-server owns its inner tool loop, so the native conversation
+    # loop's Kanban terminal-tool stop guard never sees a plain-text finish.
+    # Enforce the same contract here with bounded follow-up turns on the same
+    # Codex thread. The follow-up is synthetic control-plane input: only the
+    # projected assistant/tool messages are persisted in Hermes history.
+    api_calls = 1
+    kanban_guard_attempts = 0
+    while not turn.interrupted and turn.error is None:
+        try:
+            from agent.kanban_stop import build_kanban_stop_nudge
+
+            kanban_nudge = build_kanban_stop_nudge(
+                messages=turn.projected_messages,
+                attempts=kanban_guard_attempts,
+            )
+        except Exception:
+            logger.debug(
+                "codex app-server kanban stop-loop check failed",
+                exc_info=True,
+            )
+            kanban_nudge = None
+
+        if not kanban_nudge:
+            break
+
+        kanban_guard_attempts += 1
+        logger.info(
+            "codex app-server kanban stop-loop nudge issued "
+            "(attempt %d) task=%s",
+            kanban_guard_attempts,
+            os.environ.get("HERMES_KANBAN_TASK", ""),
+        )
+        followup = agent._codex_session.run_turn(user_input=kanban_nudge)
+        api_calls += 1
+
+        turn.projected_messages.extend(followup.projected_messages)
+        turn.tool_iterations += followup.tool_iterations
+        if followup.final_text:
+            turn.final_text = followup.final_text
+        turn.interrupted = followup.interrupted
+        turn.error = followup.error
+        turn.should_retire = turn.should_retire or followup.should_retire
+        turn.compacted = turn.compacted or followup.compacted
+        if followup.turn_id is not None:
+            turn.turn_id = followup.turn_id
+        if followup.thread_id is not None:
+            turn.thread_id = followup.thread_id
+        if followup.token_usage_last is not None:
+            turn.token_usage_last = followup.token_usage_last
+        if followup.token_usage_total is not None:
+            turn.token_usage_total = followup.token_usage_total
+        if followup.model_context_window is not None:
+            turn.model_context_window = followup.model_context_window
+
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
     # exited), retire the session so the next turn respawns codex
@@ -770,8 +824,6 @@ def run_codex_app_server_turn(
     )
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn)
-    api_calls = 1
-
     # Now check the skill nudge AFTER iters were incremented — same
     # pattern the chat_completions path uses (line ~15432).
     should_review_skills = False

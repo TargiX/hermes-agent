@@ -47,6 +47,17 @@ def _tool_call_name(tc: Any) -> str:
     return str(getattr(tc, "name", "") or "")
 
 
+def _is_terminal_kanban_tool(name: str) -> bool:
+    """Accept native names and Codex MCP-projected names for terminal tools."""
+    if name in _TERMINAL_KANBAN_TOOLS:
+        return True
+    return any(
+        name.endswith(f"{separator}{tool}")
+        for separator in (".", "__")
+        for tool in _TERMINAL_KANBAN_TOOLS
+    )
+
+
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     """True if this conversation already invoked a terminal kanban tool."""
     if not messages:
@@ -57,11 +68,11 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
         role = msg.get("role")
         if role == "assistant":
             for tc in msg.get("tool_calls") or []:
-                if _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS:
+                if _is_terminal_kanban_tool(_tool_call_name(tc)):
                     return True
         elif role == "tool":
             name = str(msg.get("name") or "")
-            if name in _TERMINAL_KANBAN_TOOLS:
+            if _is_terminal_kanban_tool(name):
                 return True
     return False
 
