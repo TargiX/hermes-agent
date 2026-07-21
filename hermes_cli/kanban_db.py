@@ -6810,6 +6810,32 @@ _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
 
+def _has_forced_evidence_recovery_after(
+    conn: sqlite3.Connection,
+    task_id: str,
+    created_at: int,
+) -> bool:
+    """Whether a validated forced promotion deliberately supersedes a guard."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'promoted_manual' AND created_at >= ? "
+        "ORDER BY id DESC",
+        (task_id, created_at),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, ValueError):
+            continue
+        if (
+            payload.get("forced") is True
+            and isinstance(payload.get("evidence_task_id"), str)
+            and payload["evidence_task_id"].strip()
+        ):
+            return True
+    return False
+
+
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
 
@@ -8095,10 +8121,17 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            if _has_forced_evidence_recovery_after(
+                conn,
+                task_id,
+                int(c["created_at"] or 0),
+            ):
+                continue
             return "active_pr"
 
     return None

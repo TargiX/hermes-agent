@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -2037,6 +2038,38 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_bypassed_by_forced_evidence_recovery(kanban_home):
+    """A validated forced recovery can deliberately resume the same PR card."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="repair-existing-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (
+                t,
+                "Existing https://github.com/example/repo/pull/42 needs metadata closeout",
+                now - 10,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'promoted_manual', ?, ?)",
+            (
+                t,
+                json.dumps(
+                    {
+                        "forced": True,
+                        "evidence_task_id": "t_approved_recovery",
+                    }
+                ),
+                now,
+            ),
+        )
+
+        assert kb.check_respawn_guard(conn, t) is None
 
 
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
