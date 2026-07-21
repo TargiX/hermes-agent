@@ -577,6 +577,7 @@ _SYNTHETIC_USER_FLAGS = (
     "_empty_recovery_synthetic",
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    "_kanban_prelimit_synthetic",
 )
 
 

@@ -6,6 +6,7 @@ import pytest
 
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
+    inject_kanban_prelimit_nudge,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
 )
@@ -123,6 +124,34 @@ def test_nudge_budget_exhausted(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=[], attempts=2) is None
     assert build_kanban_stop_nudge(messages=[], attempts=1, max_attempts=1) is None
     assert build_kanban_stop_nudge(messages=[], attempts=0, max_attempts=1) is not None
+
+
+def test_prelimit_nudge_reserves_final_four_calls(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_closeout")
+    messages = [
+        {"role": "user", "content": "work kanban task"},
+        {"role": "assistant", "content": None, "tool_calls": []},
+        {"role": "tool", "name": "terminal", "content": "evidence"},
+    ]
+
+    assert inject_kanban_prelimit_nudge(messages, remaining_calls=5) is False
+    assert inject_kanban_prelimit_nudge(messages, remaining_calls=4) is True
+    assert messages[-1]["role"] == "user"
+    assert "KANBAN_CLOSEOUT_REQUIRED_V1" in messages[-1]["content"]
+    assert "Stop optional work now" in messages[-1]["content"]
+    assert "kanban_complete" in messages[-1]["content"]
+    assert "kanban_block" in messages[-1]["content"]
+
+
+def test_prelimit_nudge_does_not_fire_after_terminal_call(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_done")
+    messages = [
+        {"role": "user", "content": "work kanban task"},
+        {"role": "tool", "name": "kanban_complete", "content": "done"},
+    ]
+
+    assert inject_kanban_prelimit_nudge(messages, remaining_calls=4) is False
+    assert len(messages) == 2
 
 
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────

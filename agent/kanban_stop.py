@@ -14,12 +14,13 @@ loop continues instead of exiting.
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, MutableSequence, Optional
 
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
 _DEFAULT_MAX_ATTEMPTS = 2
+_DEFAULT_CLOSEOUT_RESERVE = 4
 
 
 def kanban_stop_nudge_enabled() -> bool:
@@ -116,8 +117,56 @@ def build_kanban_stop_nudge(
     )
 
 
+def inject_kanban_prelimit_nudge(
+    messages: MutableSequence[dict[str, Any]],
+    *,
+    remaining_calls: int,
+    reserve_calls: int = _DEFAULT_CLOSEOUT_RESERVE,
+    task_id: Optional[str] = None,
+) -> bool:
+    """Inject one early closeout directive before the terminal tool budget is gone.
+
+    The caller owns once-per-turn deduplication. This helper only fires inside
+    the final bounded reserve and never after a terminal Kanban callback.
+    """
+
+    if not kanban_stop_nudge_enabled():
+        return False
+    if remaining_calls <= 0 or remaining_calls > reserve_calls:
+        return False
+    if session_called_kanban_terminal(messages):
+        return False
+
+    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    nudge = (
+        "KANBAN_CLOSEOUT_REQUIRED_V1: "
+        f"Task `{tid or 'this task'}` has {remaining_calls} model calls left. "
+        "Stop optional work now; use the remaining calls only to assemble the exact "
+        "required receipt and call `kanban_complete` or `kanban_block` directly. "
+        "Do not explore, poll, sleep, delegate, or end with narrative only."
+    )
+    if messages and messages[-1].get("role") == "user":
+        content = messages[-1].get("content")
+        if isinstance(content, str):
+            messages[-1]["content"] = f"{content}\n\n{nudge}"
+        elif isinstance(content, list):
+            content.append({"type": "text", "text": nudge})
+        else:
+            messages[-1]["content"] = nudge
+    else:
+        messages.append(
+            {
+                "role": "user",
+                "content": nudge,
+                "_kanban_prelimit_synthetic": True,
+            }
+        )
+    return True
+
+
 __all__ = [
     "build_kanban_stop_nudge",
+    "inject_kanban_prelimit_nudge",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",
 ]

@@ -729,6 +729,36 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
+
+        # Reserve the final four model calls for a direct Kanban terminal
+        # receipt. The ordinary stop guard only sees a textual finish; models
+        # that keep calling tools until the hard cap otherwise never receive
+        # it. Inject once, before budget consumption, while closeout remains
+        # possible.
+        if not getattr(agent, "_kanban_prelimit_nudge_issued", False):
+            try:
+                from agent.kanban_stop import inject_kanban_prelimit_nudge
+
+                _kanban_remaining_calls = min(
+                    max(agent.max_iterations - api_call_count, 0),
+                    max(agent.iteration_budget.remaining, 0),
+                )
+                if inject_kanban_prelimit_nudge(
+                    messages,
+                    remaining_calls=_kanban_remaining_calls,
+                ):
+                    agent._kanban_prelimit_nudge_issued = True
+                    agent._session_messages = messages
+                    logger.info(
+                        "kanban pre-limit closeout nudge issued task=%s remaining=%d",
+                        os.environ.get("HERMES_KANBAN_TASK", ""),
+                        _kanban_remaining_calls,
+                    )
+                    agent._emit_status(
+                        "⚠️ Kanban closeout reserve reached — terminal receipt required"
+                    )
+            except Exception:
+                logger.debug("kanban pre-limit nudge failed", exc_info=True)
         
         api_call_count += 1
         agent._api_call_count = api_call_count
