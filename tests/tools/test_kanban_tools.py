@@ -311,6 +311,10 @@ def test_show_compact_bounds_large_body_and_receipt(worker_env):
         "metadata": {
             "handoff_version": "phosphene-evidence/v1",
             "outcome": "DISPATCH_EVIDENCE",
+            "diff_sha256": "a" * 64,
+            "implementation_task": "t_implementation",
+            "implementation_workspace_path": "/tmp/canonical-implementation",
+            "selection_signature": "phosphene:create:retry",
             "evidence": [f"evidence-{index}-" + "x" * 1000 for index in range(10)],
             "unbounded_transcript": "secret detail " * 1000,
         },
@@ -327,6 +331,10 @@ def test_show_compact_bounds_large_body_and_receipt(worker_env):
     assert len(shown["latest_run"]["summary"]) <= 801
     receipt = shown["latest_run"]["metadata"]
     assert receipt["outcome"] == "DISPATCH_EVIDENCE"
+    assert receipt["diff_sha256"] == "a" * 64
+    assert receipt["implementation_task"] == "t_implementation"
+    assert receipt["implementation_workspace_path"] == "/tmp/canonical-implementation"
+    assert receipt["selection_signature"] == "phosphene:create:retry"
     assert receipt["evidence"][-1] == {"_omitted_items": 6}
     assert "unbounded_transcript" in receipt["_omitted_keys"]
     assert "secret detail" not in json.dumps(shown)

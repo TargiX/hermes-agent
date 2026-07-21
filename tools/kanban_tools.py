@@ -404,12 +404,15 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 _COMPACT_METADATA_KEYS = (
     "handoff_version", "schema", "status", "task_class", "outcome",
     "verdict", "approved", "owner_profile", "model", "task_id", "intent",
-    "base_ref", "head_ref", "changed_files", "diff_fingerprint",
+    "base_ref", "base_sha", "head_ref", "head_sha", "changed_files",
+    "diff_sha256", "diff_fingerprint", "implementation_task",
+    "implementation_workspace_path", "review_task", "publication_task",
     "reviewed_task_id", "reviewed_fingerprint", "blocking_findings",
     "authorized_next_task_ids", "next_owner", "recommended_next_stage",
     "environment_gap", "source_ref", "evidence", "falsifier",
     "collision_result", "acceptance_checked", "verification", "risks",
-    "residual_uncertainty",
+    "residual_uncertainty", "selection_signature", "reopen_condition",
+    "authority_signature", "existing_pr", "pr_url",
 )
 
 

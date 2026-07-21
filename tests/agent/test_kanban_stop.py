@@ -169,5 +169,5 @@ def test_kanban_guidance_names_codex_callbacks_and_repo_free_scratch() -> None:
 
 
 def test_kanban_guidance_forbids_self_polling_after_deliverable() -> None:
-    assert "Never wait, sleep, or poll your own task status" in KANBAN_GUIDANCE
-    assert "call the terminal board tool immediately" in KANBAN_GUIDANCE
+    assert "Never wait, sleep, or poll your task" in KANBAN_GUIDANCE
+    assert "terminal board tool immediately" in KANBAN_GUIDANCE
