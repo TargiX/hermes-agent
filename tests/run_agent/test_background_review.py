@@ -49,7 +49,10 @@ def test_completed_kanban_learning_thread_survives_worker_exit(monkeypatch):
             captured["name"] = name
 
         def start(self):
-            pass
+            captured["started"] = True
+
+        def join(self, timeout=None):
+            captured["join_timeout"] = timeout
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_done")
     monkeypatch.setattr(run_agent_module.threading, "Thread", CapturingThread)
@@ -60,7 +63,12 @@ def test_completed_kanban_learning_thread_survives_worker_exit(monkeypatch):
         review_skills=True,
     )
 
-    assert captured == {"daemon": False, "name": "bg-review"}
+    assert captured == {
+        "daemon": True,
+        "name": "bg-review",
+        "started": True,
+        "join_timeout": 130,
+    }
 
 
 def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
