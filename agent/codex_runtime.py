@@ -844,7 +844,6 @@ def run_codex_app_server_turn(
         and "skill_manage" in agent.valid_tool_names
     ):
         should_review_skills = True
-        agent._iters_since_skill = 0
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
@@ -862,9 +861,18 @@ def run_codex_app_server_turn(
     # Background review fork — same cadence + signature as the default
     # path (line ~15449). Only fires when a trigger actually tripped AND
     # we have a real final response.
+    kanban_task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    kanban_terminal_status = None
+    if kanban_task_id:
+        from agent.turn_finalizer import _kanban_task_terminal_status
+
+        kanban_terminal_status = _kanban_task_terminal_status(kanban_task_id)
+    background_review_eligible = not kanban_task_id or bool(kanban_terminal_status)
     if (
         turn.final_text
         and not turn.interrupted
+        and turn.error is None
+        and background_review_eligible
         and (should_review_memory or should_review_skills)
     ):
         try:
@@ -873,6 +881,8 @@ def run_codex_app_server_turn(
                 review_memory=should_review_memory,
                 review_skills=should_review_skills,
             )
+            if should_review_skills:
+                agent._iters_since_skill = 0
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 

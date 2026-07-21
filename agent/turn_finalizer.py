@@ -618,7 +618,6 @@ def finalize_turn(
             and agent._iters_since_skill >= agent._skill_nudge_interval
             and "skill_manage" in agent.valid_tool_names):
         _should_review_skills = True
-        agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
@@ -630,13 +629,20 @@ def finalize_turn(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    if (
+        final_response
+        and completed
+        and not interrupted
+        and (_should_review_memory or _should_review_skills)
+    ):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=_should_review_memory,
                 review_skills=_should_review_skills,
             )
+            if _should_review_skills:
+                agent._iters_since_skill = 0
         except Exception:
             pass  # Background review is best-effort
 

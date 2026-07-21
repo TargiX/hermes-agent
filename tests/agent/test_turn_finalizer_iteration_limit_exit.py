@@ -299,6 +299,26 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
 
+def test_budget_exhaustion_never_trains_background_skills(monkeypatch):
+    """An unfinished worker attempt is evidence, not a learning authority."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+    agent._skill_nudge_interval = 1
+    agent._iters_since_skill = 1
+    agent.valid_tool_names = ["skill_manage"]
+    agent._spawn_background_review = MagicMock(name="spawn_background_review")
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+        pending_verification_response="plausible but unfinished verdict",
+    )
+
+    assert result["completed"] is False
+    agent._spawn_background_review.assert_not_called()
+
+
 def test_delegated_child_budget_exhaustion_does_not_timeout_parent(monkeypatch):
     from agent.execution_scope import delegated_child_scope
 
