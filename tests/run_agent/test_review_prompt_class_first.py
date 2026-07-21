@@ -1,7 +1,7 @@
 """Behavior tests for the skill review / combined review prompts.
 
-The review prompts steer the background review agent toward actively updating
-the skill library after most sessions, with a strong bias toward:
+The review prompts steer the background review agent toward evidence-gated
+updates to the skill library, with a preference order of:
   1. Patching currently-loaded skills first,
   2. Patching existing umbrellas next,
   3. Adding references/ files under an existing umbrella,
@@ -21,16 +21,13 @@ from run_agent import AIAgent
 # _SKILL_REVIEW_PROMPT
 # ---------------------------------------------------------------------------
 
-def test_skill_review_prompt_biases_toward_active_updates():
-    """Prompt must frame updating as the default stance, not something rare."""
+def test_skill_review_prompt_requires_validated_learning():
+    """Prompt must prefer a no-op over activity without durable evidence."""
     prompt = AIAgent._SKILL_REVIEW_PROMPT
-    assert "ACTIVE" in prompt or "active" in prompt.lower(), (
-        "must tell the reviewer to be active"
-    )
-    # "missed learning opportunity" or equivalent framing for not acting
-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower(), (
-        "must frame inaction as a miss, not a neutral outcome"
-    )
+    lower = prompt.lower()
+    assert "durable" in lower and "validated" in lower
+    assert "no-op" in lower
+    assert "never invent" in lower
 
 
 def test_skill_review_prompt_treats_user_corrections_as_skill_signal():
@@ -133,12 +130,14 @@ def test_combined_review_prompt_has_memory_section():
     assert "memory tool" in prompt
 
 
-def test_combined_review_prompt_skills_biased_toward_active_updates():
-    """Skills half must carry the active-update bias."""
+def test_combined_review_prompt_skills_require_validated_learning():
+    """Skills half must carry the same evidence gate and no-op option."""
     prompt = AIAgent._COMBINED_REVIEW_PROMPT
+    lower = prompt.lower()
     assert "**Skills**" in prompt
-    assert "ACTIVE" in prompt or "active" in prompt.lower()
-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower()
+    assert "durable" in lower and "validated" in lower
+    assert "no-op" in lower
+    assert "never invent" in lower
 
 
 def test_combined_review_prompt_treats_user_corrections_as_skill_signal():
@@ -220,6 +219,31 @@ def test_skill_review_prompt_has_anti_pattern_guidance():
 def test_combined_review_prompt_has_anti_pattern_guidance():
     """_COMBINED_REVIEW_PROMPT must carry the same guidance — same failure mode applies."""
     _assert_anti_pattern_guidance(AIAgent._COMBINED_REVIEW_PROMPT, "_COMBINED_REVIEW_PROMPT")
+
+
+def _assert_higher_authority_contract_guard(prompt: str, label: str) -> None:
+    lower = prompt.lower()
+    assert "higher-authority" in lower, (
+        f"{label}: must preserve task/profile-specific authority during learning"
+    )
+    assert "task contract" in lower and "profile contract" in lower, (
+        f"{label}: must name both task and profile contracts"
+    )
+    assert "never replace" in lower or "do not replace" in lower, (
+        f"{label}: must forbid replacing an exact mechanism with a generic recipe"
+    )
+
+
+def test_skill_review_prompt_preserves_higher_authority_contracts():
+    _assert_higher_authority_contract_guard(
+        AIAgent._SKILL_REVIEW_PROMPT, "_SKILL_REVIEW_PROMPT"
+    )
+
+
+def test_combined_review_prompt_preserves_higher_authority_contracts():
+    _assert_higher_authority_contract_guard(
+        AIAgent._COMBINED_REVIEW_PROMPT, "_COMBINED_REVIEW_PROMPT"
+    )
 
 
 # ---------------------------------------------------------------------------
