@@ -244,14 +244,11 @@ class TestSpawnEnvIsolation:
         # And HOME still passes through unchanged
         assert captured["env"].get("HOME") == "/users/alice"
 
-    def test_kanban_worker_adds_pinned_paths_and_linked_git_common_dir(
-        self, monkeypatch, tmp_path
-    ):
+    def test_kanban_worker_adds_only_kanban_writable_root(self, monkeypatch):
         """Codex-runtime Kanban workers need to write board state outside
-        their scratch/worktree workspace and linked-worktree Git metadata, but
-        should not fall back to danger-full-access. Hermes passes a narrow
-        app-server config override for only the dispatcher-pinned paths plus
-        that worktree's common Git directory.
+        their scratch/worktree workspace, but should not fall back to
+        danger-full-access. Hermes passes a narrow app-server config override
+        for the Kanban root only.
         """
         import subprocess
         from agent.transports import codex_app_server as cas
@@ -288,21 +285,10 @@ class TestSpawnEnvIsolation:
         monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "host:123")
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "smoke")
         monkeypatch.setenv("HERMES_SESSION_ID", "session-smoke")
-        board_root = tmp_path / "kanban" / "boards" / "smoke"
-        board_root.mkdir(parents=True)
-        workspace_root = board_root / "workspaces"
-        workspace = tmp_path / "repos" / "project" / ".worktrees" / "t_smoke"
-        workspace.mkdir(parents=True)
-        common_git = tmp_path / "repos" / "project" / ".git"
-        worktree_git = common_git / "worktrees" / "t_smoke"
-        worktree_git.mkdir(parents=True)
-        (worktree_git / "commondir").write_text("../..\n", encoding="utf-8")
-        (workspace / ".git").write_text(
-            f"gitdir: {worktree_git}\n", encoding="utf-8"
+        monkeypatch.setenv(
+            "HERMES_KANBAN_DB",
+            "/users/alice/.hermes/kanban/boards/smoke/kanban.db",
         )
-        monkeypatch.setenv("HERMES_KANBAN_DB", str(board_root / "kanban.db"))
-        monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(workspace_root))
-        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
 
         client = cas.CodexAppServerClient(codex_bin="codex")
         client._closed = True
@@ -310,11 +296,10 @@ class TestSpawnEnvIsolation:
         cmd = captured["cmd"]
         assert cmd[:2] == ["codex", "app-server"]
         assert 'sandbox_mode="workspace-write"' in cmd
-        expected_roots = json.dumps(
-            [str(board_root), str(workspace_root), str(workspace), str(common_git)],
-            separators=(",", ":"),
+        assert (
+            'sandbox_workspace_write.writable_roots=["/users/alice/.hermes/kanban/boards/smoke"]'
+            in cmd
         )
-        assert f"sandbox_workspace_write.writable_roots={expected_roots}" in cmd
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert (
             'mcp_servers.hermes-tools.env.HERMES_KANBAN_TASK="t_smoke"'
@@ -332,7 +317,7 @@ class TestSpawnEnvIsolation:
         )
         assert (
             'mcp_servers.hermes-tools.env.HERMES_KANBAN_DB='
-            f'{json.dumps(str(board_root / "kanban.db"))}'
+            '"/users/alice/.hermes/kanban/boards/smoke/kanban.db"'
             in cmd
         )
         assert (

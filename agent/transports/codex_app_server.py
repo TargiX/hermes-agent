@@ -54,68 +54,6 @@ _KANBAN_MCP_ENV_KEYS = (
 )
 
 
-def _linked_worktree_common_git_dir(workspace: str | None) -> Path | None:
-    """Return the exact common Git directory for a dispatcher-owned worktree.
-
-    Codex already receives the worktree itself as cwd, but Git writes commits,
-    refs, and the per-worktree index through the common repository ``.git``
-    directory.  Accept only the standard ``.git/worktrees/<name>`` layout so a
-    repository-controlled pointer cannot broaden the sandbox arbitrarily.
-    """
-
-    if not workspace:
-        return None
-    dotgit = Path(workspace).expanduser().resolve() / ".git"
-    if not dotgit.is_file():
-        return None
-    try:
-        line = dotgit.read_text(encoding="utf-8").splitlines()[0]
-    except (OSError, IndexError, UnicodeError):
-        return None
-    if not line.startswith("gitdir: "):
-        return None
-    git_dir = Path(line.removeprefix("gitdir: ").strip())
-    if not git_dir.is_absolute():
-        git_dir = dotgit.parent / git_dir
-    try:
-        git_dir = git_dir.resolve(strict=True)
-        common_relative = (git_dir / "commondir").read_text(
-            encoding="utf-8"
-        ).strip()
-        common_dir = (git_dir / common_relative).resolve(strict=True)
-    except (OSError, UnicodeError):
-        return None
-    if (
-        common_dir.name != ".git"
-        or git_dir.parent.name != "worktrees"
-        or git_dir.parent.parent != common_dir
-    ):
-        return None
-    return common_dir
-
-
-def _kanban_writable_roots(spawn_env: dict[str, str], kanban_root: str) -> list[str]:
-    """Build the narrow writable-root set pinned by the dispatcher."""
-
-    roots: list[str] = []
-
-    def add(raw: str | None) -> None:
-        if not raw:
-            return
-        resolved = str(Path(raw).expanduser().resolve())
-        if resolved not in roots:
-            roots.append(resolved)
-
-    add(kanban_root)
-    add(spawn_env.get("HERMES_KANBAN_WORKSPACES_ROOT"))
-    workspace = spawn_env.get("HERMES_KANBAN_WORKSPACE")
-    add(workspace)
-    add(spawn_env.get("HERMES_KANBAN_ROOT"))
-    common_git = _linked_worktree_common_git_dir(workspace)
-    add(str(common_git) if common_git else None)
-    return roots
-
-
 @dataclass
 class CodexAppServerError(RuntimeError):
     """Raised on JSON-RPC errors from the app-server."""
@@ -178,11 +116,11 @@ class CodexAppServerClient:
             spawn_env["CODEX_HOME"] = codex_home
 
         app_server_args = list(extra_args or [])
-        # Kanban workers must be able to write their handoff/status back to the
-        # board DB and, for linked Git worktrees, write the exact common Git
-        # metadata used by index/commit/ref operations. Keep the Codex sandbox
-        # on and add only dispatcher-pinned paths plus a validated standard
-        # ``.git/worktrees/<name>`` common directory.
+        # Kanban workers must be able to write their handoff/status back to
+        # the board DB, which lives outside the per-task workspace. Keep the
+        # Codex sandbox on, but add the Kanban root as the only extra writable
+        # root. Without this, codex-runtime workers finish their actual work
+        # but crash/block when kanban_complete/kanban_block writes SQLite.
         if spawn_env.get("HERMES_KANBAN_TASK"):
             kanban_db = spawn_env.get("HERMES_KANBAN_DB")
             kanban_root = (
@@ -196,14 +134,12 @@ class CodexAppServerClient:
                     ),
                 )
             )
-            writable_roots = _kanban_writable_roots(spawn_env, kanban_root)
             app_server_args.extend(
                 [
                     "-c",
                     'sandbox_mode="workspace-write"',
                     "-c",
-                    "sandbox_workspace_write.writable_roots="
-                    + json.dumps(writable_roots, separators=(",", ":")),
+                    f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
                     "-c",
                     "sandbox_workspace_write.network_access="
                     + (
