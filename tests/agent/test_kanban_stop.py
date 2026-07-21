@@ -9,6 +9,7 @@ from agent.kanban_stop import (
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
 )
+from agent.prompt_builder import KANBAN_GUIDANCE
 
 
 @pytest.fixture
@@ -160,3 +161,8 @@ def test_nudge_and_dispatcher_budgets_are_independent(clear_kanban_env):
     # Dispatcher-side streak is tracked in the DB, not in the nudge module —
     # the nudge module has no knowledge of the streak counter.
     assert not hasattr(build_kanban_stop_nudge, "_streak")
+
+
+def test_kanban_guidance_names_codex_callbacks_and_repo_free_scratch() -> None:
+    assert "mcp.hermes-tools.kanban_show" in KANBAN_GUIDANCE
+    assert "scratch workspace is not a missing checkout" in KANBAN_GUIDANCE
