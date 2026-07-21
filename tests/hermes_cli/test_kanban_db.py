@@ -2549,6 +2549,135 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
     assert f"branch refs/heads/wt/{tid}" in listed
 
 
+def test_dispatch_worktree_prepares_opt_in_shared_path_before_spawn(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    shared_dependencies = repo / "node_modules"
+    shared_dependencies.mkdir()
+    (shared_dependencies / ".ready").write_text("ready\n", encoding="utf-8")
+    kb.create_board("worktree-shared-path-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    observed: dict[str, object] = {}
+
+    def fake_spawn(task, workspace, board=None):
+        destination = Path(workspace) / "node_modules"
+        observed["is_symlink"] = destination.is_symlink()
+        observed["resolved"] = destination.resolve(strict=True)
+        return None
+
+    with kb.connect(board="worktree-shared-path-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="worktree-shared-path-board",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            board="worktree-shared-path-board",
+            worktree_shared_paths=["node_modules"],
+        )
+
+    expected = repo / ".worktrees" / tid
+    assert result.spawned == [(tid, "sentinel", str(expected))]
+    assert observed == {
+        "is_symlink": True,
+        "resolved": shared_dependencies.resolve(),
+    }
+
+
+@pytest.mark.parametrize(
+    "unsafe_path", ["/tmp/node_modules", "../node_modules", "", "."]
+)
+def test_dispatch_worktree_rejects_unsafe_shared_path(
+    kanban_home, tmp_path, monkeypatch, unsafe_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("unsafe-shared-path-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    spawned: list[str] = []
+
+    with kb.connect(board="unsafe-shared-path-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="unsafe-shared-path-board",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+            board="unsafe-shared-path-board",
+            worktree_shared_paths=[unsafe_path],
+            failure_limit=1,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert spawned == []
+    assert result.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+
+
+def test_dispatch_worktree_rejects_shared_path_through_symlinked_parent(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    outside = tmp_path / "outside"
+    (outside / "node_modules").mkdir(parents=True)
+    (repo / "deps").symlink_to(outside, target_is_directory=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "deps"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "add dependency link"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    kb.create_board("escaped-shared-path-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    spawned: list[str] = []
+
+    with kb.connect(board="escaped-shared-path-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="escaped-shared-path-board",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+            board="escaped-shared-path-board",
+            worktree_shared_paths=["deps/node_modules"],
+            failure_limit=1,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert spawned == []
+    assert result.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+
+
 def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch(kanban_home, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_git_repo(repo)

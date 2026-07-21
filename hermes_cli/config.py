@@ -2894,6 +2894,12 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Explicit repo-root paths to expose inside dispatcher-created linked
+        # worktrees before the worker starts. Each entry must be a safe
+        # relative path (for example ``node_modules``). The dispatcher creates
+        # a symlink only when the source exists in the primary checkout; it
+        # never replaces a destination or accepts absolute / parent traversal.
+        "worktree_shared_paths": [],
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or

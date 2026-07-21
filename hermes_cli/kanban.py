@@ -2315,6 +2315,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = _coerce_positive_int(
             _kanban_cfg.get("max_in_progress_per_profile")
         )
+        raw_worktree_shared_paths = _kanban_cfg.get("worktree_shared_paths", [])
+        worktree_shared_paths = (
+            list(raw_worktree_shared_paths)
+            if isinstance(raw_worktree_shared_paths, list)
+            else []
+        )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
@@ -2325,6 +2331,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
+        worktree_shared_paths = []
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
@@ -2336,6 +2343,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            worktree_shared_paths=worktree_shared_paths,
         )
     if getattr(args, "json", False):
         print(json.dumps({

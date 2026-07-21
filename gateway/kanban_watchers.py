@@ -929,6 +929,16 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        raw_worktree_shared_paths = kanban_cfg.get("worktree_shared_paths", [])
+        if isinstance(raw_worktree_shared_paths, list):
+            worktree_shared_paths = list(raw_worktree_shared_paths)
+        else:
+            logger.warning(
+                "kanban dispatcher: invalid kanban.worktree_shared_paths=%r; ignoring",
+                raw_worktree_shared_paths,
+            )
+            worktree_shared_paths = []
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1022,6 +1032,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    worktree_shared_paths=worktree_shared_paths,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

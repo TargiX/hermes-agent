@@ -6636,6 +6636,52 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+def _prepare_worktree_shared_paths(
+    workspace: Path,
+    shared_paths: Optional[list[str]],
+) -> None:
+    """Expose explicitly configured primary-checkout paths before spawn.
+
+    The linked worktree and its primary checkout share a Git common directory.
+    For ordinary non-bare repositories that directory is ``<repo>/.git``;
+    its parent is therefore the only trusted source root. Missing sources are
+    a no-op so one global opt-in can span heterogeneous repositories. Existing
+    destinations fail closed and are never replaced.
+    """
+    if not shared_paths:
+        return
+
+    common_dir = _git_common_dir(workspace)
+    if common_dir is None or common_dir.name != ".git":
+        raise RuntimeError(
+            f"cannot resolve primary checkout for shared worktree paths at {workspace}"
+        )
+    source_root = common_dir.parent.resolve(strict=True)
+    workspace_root = workspace.resolve(strict=True)
+
+    for raw_path in shared_paths:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ValueError("worktree shared paths must be non-empty relative strings")
+        relative = Path(raw_path.strip())
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(
+                f"unsafe worktree shared path {raw_path!r}; use a relative path without '..'"
+            )
+
+        source = source_root / relative
+        if not source.exists():
+            continue
+        destination = workspace_root / relative
+        if os.path.lexists(destination):
+            if destination.is_symlink() and destination.resolve(strict=True) == source.resolve(strict=True):
+                continue
+            raise RuntimeError(
+                f"worktree shared path destination already exists: {destination}"
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.symlink_to(source.resolve(strict=True), target_is_directory=source.is_dir())
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -8329,6 +8375,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    worktree_shared_paths: Optional[list[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8363,6 +8410,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            worktree_shared_paths=worktree_shared_paths,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8379,6 +8427,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            worktree_shared_paths=worktree_shared_paths,
         )
 
 
@@ -8395,6 +8444,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    worktree_shared_paths: Optional[list[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8640,6 +8690,7 @@ def _dispatch_once_locked(
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                _prepare_worktree_shared_paths(workspace, worktree_shared_paths)
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
