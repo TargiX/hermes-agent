@@ -2330,6 +2330,102 @@ def test_worktree_workspace_repo_root_anchor_materializes_linked_worktree(kanban
     assert f"branch refs/heads/wt/{t}" in listed
 
 
+def test_worktree_workspace_branches_from_fetched_origin_tip(kanban_home, tmp_path):
+    """Dispatcher materialization, not the sandboxed worker, owns freshness."""
+
+    seed = tmp_path / "seed"
+    _init_git_repo(seed)
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(remote), "symbolic-ref", "HEAD", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(seed), "remote", "add", "origin", str(remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(seed), "push", "-u", "origin", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    primary = tmp_path / "primary"
+    subprocess.run(
+        ["git", "clone", str(remote), str(primary)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stale_head = subprocess.run(
+        ["git", "-C", str(primary), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    (seed / "fresh.txt").write_text("fresh remote source\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(seed), "add", "fresh.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(seed), "commit", "-m", "fresh source"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(seed), "push", "origin", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    remote_head = subprocess.run(
+        ["git", "-C", str(seed), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert remote_head != stale_head
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="fresh project task",
+            workspace_kind="worktree",
+            workspace_path=str(primary),
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+
+    workspace_head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert workspace_head == remote_head
+    assert workspace_head != stale_head
+    assert (workspace / "fresh.txt").read_text(encoding="utf-8") == (
+        "fresh remote source\n"
+    )
+
+
 def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path):
     """A worktree task created with no explicit path inherits the board's
     default_workdir as its anchor and materializes a per-task linked worktree

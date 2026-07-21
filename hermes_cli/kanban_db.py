@@ -6441,6 +6441,68 @@ def _nearest_existing_path(path: Path) -> Path:
     return current
 
 
+def _resolve_dispatch_worktree_base(repo_root: Path) -> str:
+    """Fetch and resolve the source ref before a sandboxed worker starts.
+
+    Linked-worktree workers can safely edit their assigned checkout, but their
+    sandbox must not receive write access to the repository's shared Git
+    directory merely to refresh remote refs. The trusted dispatcher therefore
+    owns the fetch and branches new task worktrees from the refreshed upstream
+    or origin default instead of a potentially stale primary-checkout HEAD.
+
+    Repositories without an ``origin`` remain valid local-only projects and
+    fall back to ``HEAD``. When an origin exists, fetch failure is explicit: a
+    stale source tree must not be presented to the worker as current truth.
+    """
+
+    def _git(args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    origin = _git(["remote", "get-url", "origin"])
+    if origin.returncode != 0:
+        return "HEAD"
+
+    fetched = _git(["fetch", "--quiet", "origin"], timeout=60)
+    if fetched.returncode != 0:
+        detail = (fetched.stderr or fetched.stdout or "").strip()
+        raise RuntimeError(
+            "git fetch origin failed before worktree materialization"
+            + (f": {detail}" if detail else "")
+        )
+
+    upstream = _git(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]
+    )
+    if upstream.returncode == 0:
+        candidate = (upstream.stdout or "").strip()
+        if candidate and _git(["rev-parse", "--verify", candidate]).returncode == 0:
+            return candidate
+
+    remote_head = _git(
+        ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]
+    )
+    if remote_head.returncode == 0:
+        candidate = (remote_head.stdout or "").strip()
+        if candidate.startswith("refs/remotes/"):
+            candidate = candidate.removeprefix("refs/remotes/")
+        if candidate and _git(["rev-parse", "--verify", candidate]).returncode == 0:
+            return candidate
+
+    for candidate in ("origin/main", "origin/master"):
+        if _git(["rev-parse", "--verify", candidate]).returncode == 0:
+            return candidate
+    raise RuntimeError(
+        "git fetch origin succeeded but no upstream/default remote ref could "
+        "be resolved for worktree materialization"
+    )
+
+
 def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
     current = _nearest_existing_path(path).resolve(strict=False)
     while True:
@@ -6464,9 +6526,10 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
+        base_ref = _resolve_dispatch_worktree_base(repo_root)
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), base_ref,
         ]
     result = subprocess.run(
         cmd,
