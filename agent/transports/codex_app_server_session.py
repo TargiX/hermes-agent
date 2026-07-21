@@ -370,6 +370,7 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
+        first_event_timeout: float = 90.0,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -380,6 +381,11 @@ class CodexAppServerSession:
         `turn/completed`, fast-fail and mark the session for retirement.
         Mirrors openclaw beta.8's post-tool completion watchdog (#81697)
         so a wedged codex doesn't burn the full turn deadline.
+
+        first_event_timeout: after `turn/start` succeeds, require at least one
+        notification or server request within this many seconds. A turn that
+        is accepted but never emits even `turn/started` is wedged before useful
+        work and must not consume the entire outer task deadline.
         """
         # Pre-create the result so startup failures (codex subprocess can't
         # spawn, initialize handshake rejects, thread/start blows up) surface
@@ -445,6 +451,8 @@ class CodexAppServerSession:
 
         result.turn_id = (ts.get("turn") or {}).get("id")
         deadline = time.monotonic() + turn_timeout
+        first_event_deadline = deadline - turn_timeout + first_event_timeout
+        first_event_seen = False
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
@@ -497,6 +505,7 @@ class CodexAppServerSession:
             # reading notifications, so the codex side isn't blocked.
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
+                first_event_seen = True
                 # Drain any pending notifications first so per-turn state
                 # (e.g. _pending_file_changes for fileChange approvals) is
                 # up to date when we make the approval decision. Bounded
@@ -547,7 +556,22 @@ class CodexAppServerSession:
                 timeout=notification_poll_timeout
             )
             if note is None:
+                if (
+                    not first_event_seen
+                    and time.monotonic() > first_event_deadline
+                ):
+                    self._issue_interrupt(result.turn_id)
+                    result.interrupted = True
+                    result.error = (
+                        "codex emitted no events for "
+                        f"{first_event_timeout:.0f}s after turn/start; "
+                        "retiring app-server session."
+                    )
+                    result.should_retire = True
+                    break
                 continue
+
+            first_event_seen = True
 
             method = note.get("method", "")
             if self._on_event is not None:

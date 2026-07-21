@@ -890,6 +890,22 @@ class TestSessionRetirement:
             "respawns codex instead of riding a wedged subprocess."
         )
 
+    def test_no_first_event_watchdog_retires_before_full_turn_deadline(self):
+        client = FakeClient()
+        s = make_session(client)
+
+        r = s.run_turn(
+            "accepted turn that never emits an event",
+            turn_timeout=5.0,
+            notification_poll_timeout=0.01,
+            first_event_timeout=0.05,
+        )
+
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "no events" in r.error
+        assert any(method == "turn/interrupt" for method, _ in client.requests)
+
     def test_completed_turn_does_not_retire(self):
         client = FakeClient()
         client.queue_notification(
