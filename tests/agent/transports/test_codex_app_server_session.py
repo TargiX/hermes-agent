@@ -139,6 +139,29 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    def test_model_and_effort_are_pinned_on_app_server_spawn(self):
+        captured: dict[str, Any] = {}
+        client = FakeClient()
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            model="gpt-5.6-terra",
+            reasoning_effort="high",
+            client_factory=factory,
+        )
+        session.ensure_started()
+
+        assert captured["extra_args"] == [
+            "-c",
+            'model="gpt-5.6-terra"',
+            "-c",
+            'model_reasoning_effort="high"',
+        ]
+
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
         s = make_session(client)

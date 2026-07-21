@@ -7,6 +7,9 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from hermes_cli.runtime_provider import (
@@ -316,6 +319,15 @@ class TestSpawnEnvIsolation:
             'mcp_servers.hermes-tools.env.HERMES_KANBAN_DB='
             '"/users/alice/.hermes/kanban/boards/smoke/kanban.db"'
             in cmd
+        )
+        assert (
+            'mcp_servers.hermes-tools.env.HERMES_HOME='
+            '"/users/alice/.hermes/profiles/backend-worker"'
+            in cmd
+        )
+        source_root = str(Path(cas.__file__).resolve().parents[2])
+        assert (
+            f"mcp_servers.hermes-tools.cwd={json.dumps(source_root)}" in cmd
         )
         assert all("danger" not in part for part in cmd)
 

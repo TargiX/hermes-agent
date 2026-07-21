@@ -23,6 +23,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 from tools.environments.local import hermes_subprocess_env
@@ -34,9 +35,11 @@ MIN_CODEX_VERSION = (0, 125, 0)
 
 # Codex launches configured MCP servers as grandchildren and does not preserve
 # arbitrary worker-scoped environment by default. Forward only the non-secret
-# Kanban lifecycle coordinates that the internal hermes-tools callback needs
-# to expose and safely bind terminal board operations to this exact run.
+# profile and Kanban lifecycle coordinates that the internal hermes-tools
+# callback needs to expose and safely bind terminal board operations to this
+# exact run.
 _KANBAN_MCP_ENV_KEYS = (
+    "HERMES_HOME",
     "HERMES_KANBAN_TASK",
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_CLAIM_LOCK",
@@ -139,6 +142,9 @@ class CodexAppServerClient:
                     f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
                     "-c",
                     "sandbox_workspace_write.network_access=false",
+                    "-c",
+                    "mcp_servers.hermes-tools.cwd="
+                    f"{json.dumps(str(Path(__file__).resolve().parents[2]))}",
                 ]
             )
             for key in _KANBAN_MCP_ENV_KEYS:

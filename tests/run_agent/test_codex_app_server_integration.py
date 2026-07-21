@@ -73,6 +73,34 @@ class TestApiModeAccepted:
 
 
 class TestRunConversationCodexPath:
+    def test_session_uses_acting_model_and_reasoning_effort(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_init(self, **kwargs):
+            captured.update(kwargs)
+            self._thread_id = "thread-stub-1"
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+                turn_id="turn-stub-1",
+                thread_id="thread-stub-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        agent = _make_codex_agent(
+            model="gpt-5.6-terra",
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("implement the focused slice")
+
+        assert captured["model"] == "gpt-5.6-terra"
+        assert captured["reasoning_effort"] == "high"
+
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
         # No background review fork during tests

@@ -596,6 +596,10 @@ def _build_hermes_tools_mcp_entry() -> dict:
     out: dict[str, Any] = {
         "command": sys.executable,
         "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+        # Codex launches stdio MCP servers from the active product cwd. Pin
+        # this callback to the Hermes source/install root so ``python -m
+        # agent...`` remains importable from delegated product worktrees.
+        "cwd": str(Path(__file__).resolve().parents[1]),
     }
     if env:
         out["env"] = env

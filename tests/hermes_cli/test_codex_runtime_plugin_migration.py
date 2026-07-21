@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 
 import pytest
 
@@ -499,6 +501,7 @@ class TestMigrate:
         text = (tmp_path / "config.toml").read_text()
         assert "[mcp_servers.hermes-tools]" in text
         assert "hermes_tools_mcp_server" in text
+        assert f'cwd = "{Path(__file__).resolve().parents[2]}"' in text
         # Must include startup + tool timeouts so codex doesn't give up
         assert "startup_timeout_sec" in text
         assert "tool_timeout_sec" in text
@@ -861,3 +864,14 @@ class TestHermesHomeLeakGuard:
             f"HERMES_HOME should not be set when env var is unset, got: "
             f"{env.get('HERMES_HOME')!r}"
         )
+
+    def test_mcp_entry_has_stable_source_cwd(self):
+        """The stdio command must import Hermes from its own source/install.
+
+        Codex starts MCP servers from the active product worktree. Without an
+        explicit cwd, ``python -m agent...`` cannot import Hermes there and
+        Kanban workers lose their terminal lifecycle callbacks.
+        """
+        entry = _build_hermes_tools_mcp_entry()
+        source_root = Path(__file__).resolve().parents[2]
+        assert entry["cwd"] == str(source_root)
