@@ -21,6 +21,7 @@ class TestCronjobRunExecutesImmediately:
         """action='run' must claim the job then fire it through run_one_job."""
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
+             patch("cron.executions.claim_execution", return_value={"id": "exec-1"}), \
              patch("tools.cronjob_tools.claim_job_for_fire", return_value=True) as m_claim, \
              patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=ran):
@@ -35,6 +36,8 @@ class TestCronjobRunExecutesImmediately:
     def test_run_skips_when_claim_lost(self):
         """If the scheduler already holds the fire claim, do NOT double-run."""
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
+             patch("cron.executions.claim_execution", return_value={"id": "exec-2"}), \
+             patch("cron.executions.finish_execution"), \
              patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \
              patch("cron.scheduler.run_one_job") as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=dict(_JOB)):
@@ -50,6 +53,7 @@ class TestCronjobRunExecutesImmediately:
         """A failed run is reported via the re-read job's last_status/last_error."""
         failed = {"id": "job-run-1", "last_status": "error", "last_error": "provider 500"}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
+             patch("cron.executions.claim_execution", return_value={"id": "exec-3"}), \
              patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_one_job", return_value=True), \
              patch("tools.cronjob_tools.get_job", return_value=failed):
@@ -61,7 +65,9 @@ class TestCronjobRunExecutesImmediately:
 
     def test_execute_job_now_bails_without_claim(self):
         """_execute_job_now never calls run_one_job when the claim is lost."""
-        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \
+        with patch("cron.executions.claim_execution", return_value={"id": "exec-4"}), \
+             patch("cron.executions.finish_execution"), \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \
              patch("cron.scheduler.run_one_job") as m_run:
             res = _execute_job_now(dict(_JOB))
         assert res["claimed"] is False
@@ -70,7 +76,9 @@ class TestCronjobRunExecutesImmediately:
 
     def test_execute_job_now_marks_failure_on_exception(self):
         """An exception during fire is captured, marked failed, not propagated."""
-        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+        with patch("cron.executions.claim_execution", return_value={"id": "exec-5"}), \
+             patch("cron.executions.finish_execution"), \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_one_job", side_effect=RuntimeError("boom")), \
              patch("tools.cronjob_tools.mark_job_run") as m_mark, \
              patch("tools.cronjob_tools.get_job", return_value=dict(_JOB)):
@@ -79,3 +87,15 @@ class TestCronjobRunExecutesImmediately:
         assert res["success"] is False
         assert "boom" in res["error"]
         m_mark.assert_called_once()
+
+    def test_execute_job_now_skips_before_schedule_claim_when_execution_is_live(self):
+        """A wake request must not advance the schedule of an in-flight run."""
+        with patch("cron.executions.claim_execution", return_value=None), \
+             patch("tools.cronjob_tools.claim_job_for_fire") as m_schedule_claim, \
+             patch("cron.scheduler.run_one_job") as m_run:
+            res = _execute_job_now(dict(_JOB))
+
+        assert res["claimed"] is False
+        assert "live execution" in res["error"]
+        m_schedule_claim.assert_not_called()
+        m_run.assert_not_called()

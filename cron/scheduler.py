@@ -279,7 +279,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import claim_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -3683,7 +3683,14 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     """
     execution_id = job.get("execution_id")
     if not execution_id:
-        execution_id = create_execution(job["id"], source="direct")["id"]
+        execution = claim_execution(job["id"], source="direct")
+        if execution is None:
+            logger.info(
+                "Job '%s' already has a live execution — skipping duplicate direct fire",
+                job.get("name", job["id"]),
+            )
+            return False
+        execution_id = execution["id"]
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3969,7 +3976,15 @@ def tick(
                 _running_job_ids.add(job_id)
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
+            execution = claim_execution(job_id, source="builtin")
+            if execution is None:
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                logger.info(
+                    "Job '%s' already has a live execution — skipping duplicate tick",
+                    job.get("name", job_id),
+                )
+                return None
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 

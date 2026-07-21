@@ -101,15 +101,28 @@ class CronScheduler(ABC):
         was lost (another machine/retry won it) or the job no longer exists.
         """
         from cron.jobs import claim_job_for_fire, get_job
-        from cron.executions import create_execution
+        from cron.executions import claim_execution, finish_execution
         from cron.scheduler import run_one_job
 
+        execution = claim_execution(job_id, source=self.name)
+        if execution is None:
+            return False
         if not claim_job_for_fire(job_id):
+            finish_execution(
+                execution["id"],
+                success=False,
+                error="Provider fire claim was lost before execution started.",
+            )
             return False  # another machine already claimed this fire
         job = get_job(job_id)
         if job is None:
+            finish_execution(
+                execution["id"],
+                success=False,
+                error="Job disappeared before provider execution started.",
+            )
             return False  # job removed (e.g. repeat-N exhausted) between arm and fire
-        job["execution_id"] = create_execution(job_id, source=self.name)["id"]
+        job["execution_id"] = execution["id"]
         return run_one_job(job, adapters=adapters, loop=loop)
 
     def reconcile(self) -> None:

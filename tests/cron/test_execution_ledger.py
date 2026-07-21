@@ -39,6 +39,25 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     assert persisted == [completed]
 
 
+def test_claim_execution_rejects_live_same_job_until_terminal(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    first = executions.claim_execution("single-lead", source="direct")
+    assert first is not None
+    assert executions.claim_execution("single-lead", source="builtin") is None
+    assert [row["id"] for row in executions.list_executions(job_id="single-lead")] == [
+        first["id"]
+    ]
+
+    executions.mark_execution_running(first["id"])
+    assert executions.claim_execution("single-lead", source="builtin") is None
+    executions.finish_execution(first["id"], success=True)
+
+    next_attempt = executions.claim_execution("single-lead", source="builtin")
+    assert next_attempt is not None
+    assert next_attempt["id"] != first["id"]
+
+
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("immutable", source="builtin")
@@ -216,7 +235,7 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
 
     finished = []
     monkeypatch.setattr(
-        scheduler, "create_execution",
+        scheduler, "claim_execution",
         lambda *_args, **_kwargs: {"id": "exec-submit-fail"},
     )
     monkeypatch.setattr(
@@ -235,6 +254,37 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         })
     ]
     assert "submit-fail" not in scheduler.get_running_job_ids()
+
+
+def test_builtin_tick_does_not_overlap_live_direct_execution(monkeypatch):
+    import cron.scheduler as scheduler
+
+    class NoSubmitPool:
+        def submit(self, _callable):
+            raise AssertionError("duplicate job must not reach executor")
+
+    monkeypatch.setattr(scheduler, "claim_execution", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "single-lead"}])
+    monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: NoSubmitPool())
+
+    assert scheduler.tick(verbose=False, sync=False) == 0
+    assert "single-lead" not in scheduler.get_running_job_ids()
+
+
+def test_direct_run_does_not_overlap_live_execution(monkeypatch):
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "claim_execution", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("duplicate direct run must not execute")
+        ),
+    )
+
+    assert scheduler.run_one_job({"id": "single-lead"}) is False
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):

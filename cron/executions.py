@@ -116,6 +116,64 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     return _record(row)  # type: ignore[return-value]
 
 
+def claim_execution(job_id: str, *, source: str) -> Optional[Dict[str, Any]]:
+    """Atomically claim the only live execution slot for one cron job.
+
+    The in-process scheduler guard cannot see a direct/manual fire running in
+    another thread or process. Serialize through the durable ledger so every
+    trigger source agrees that one recurring job has at most one claimed or
+    running execution. Provably abandoned owners are classified ``unknown``
+    before a new claim; a live owner makes this a no-op.
+    """
+
+    now = _hermes_now().isoformat()
+    execution_id = uuid.uuid4().hex
+    pid = os.getpid()
+    with _lock, _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        active = conn.execute(
+            """SELECT id, pid, process_started_at FROM executions
+               WHERE job_id=? AND status IN ('claimed','running')""",
+            (str(job_id),),
+        ).fetchall()
+        live_owner = False
+        for row in active:
+            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+                live_owner = True
+                continue
+            conn.execute(
+                """UPDATE executions SET status='unknown', finished_at=?, error=?
+                   WHERE id=? AND status IN ('claimed','running')""",
+                (
+                    now,
+                    "A new trigger proved the prior execution owner exited before "
+                    "a durable terminal state; whether side effects ran is unknown.",
+                    row["id"],
+                ),
+            )
+        if live_owner:
+            return None
+        conn.execute(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, process_started_at,
+                status, claimed_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+            (
+                execution_id,
+                str(job_id),
+                str(source),
+                _PROCESS_ID,
+                pid,
+                _process_start_time(pid),
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone()
+    return _record(row)
+
+
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     """Transition one claimed attempt to running exactly once."""
     now = _hermes_now().isoformat()
