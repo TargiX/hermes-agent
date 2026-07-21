@@ -598,6 +598,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("max_turns") is not None:
+        result["max_turns"] = job["max_turns"]
+    if job.get("max_runtime_seconds") is not None:
+        result["max_runtime_seconds"] = job["max_runtime_seconds"]
     return result
 
 
@@ -677,6 +681,8 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    max_turns: Optional[int] = None,
+    max_runtime_seconds: Optional[float] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -750,6 +756,8 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                max_turns=max_turns,
+                max_runtime_seconds=max_runtime_seconds,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -923,6 +931,10 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if max_turns is not None:
+                updates["max_turns"] = max_turns
+            if max_runtime_seconds is not None:
+                updates["max_runtime_seconds"] = max_runtime_seconds
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.

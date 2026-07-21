@@ -251,6 +251,39 @@ class TestJobCRUD:
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
 
+    def test_create_persists_per_job_execution_limits(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Fast supervisor",
+            schedule="every 15m",
+            max_turns=8,
+            max_runtime_seconds=300,
+        )
+
+        assert job["max_turns"] == 8
+        assert job["max_runtime_seconds"] == 300.0
+        assert get_job(job["id"])["max_turns"] == 8
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("max_turns", 0),
+            ("max_turns", True),
+            ("max_turns", 1.5),
+            ("max_turns", "1.5"),
+            ("max_runtime_seconds", 0),
+            ("max_runtime_seconds", float("inf")),
+        ],
+    )
+    def test_create_rejects_invalid_execution_limits(
+        self, tmp_cron_dir, field, value
+    ):
+        with pytest.raises(ValueError, match=field):
+            create_job(
+                prompt="Bad supervisor",
+                schedule="every 15m",
+                **{field: value},
+            )
+
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")
         create_job(prompt="Job 2", schedule="every 2h")
@@ -357,6 +390,17 @@ class TestUpdateJob:
         # Verify persisted to disk
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
+
+    def test_update_replaces_per_job_execution_limits(self, tmp_cron_dir):
+        job = create_job(prompt="Supervisor", schedule="every 15m")
+
+        updated = update_job(
+            job["id"],
+            {"max_turns": 6, "max_runtime_seconds": 180},
+        )
+
+        assert updated["max_turns"] == 6
+        assert updated["max_runtime_seconds"] == 180.0
 
     def test_update_schedule(self, tmp_cron_dir):
         job = create_job(prompt="Daily report", schedule="every 1h")

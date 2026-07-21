@@ -264,6 +264,34 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_and_update_per_job_execution_limits(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Fast supervisor",
+                schedule="every 15m",
+                max_turns=8,
+                max_runtime_seconds=300,
+            )
+        )
+
+        assert created["success"] is True
+        assert created["job"]["max_turns"] == 8
+        assert created["job"]["max_runtime_seconds"] == 300.0
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                max_turns=6,
+                max_runtime_seconds=180,
+            )
+        )
+
+        assert updated["success"] is True
+        assert updated["job"]["max_turns"] == 6
+        assert updated["job"]["max_runtime_seconds"] == 180.0
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 

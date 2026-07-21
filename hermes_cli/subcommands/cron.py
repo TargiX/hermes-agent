@@ -70,6 +70,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
     )
+    cron_create.add_argument(
+        "--max-turns",
+        type=int,
+        help="Per-job maximum model/tool iterations (must be positive).",
+    )
+    cron_create.add_argument(
+        "--max-runtime-seconds",
+        type=float,
+        help="Hard per-job wall-clock cap in seconds (must be positive).",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -133,6 +143,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument(
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--max-turns",
+        type=int,
+        help="Replace the per-job maximum model/tool iterations.",
+    )
+    cron_edit.add_argument(
+        "--max-runtime-seconds",
+        type=float,
+        help="Replace the hard per-job wall-clock cap in seconds.",
     )
 
     # lifecycle actions

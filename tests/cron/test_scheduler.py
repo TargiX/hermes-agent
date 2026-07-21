@@ -1003,6 +1003,92 @@ class TestRunJobSessionPersistence:
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
+    def test_run_job_applies_per_job_turn_limit(self, tmp_path):
+        job = {
+            "id": "bounded-job",
+            "name": "bounded",
+            "prompt": "refill",
+            "max_turns": 8,
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert mock_agent_cls.call_args.kwargs["max_iterations"] == 8
+
+    def test_run_job_interrupts_at_per_job_wall_clock_limit(self, tmp_path):
+        import time
+
+        job = {
+            "id": "wall-bounded-job",
+            "name": "wall bounded",
+            "prompt": "refill",
+            "max_runtime_seconds": 0.01,
+        }
+        fake_db = MagicMock()
+        fake_future = MagicMock()
+        fake_pool = MagicMock()
+        fake_pool.submit.return_value = fake_future
+
+        def wait_past_deadline(*_args, **_kwargs):
+            time.sleep(0.02)
+            return set(), set()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls, \
+             patch(
+                 "cron.scheduler.concurrent.futures.ThreadPoolExecutor",
+                 return_value=fake_pool,
+             ), \
+             patch(
+                 "cron.scheduler.concurrent.futures.wait",
+                 side_effect=wait_past_deadline,
+             ):
+            mock_agent = MagicMock()
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is False
+        assert "hard wall-clock limit of 0.01s" in error
+        mock_agent.interrupt.assert_called_once_with(
+            "Cron job exceeded wall-clock limit"
+        )
+
     def test_run_job_suppresses_empty_turn_explainer(self, tmp_path):
         """An empty model turn becomes the '⚠️ No reply…' explainer (#34452).
         For cron, that abnormal-empty explainer must be treated as empty so it

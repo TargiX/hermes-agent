@@ -14,6 +14,7 @@ import concurrent.futures
 import contextvars
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -3034,8 +3035,58 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Per-job execution limits override the profile-wide defaults. Keep
+        # malformed persisted values fail-closed: a hand-edited jobs.json must
+        # not silently discard the very guard intended to bound a supervisor.
+        _job_max_turns = job.get("max_turns")
+        if _job_max_turns is None:
+            max_iterations = (
+                _cfg.get("agent", {}).get("max_turns")
+                or _cfg.get("max_turns")
+                or 90
+            )
+        else:
+            try:
+                max_iterations = int(_job_max_turns)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Cron job '{job_name}' has invalid max_turns={_job_max_turns!r}"
+                ) from exc
+            if (
+                isinstance(_job_max_turns, bool)
+                or (
+                    isinstance(_job_max_turns, float)
+                    and not _job_max_turns.is_integer()
+                )
+                or (
+                    isinstance(_job_max_turns, str)
+                    and str(max_iterations) != _job_max_turns.strip().lstrip("+")
+                )
+                or max_iterations < 1
+            ):
+                raise RuntimeError(
+                    f"Cron job '{job_name}' has invalid max_turns={_job_max_turns!r}"
+                )
+
+        _job_wall_raw = job.get("max_runtime_seconds")
+        _cron_wall_limit = None
+        if _job_wall_raw is not None:
+            try:
+                _cron_wall_limit = float(_job_wall_raw)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Cron job '{job_name}' has invalid "
+                    f"max_runtime_seconds={_job_wall_raw!r}"
+                ) from exc
+            if (
+                isinstance(_job_wall_raw, bool)
+                or not math.isfinite(_cron_wall_limit)
+                or _cron_wall_limit <= 0
+            ):
+                raise RuntimeError(
+                    f"Cron job '{job_name}' has invalid "
+                    f"max_runtime_seconds={_job_wall_raw!r}"
+                )
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -3286,7 +3337,11 @@ def run_job(
         else:
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
-        _POLL_INTERVAL = 5.0
+        _POLL_INTERVAL = (
+            min(5.0, _cron_wall_limit)
+            if _cron_wall_limit is not None
+            else 5.0
+        )
         # Keep the one-shot run_claim fresh while the run is alive (#62002):
         # the claim TTL is a dead-owner detector, but without a heartbeat a
         # run that legitimately outlives it (stream stall, laptop asleep
@@ -3303,6 +3358,7 @@ def run_job(
             str(_run_claim.get("by") or "") if isinstance(_run_claim, dict) else ""
         )
         _last_claim_heartbeat = time.monotonic()
+        _job_started_monotonic = time.monotonic()
 
         def _heartbeat_run_claim_if_due():
             nonlocal _last_claim_heartbeat
@@ -3331,22 +3387,14 @@ def run_job(
             task_id=_cron_task_id,
         )
         _inactivity_timeout = False
+        _wall_timeout = False
         try:
-            if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
-                    result = None
-                    while True:
-                        done, _ = concurrent.futures.wait(
-                            {_cron_future}, timeout=_POLL_INTERVAL,
-                        )
-                        if done:
-                            result = _cron_future.result()
-                            break
-                        _heartbeat_run_claim_if_due()
-                else:
-                    result = _cron_future.result()
+            if (
+                _cron_inactivity_limit is None
+                and _cron_wall_limit is None
+                and not _is_oneshot
+            ):
+                result = _cron_future.result()
             else:
                 result = None
                 while True:
@@ -3357,22 +3405,45 @@ def run_job(
                         result = _cron_future.result()
                         break
                     _heartbeat_run_claim_if_due()
-                    # Agent still running — check inactivity.
-                    _idle_secs = 0.0
-                    if hasattr(agent, "get_activity_summary"):
-                        try:
-                            _act = agent.get_activity_summary()
-                            _idle_secs = _act.get("seconds_since_activity", 0.0)
-                        except Exception:
-                            pass
-                    if _idle_secs >= _cron_inactivity_limit:
-                        _inactivity_timeout = True
+                    if (
+                        _cron_wall_limit is not None
+                        and time.monotonic() - _job_started_monotonic
+                        >= _cron_wall_limit
+                    ):
+                        _wall_timeout = True
                         break
+                    # Agent still running — check inactivity.
+                    if _cron_inactivity_limit is not None:
+                        _idle_secs = 0.0
+                        if hasattr(agent, "get_activity_summary"):
+                            try:
+                                _act = agent.get_activity_summary()
+                                _idle_secs = _act.get("seconds_since_activity", 0.0)
+                            except Exception:
+                                pass
+                        if _idle_secs >= _cron_inactivity_limit:
+                            _inactivity_timeout = True
+                            break
         except Exception:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+
+        if _wall_timeout:
+            _elapsed = time.monotonic() - _job_started_monotonic
+            logger.error(
+                "Job '%s' exceeded wall-clock limit %.0fs (elapsed %.0fs)",
+                job_name,
+                _cron_wall_limit,
+                _elapsed,
+            )
+            if hasattr(agent, "interrupt"):
+                agent.interrupt("Cron job exceeded wall-clock limit")
+            raise TimeoutError(
+                f"Cron job '{job_name}' exceeded its hard wall-clock limit "
+                f"of {_cron_wall_limit:g}s"
+            )
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.

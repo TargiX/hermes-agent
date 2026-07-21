@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import logging
+import math
 import shutil
 import tempfile
 import threading
@@ -1069,6 +1070,42 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+def _normalize_job_positive_int(value: Any, *, field: str) -> Optional[int]:
+    """Normalize an optional positive integer cron execution limit."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a positive integer")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"{field} must be a positive integer")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive integer") from exc
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate or str(normalized) != candidate.lstrip("+"):
+            raise ValueError(f"{field} must be a positive integer")
+    if normalized < 1:
+        raise ValueError(f"{field} must be a positive integer")
+    return normalized
+
+
+def _normalize_job_positive_float(value: Any, *, field: str) -> Optional[float]:
+    """Normalize an optional positive wall-clock limit in seconds."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a positive number")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive number") from exc
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise ValueError(f"{field} must be a positive number")
+    return normalized
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1087,6 +1124,8 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    max_turns: Optional[int] = None,
+    max_runtime_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1131,6 +1170,11 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        max_turns: Optional per-job cap on model/tool iterations. Overrides the
+                   profile-wide agent.max_turns only for this job.
+        max_runtime_seconds: Optional hard wall-clock cap for this agent job.
+                             Unlike HERMES_CRON_TIMEOUT, active output does not
+                             extend this deadline.
 
     Returns:
         The created job dict
@@ -1163,6 +1207,11 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_max_turns = _normalize_job_positive_int(max_turns, field="max_turns")
+    normalized_max_runtime = _normalize_job_positive_float(
+        max_runtime_seconds,
+        field="max_runtime_seconds",
+    )
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1253,6 +1302,10 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    if normalized_max_turns is not None:
+        job["max_turns"] = normalized_max_turns
+    if normalized_max_runtime is not None:
+        job["max_runtime_seconds"] = normalized_max_runtime
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1355,6 +1408,17 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "max_turns" in updates:
+                updates["max_turns"] = _normalize_job_positive_int(
+                    updates["max_turns"],
+                    field="max_turns",
+                )
+            if "max_runtime_seconds" in updates:
+                updates["max_runtime_seconds"] = _normalize_job_positive_float(
+                    updates["max_runtime_seconds"],
+                    field="max_runtime_seconds",
+                )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

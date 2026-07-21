@@ -163,6 +163,10 @@ def cron_list(show_all: bool = False):
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
+        if job.get("max_turns") is not None:
+            print(f"    Max turns: {job['max_turns']}")
+        if job.get("max_runtime_seconds") is not None:
+            print(f"    Max runtime: {job['max_runtime_seconds']}s")
 
         # Execution history
         last_status = job.get("last_status")
@@ -335,6 +339,8 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        max_turns=getattr(args, "max_turns", None),
+        max_runtime_seconds=getattr(args, "max_runtime_seconds", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -351,6 +357,10 @@ def cron_create(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
+    if job_data.get("max_turns") is not None:
+        print(f"  Max turns: {job_data['max_turns']}")
+    if job_data.get("max_runtime_seconds") is not None:
+        print(f"  Max runtime: {job_data['max_runtime_seconds']}s")
     print(f"  Next run: {result['next_run_at']}")
     _warn_if_gateway_not_running()
     return 0
@@ -398,6 +408,8 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        max_turns=getattr(args, "max_turns", None),
+        max_runtime_seconds=getattr(args, "max_runtime_seconds", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -417,6 +429,10 @@ def cron_edit(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
+    if updated.get("max_turns") is not None:
+        print(f"  Max turns: {updated['max_turns']}")
+    if updated.get("max_runtime_seconds") is not None:
+        print(f"  Max runtime: {updated['max_runtime_seconds']}s")
     return 0
 
 
