@@ -191,6 +191,83 @@ def test_review_required_preserves_structured_run_metadata(kanban_home: Path) ->
         assert run.metadata == receipt
 
 
+def test_review_required_cannot_bypass_declared_receipt_through_db(
+    kanban_home: Path,
+) -> None:
+    """Every block path must enforce the task's immutable handoff contract."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (
+                    "task_class: implementation\n"
+                    "required_receipt: phosphene-implementation/v1\n",
+                    tid,
+                ),
+            )
+
+        with pytest.raises(ValueError, match="declared implementation receipt"):
+            kb.block_task(
+                conn,
+                tid,
+                reason="review-required without machine metadata",
+                kind="review_required",
+            )
+
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="review-required with machine metadata",
+            kind="review_required",
+            metadata={
+                "handoff_version": "phosphene-implementation/v1",
+                "diff_sha256": "a" * 64,
+                "diff_fingerprint": "a" * 64,
+                "changed_files": ["feature.ts"],
+                "next_owner": "agencyreviewer",
+            },
+        )
+
+
+def test_review_complete_cannot_bypass_declared_receipt_through_db(
+    kanban_home: Path,
+) -> None:
+    """CLI/direct DB completion must enforce the same review receipt as MCP."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (
+                    "task_class: review\n"
+                    "required_receipt: phosphene-review/v1\n"
+                    "implementation_task_id: t_impl1234\n",
+                    tid,
+                ),
+            )
+
+        with pytest.raises(ValueError, match="declared review receipt"):
+            kb.complete_task(conn, tid, result="APPROVE")
+
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.complete_task(
+            conn,
+            tid,
+            result="APPROVE",
+            metadata={
+                "handoff_version": "phosphene-review/v1",
+                "outcome": "APPROVE",
+                "approved": True,
+                "implementation_task_id": "t_impl1234",
+                "reviewed_fingerprint": "a" * 64,
+                "blocking_findings": [],
+                "authorized_next_task_ids": ["t_impl1234"],
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------

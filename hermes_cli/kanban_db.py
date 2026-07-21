@@ -4738,6 +4738,115 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _declared_contract_value(body: Optional[str], key: str) -> Optional[str]:
+    """Read one exact ``key: value`` line from an immutable task body."""
+
+    if not body:
+        return None
+    prefix = f"{key}:"
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if line.startswith(("- ", "* ")):
+            line = line[2:].strip()
+        if not line.startswith(prefix):
+            continue
+        value = line[len(prefix):].strip().strip("`\"'")
+        return value or None
+    return None
+
+
+def validate_declared_handoff(
+    *,
+    body: Optional[str],
+    metadata: Optional[dict],
+    action: str,
+    block_kind: Optional[str] = None,
+) -> Optional[str]:
+    """Validate immutable review/implementation receipts for every caller.
+
+    This lives in the database boundary so the MCP tool, CLI, dashboard, and
+    direct library callers cannot disagree about terminal handoff authority.
+    """
+
+    task_class = _declared_contract_value(body, "task_class")
+    receipt = _declared_contract_value(body, "required_receipt")
+    if not task_class or not receipt:
+        return None
+    payload = metadata if isinstance(metadata, dict) else {}
+
+    if task_class == "review" and receipt.endswith("-review/v1") and action == "complete":
+        issues: list[str] = []
+        if payload.get("handoff_version") != receipt:
+            issues.append(f"metadata.handoff_version must equal {receipt!r}")
+        outcome = payload.get("outcome")
+        if outcome not in {"APPROVE", "REQUEST_CHANGES"}:
+            issues.append("metadata.outcome must be 'APPROVE' or 'REQUEST_CHANGES'")
+        approved = payload.get("approved")
+        if not isinstance(approved, bool) or (
+            outcome in {"APPROVE", "REQUEST_CHANGES"}
+            and approved is not (outcome == "APPROVE")
+        ):
+            issues.append("metadata.approved must be a boolean matching metadata.outcome")
+        target = (
+            _declared_contract_value(body, "recovery_target")
+            or _declared_contract_value(body, "implementation_task_id")
+        )
+        implementation_task_id = payload.get("implementation_task_id")
+        if not isinstance(implementation_task_id, str) or not implementation_task_id:
+            issues.append("metadata.implementation_task_id is required")
+        elif target and implementation_task_id != target:
+            issues.append(
+                f"metadata.implementation_task_id must equal declared target {target!r}"
+            )
+        reviewed_fingerprint = payload.get("reviewed_fingerprint")
+        if not isinstance(reviewed_fingerprint, str) or not reviewed_fingerprint:
+            issues.append("metadata.reviewed_fingerprint is required")
+        if not isinstance(payload.get("blocking_findings"), list):
+            issues.append("metadata.blocking_findings must be a list")
+        authorized = payload.get("authorized_next_task_ids")
+        if not isinstance(authorized, list) or not authorized:
+            issues.append("metadata.authorized_next_task_ids must be a non-empty list")
+        elif target and target not in authorized:
+            issues.append(
+                f"metadata.authorized_next_task_ids must contain declared target {target!r}"
+            )
+        if issues:
+            return "declared review receipt is incomplete: " + "; ".join(issues)
+
+    if (
+        task_class == "implementation"
+        and receipt.endswith("-implementation/v1")
+        and action == "block"
+        and block_kind == "review_required"
+    ):
+        issues = []
+        if payload.get("handoff_version") != receipt:
+            issues.append(f"metadata.handoff_version must equal {receipt!r}")
+        diff_sha256 = payload.get("diff_sha256")
+        diff_fingerprint = payload.get("diff_fingerprint")
+        if not isinstance(diff_sha256, str) or not diff_sha256:
+            issues.append("metadata.diff_sha256 is required")
+        if not isinstance(diff_fingerprint, str) or not diff_fingerprint:
+            issues.append("metadata.diff_fingerprint is required")
+        if (
+            isinstance(diff_sha256, str)
+            and diff_sha256
+            and isinstance(diff_fingerprint, str)
+            and diff_fingerprint
+            and diff_sha256 != diff_fingerprint
+        ):
+            issues.append("metadata.diff_sha256 must equal metadata.diff_fingerprint")
+        changed_files = payload.get("changed_files")
+        if not isinstance(changed_files, list) or not changed_files:
+            issues.append("metadata.changed_files must be a non-empty list")
+        if payload.get("next_owner") != "agencyreviewer":
+            issues.append("metadata.next_owner must equal 'agencyreviewer'")
+        if issues:
+            return "declared implementation receipt is incomplete: " + "; ".join(issues)
+
+    return None
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4776,6 +4885,17 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    task_row = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    handoff_error = validate_declared_handoff(
+        body=task_row["body"] if task_row else None,
+        metadata=metadata,
+        action="complete",
+    )
+    if handoff_error:
+        raise ValueError(handoff_error)
+
     now = int(time.time())
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -5573,11 +5693,19 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, body FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        handoff_error = validate_declared_handoff(
+            body=cur_row["body"],
+            metadata=metadata,
+            action="block",
+            block_kind=kind,
+        )
+        if handoff_error:
+            raise ValueError(handoff_error)
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])

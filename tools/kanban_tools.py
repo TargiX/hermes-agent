@@ -147,23 +147,6 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
-def _declared_contract_value(body: Optional[str], key: str) -> Optional[str]:
-    """Read one exact ``key: value`` line from an immutable task body."""
-
-    if not body:
-        return None
-    prefix = f"{key}:"
-    for raw_line in body.splitlines():
-        line = raw_line.strip()
-        if line.startswith(("- ", "* ")):
-            line = line[2:].strip()
-        if not line.startswith(prefix):
-            continue
-        value = line[len(prefix):].strip().strip("`\"'")
-        return value or None
-    return None
-
-
 def _validate_declared_handoff(
     *,
     task: Any,
@@ -173,93 +156,21 @@ def _validate_declared_handoff(
 ) -> Optional[str]:
     """Reject incomplete declared receipts before a worker becomes terminal."""
 
-    task_class = _declared_contract_value(task.body, "task_class")
-    receipt = _declared_contract_value(task.body, "required_receipt")
-    if not task_class or not receipt:
+    from hermes_cli import kanban_db as kb
+
+    error = kb.validate_declared_handoff(
+        body=task.body,
+        metadata=metadata,
+        action=action,
+        block_kind=block_kind,
+    )
+    if not error:
         return None
-    payload = metadata if isinstance(metadata, dict) else {}
-
-    if task_class == "review" and receipt.endswith("-review/v1") and action == "complete":
-        issues: list[str] = []
-        if payload.get("handoff_version") != receipt:
-            issues.append(f"metadata.handoff_version must equal {receipt!r}")
-        outcome = payload.get("outcome")
-        if outcome not in {"APPROVE", "REQUEST_CHANGES"}:
-            issues.append("metadata.outcome must be 'APPROVE' or 'REQUEST_CHANGES'")
-        approved = payload.get("approved")
-        if not isinstance(approved, bool) or (
-            outcome in {"APPROVE", "REQUEST_CHANGES"}
-            and approved is not (outcome == "APPROVE")
-        ):
-            issues.append("metadata.approved must be a boolean matching metadata.outcome")
-        target = (
-            _declared_contract_value(task.body, "recovery_target")
-            or _declared_contract_value(task.body, "implementation_task_id")
-        )
-        implementation_task_id = payload.get("implementation_task_id")
-        if not isinstance(implementation_task_id, str) or not implementation_task_id:
-            issues.append("metadata.implementation_task_id is required")
-        elif target and implementation_task_id != target:
-            issues.append(
-                f"metadata.implementation_task_id must equal declared target {target!r}"
-            )
-        reviewed_fingerprint = payload.get("reviewed_fingerprint")
-        if not isinstance(reviewed_fingerprint, str) or not reviewed_fingerprint:
-            issues.append("metadata.reviewed_fingerprint is required")
-        if not isinstance(payload.get("blocking_findings"), list):
-            issues.append("metadata.blocking_findings must be a list")
-        authorized = payload.get("authorized_next_task_ids")
-        if not isinstance(authorized, list) or not authorized:
-            issues.append("metadata.authorized_next_task_ids must be a non-empty list")
-        elif target and target not in authorized:
-            issues.append(
-                f"metadata.authorized_next_task_ids must contain declared target {target!r}"
-            )
-        if issues:
-            return (
-                "declared review receipt is incomplete: "
-                + "; ".join(issues)
-                + ". Your task is still in-flight and no terminal state was written. "
-                "Retry kanban_complete with corrected metadata in this same run."
-            )
-
-    if (
-        task_class == "implementation"
-        and receipt.endswith("-implementation/v1")
-        and action == "block"
-        and block_kind == "review_required"
-    ):
-        issues = []
-        if payload.get("handoff_version") != receipt:
-            issues.append(f"metadata.handoff_version must equal {receipt!r}")
-        diff_sha256 = payload.get("diff_sha256")
-        diff_fingerprint = payload.get("diff_fingerprint")
-        if not isinstance(diff_sha256, str) or not diff_sha256:
-            issues.append("metadata.diff_sha256 is required")
-        if not isinstance(diff_fingerprint, str) or not diff_fingerprint:
-            issues.append("metadata.diff_fingerprint is required")
-        if (
-            isinstance(diff_sha256, str)
-            and diff_sha256
-            and isinstance(diff_fingerprint, str)
-            and diff_fingerprint
-            and diff_sha256 != diff_fingerprint
-        ):
-            issues.append("metadata.diff_sha256 must equal metadata.diff_fingerprint")
-        changed_files = payload.get("changed_files")
-        if not isinstance(changed_files, list) or not changed_files:
-            issues.append("metadata.changed_files must be a non-empty list")
-        if payload.get("next_owner") != "agencyreviewer":
-            issues.append("metadata.next_owner must equal 'agencyreviewer'")
-        if issues:
-            return (
-                "declared implementation receipt is incomplete: "
-                + "; ".join(issues)
-                + ". Your task is still in-flight and no terminal state was written. "
-                "Retry kanban_block with corrected metadata in this same run."
-            )
-
-    return None
+    callback = "kanban_complete" if action == "complete" else "kanban_block"
+    return (
+        f"{error}. Your task is still in-flight and no terminal state was written. "
+        f"Retry {callback} with corrected metadata in this same run."
+    )
 
 
 def _stamp_worker_session_metadata(
