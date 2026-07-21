@@ -12,6 +12,7 @@ import multiprocessing as mp
 import sqlite3
 import threading
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -158,6 +159,20 @@ def test_write_lock_serializes_independent_connections(db_path):
     finally:
         first.close()
         second.close()
+
+
+def test_mock_connection_does_not_materialize_a_magicmock_write_lock(
+    tmp_path, monkeypatch
+):
+    """Non-SQLite test doubles must not turn their repr into an on-disk lock path."""
+    monkeypatch.chdir(tmp_path)
+    conn = MagicMock()
+
+    assert kb._connection_db_path(conn) is None
+    with kb.write_txn(conn):
+        pass
+
+    assert list(tmp_path.glob("*MagicMock*.write.lock")) == []
 
 
 def test_cold_connect_migrates_existing_wal_database_to_delete(tmp_path):

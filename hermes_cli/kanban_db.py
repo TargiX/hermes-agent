@@ -2643,9 +2643,16 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
 def _connection_db_path(conn: sqlite3.Connection) -> Optional[Path]:
     """Return the main on-disk DB path for ``conn`` when one exists."""
     row = conn.execute("PRAGMA database_list").fetchone()
-    if row is None or not row[2]:
+    if row is None:
         return None
-    return Path(str(row[2])).resolve()
+    raw_path = row[2]
+    # sqlite3 always returns the filename as text. Test doubles and wrapper
+    # connections can return truthy proxy objects (notably MagicMock); turning
+    # their repr into a Path would create garbage ``*.write.lock`` files in the
+    # process cwd. Treat every non-text value as an unknown/in-memory path.
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    return Path(raw_path).resolve()
 
 
 def _is_corruption_error(exc: BaseException) -> bool:
