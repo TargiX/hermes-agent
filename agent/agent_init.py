@@ -75,6 +75,11 @@ def _bind_kanban_run_session(session_id: str) -> None:
     itself remains available so a temporary Kanban write problem can still be
     diagnosed and reported by the worker.
     """
+    from agent.execution_scope import in_delegated_child_scope
+
+    if in_delegated_child_scope():
+        return
+
     # A self-improvement fork inherits the worker's process environment but is
     # not a new execution of that Kanban run. Binding its freshly generated
     # constructor session would create noisy CAS failures (or steal provenance

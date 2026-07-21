@@ -114,7 +114,13 @@ def finalize_turn(
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
     )
-    _kanban_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    from agent.execution_scope import in_delegated_child_scope
+
+    _kanban_task = (
+        ""
+        if in_delegated_child_scope()
+        else (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    )
     _kanban_terminal_status = (
         _kanban_task_terminal_status(_kanban_task) if _kanban_task else None
     )

@@ -38,6 +38,7 @@ from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
+from agent.execution_scope import in_delegated_child_scope
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,8 @@ def _check_kanban_mode() -> bool:
     embedded by default) and orchestrator profiles with the kanban
     toolset enabled see the Kanban lifecycle tool surface.
     """
+    if in_delegated_child_scope():
+        return False
     if os.environ.get("HERMES_KANBAN_TASK"):
         return True
     return _profile_has_kanban_toolset()
@@ -89,6 +92,8 @@ def _check_kanban_orchestrator_mode() -> bool:
     board state. Profiles that explicitly opt into the kanban toolset
     and are NOT scoped to a single task are the orchestrator surface.
     """
+    if in_delegated_child_scope():
+        return False
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
     return _profile_has_kanban_toolset()
@@ -175,6 +180,13 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     when it must be rejected. Callers should ``return`` the error
     verbatim.
     """
+    if in_delegated_child_scope():
+        return tool_error(
+            "delegated child contributions cannot mutate Kanban lifecycle "
+            "state; return evidence to the parent agent, which owns the task "
+            "handoff"
+        )
+
     env_tid = os.environ.get("HERMES_KANBAN_TASK")
     if not env_tid:
         # Orchestrator or CLI context — no task-scope restriction.

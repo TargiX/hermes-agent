@@ -2049,6 +2049,70 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
 
 class TestChildCredentialLeasing(unittest.TestCase):
+    def test_build_child_agent_enters_delegated_execution_scope(self):
+        from agent.execution_scope import in_delegated_child_scope
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["hermes-cli"]
+        observed = []
+
+        def build_fake_child(**kwargs):
+            observed.append(in_delegated_child_scope())
+            return MagicMock()
+
+        with patch("run_agent.AIAgent", side_effect=build_fake_child):
+            _build_child_agent(
+                task_index=0,
+                goal="Review parent work without owning its lifecycle",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(observed, [True])
+
+    def test_run_single_child_enters_delegated_execution_scope(self):
+        from agent.execution_scope import in_delegated_child_scope
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child._credential_pool = None
+        child._delegate_saved_tool_names = []
+        child._subagent_id = None
+        child.tool_progress_callback = None
+        child.reasoning_config = None
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.session_estimated_cost_usd = 0.0
+        child.model = "test-model"
+        child.provider = "test-provider"
+        child.session_id = "child-session"
+        observed = []
+
+        def run_conversation(**kwargs):
+            observed.append(in_delegated_child_scope())
+            return {
+                "final_response": "child contribution",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        child.run_conversation.side_effect = run_conversation
+        result = _run_single_child(
+            task_index=0,
+            goal="Inspect only",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(observed, [True])
+
     def test_run_single_child_acquires_and_releases_lease(self):
         from tools.delegate_tool import _run_single_child
 

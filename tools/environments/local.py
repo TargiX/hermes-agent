@@ -463,6 +463,22 @@ def _inject_session_context_env(env: dict) -> None:
         env.pop("TERMINAL_CWD", None)
 
 
+def _strip_delegated_parent_kanban_env(env: dict[str, str]) -> None:
+    """Remove a dispatcher parent's identity from delegated subprocesses."""
+
+    try:
+        from agent.execution_scope import in_delegated_child_scope
+
+        delegated = in_delegated_child_scope()
+    except Exception:
+        delegated = False
+    if not delegated:
+        return
+    for key in list(env):
+        if key.startswith("HERMES_KANBAN_"):
+            env.pop(key, None)
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -499,6 +515,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # Same cross-session leak guard as _make_run_env, for the background/PTY
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
+    _strip_delegated_parent_kanban_env(sanitized)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
@@ -610,6 +627,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     _inject_context_hermes_home(env)
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(env)
+    _strip_delegated_parent_kanban_env(env)
 
     # Active-venv markers must not clobber another project's environment.
     for _marker in _ACTIVE_VENV_MARKER_VARS:
@@ -1183,6 +1201,7 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
+    _strip_delegated_parent_kanban_env(run_env)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)

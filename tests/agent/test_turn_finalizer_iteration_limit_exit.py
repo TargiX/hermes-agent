@@ -299,6 +299,27 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
 
+def test_delegated_child_budget_exhaustion_does_not_timeout_parent(monkeypatch):
+    from agent.execution_scope import delegated_child_scope
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-parent")
+    record = MagicMock(name="record_task_failure")
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    agent = _LimitAgent()
+
+    with delegated_child_scope():
+        result = _finalize(
+            agent,
+            final_response=None,
+            exit_reason="unknown",
+            pending_verification_response="child contribution",
+        )
+
+    assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
+    record.assert_not_called()
+
+
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
     """When budget exhaustion preserves a verification candidate that is
     already the tail assistant message, the finalizer must NOT append a

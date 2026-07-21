@@ -31,6 +31,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
+from agent.execution_scope import in_delegated_child_scope
 
 logger = logging.getLogger(__name__)
 
@@ -322,6 +323,7 @@ def get_tool_definitions(
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            in_delegated_child_scope(),
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
@@ -366,7 +368,11 @@ def _compute_tool_definitions(
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if os.environ.get("HERMES_KANBAN_TASK") and "kanban" not in effective_enabled_toolsets:
+        if (
+            os.environ.get("HERMES_KANBAN_TASK")
+            and not in_delegated_child_scope()
+            and "kanban" not in effective_enabled_toolsets
+        ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
             # must always receive the lifecycle handoff tools. Assignee
             # profiles may intentionally restrict their normal chat toolsets
@@ -391,6 +397,13 @@ def _compute_tool_definitions(
         from toolsets import get_all_toolsets
         for ts_name in get_all_toolsets():
             tools_to_include.update(resolve_toolset(ts_name))
+
+    # A delegated child shares the dispatcher worker's process environment,
+    # but it is a contribution to the parent, not a lifecycle owner. Strip the
+    # whole Kanban surface before registry check caching can re-expose schemas
+    # resolved for the parent context.
+    if in_delegated_child_scope():
+        tools_to_include.difference_update(resolve_toolset("kanban"))
 
     # Always apply disabled toolsets as a subtraction step at the end.
     # This ensures that even if a composite toolset (like hermes-cli)
