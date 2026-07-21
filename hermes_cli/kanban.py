@@ -640,6 +640,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Promote even if parent dependencies are not yet done/archived",
     )
     p_promote.add_argument(
+        "--evidence-task-id",
+        default=None,
+        help=(
+            "Existing task id that proves a triage blocker is resolved. "
+            "Required with --force when recovering a triage task."
+        ),
+    )
+    p_promote.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate the promotion without mutating state",
@@ -2221,6 +2229,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 actor=author,
                 reason=reason,
                 force=bool(args.force),
+                evidence_task_id=getattr(args, "evidence_task_id", None),
                 dry_run=bool(args.dry_run),
             )
             results.append({
@@ -2228,6 +2237,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 "promoted": ok,
                 "dry_run": bool(args.dry_run),
                 "forced": bool(args.force),
+                "evidence_task_id": getattr(args, "evidence_task_id", None),
                 "reason": reason,
                 "error": err,
             })

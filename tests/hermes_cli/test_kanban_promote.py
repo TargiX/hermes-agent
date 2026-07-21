@@ -215,15 +215,52 @@ def test_promote_blocked_task_works(conn):
 
 
 def _promote_ns(task_id, *, ids=None, reason=None, force=False,
-                dry_run=False, as_json=False):
+                evidence_task_id=None, dry_run=False, as_json=False):
     return argparse.Namespace(
         task_id=task_id,
         reason=list(reason or []),
         ids=list(ids or []) or None,
         force=force,
+        evidence_task_id=evidence_task_id,
         dry_run=dry_run,
         json=as_json,
     )
+
+
+def test_cli_promote_triage_forwards_required_recovery_evidence(
+    kanban_home, capsys
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="recoverable triage")
+        conn.execute(
+            "UPDATE tasks SET status='triage', block_kind='capability', "
+            "block_recurrences=2, consecutive_failures=3 WHERE id=?",
+            (tid,),
+        )
+
+    rc = kb_cli._cmd_promote(
+        _promote_ns(
+            tid,
+            force=True,
+            reason=["adapter", "fixed"],
+            evidence_task_id="t_prior_proof",
+            as_json=True,
+        )
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["promoted"] is True
+    assert payload["evidence_task_id"] == "t_prior_proof"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='promoted_manual' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+    assert json.loads(event["payload"])["evidence_task_id"] == "t_prior_proof"
 
 
 def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
