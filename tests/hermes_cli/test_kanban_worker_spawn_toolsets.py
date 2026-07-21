@@ -125,6 +125,44 @@ def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
     assert "HERMES_TUI" not in captured["env"]
 
 
+def test_default_spawn_uses_machine_quiet_path_for_terminal_exit_semantics(
+    monkeypatch, tmp_path
+):
+    """Every internal kanban worker must run through cli.py's ``-Q`` path.
+
+    That path maps terminal provider quota/overload failures to EX_TEMPFAIL
+    so the dispatcher records ``rate_limited`` and applies cooldown. Ordinary
+    ``-q`` prints the error but exits zero, which is then misclassified as a
+    missing kanban callback and immediately retried.
+    """
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4246
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    task = _make_task(kb, assignee="elias")
+    assert task.goal_mode is False
+    kb._default_spawn(task, str(workspace))
+
+    assert "-Q" in captured["cmd"]
+
+
 def test_default_spawn_routes_configured_external_worker_without_a_shell(
     monkeypatch, tmp_path
 ):

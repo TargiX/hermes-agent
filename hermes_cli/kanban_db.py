@@ -8991,7 +8991,7 @@ def _default_spawn(
     *,
     board: Optional[str] = None,
 ) -> Optional[int]:
-    """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
+    """Fire-and-forget ``hermes -p <profile> chat -q ... -Q`` subprocess.
 
     Returns the spawned child's PID so the dispatcher can detect crashes
     before the claim TTL expires. The child's completion is still observed
@@ -9137,14 +9137,15 @@ def _default_spawn(
         cmd.extend([
             "chat",
             "-q", prompt,
+            # Kanban workers are automation wrappers, so always use the
+            # machine-readable path. Besides suppressing terminal chrome,
+            # cli.py's -Q path owns the worker exit contract: terminal
+            # provider quota/overload returns EX_TEMPFAIL (75), which the
+            # dispatcher converts to a neutral rate_limited run + cooldown.
+            # Plain -q exits zero after printing the same failure and is
+            # indistinguishable from a missing terminal kanban callback.
+            "-Q",
         ])
-        if task.goal_mode:
-            # Goal-mode workers must take the fully-quiet single-query path:
-            # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-            # cli.py's quiet branch. Without -Q the worker gets exactly one
-            # turn, prints text, exits rc=0, and the dispatcher records a
-            # protocol violation (incident 2026-06-09 t_d9cbe312).
-            cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
