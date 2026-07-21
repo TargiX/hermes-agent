@@ -1623,6 +1623,61 @@ def _handle_unblock(args: dict, **kw) -> str:
         return tool_error(f"kanban_unblock: {e}")
 
 
+def _handle_reassign(args: dict, **kw) -> str:
+    """Move one existing card to a different profile with an audit reason."""
+    guard = _require_orchestrator_tool("kanban_reassign")
+    if guard:
+        return guard
+    tid = str(args.get("task_id") or "").strip()
+    if not tid:
+        return tool_error("task_id is required")
+    if "assignee" not in args:
+        return tool_error("assignee is required (use 'none' to unassign)")
+    assignee = _normalize_profile(args.get("assignee"))
+    reason = str(args.get("reason") or "").strip()
+    if not reason:
+        return tool_error("reason is required for reassignment audit")
+    reclaim, bool_error = _parse_bool_arg(args, "reclaim", default=False)
+    if bool_error:
+        return tool_error(bool_error)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"could not reassign {tid} (unknown task)")
+            previous_assignee = task.assignee
+            reason = redact_sensitive_text(reason, force=True)
+            ok = kb.reassign_task(
+                conn,
+                tid,
+                assignee,
+                reclaim_first=reclaim,
+                reason=reason,
+            )
+            if not ok:
+                return tool_error(
+                    f"could not reassign {tid} (task may still be running; "
+                    "set reclaim=true only for an explicitly audited stale run)"
+                )
+            updated = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                previous_assignee=previous_assignee,
+                assignee=updated.assignee if updated else assignee,
+                status=updated.status if updated else None,
+                reclaimed=reclaim,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_reassign: {e}")
+    except Exception as e:
+        logger.exception("kanban_reassign failed")
+        return tool_error(f"kanban_reassign: {e}")
+
+
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
     parent_id = args.get("parent_id")
@@ -2300,6 +2355,46 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_REASSIGN_SCHEMA = {
+    "name": "kanban_reassign",
+    "description": (
+        "Reassign the same existing Kanban card to another profile while "
+        "preserving its task, history, workspace, branch, links, and current "
+        "status. Requires a non-empty audit reason. Orchestrator-only; task "
+        "workers never see this recovery tool. Running work is refused unless "
+        "reclaim=true is explicitly supplied for an audited stale run."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Existing task id whose owner profile must change.",
+            },
+            "assignee": {
+                "type": "string",
+                "description": "Target profile name, or 'none' to leave unassigned.",
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Required audit reason naming the failed route or changed "
+                    "ownership authority."
+                ),
+            },
+            "reclaim": {
+                "type": "boolean",
+                "description": (
+                    "Release a currently running claim before reassignment. "
+                    "Defaults to false; use only for an explicitly audited stale run."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "assignee", "reason"],
+    },
+}
+
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -2420,6 +2515,15 @@ registry.register(
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
+)
+
+registry.register(
+    name="kanban_reassign",
+    toolset="kanban",
+    schema=KANBAN_REASSIGN_SCHEMA,
+    handler=_handle_reassign,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="⇄",
 )
 
 registry.register(

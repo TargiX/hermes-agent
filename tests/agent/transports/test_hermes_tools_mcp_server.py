@@ -210,6 +210,7 @@ class TestModuleSurface:
             "kanban_show",
             "kanban_list",
             "kanban_unblock",
+            "kanban_reassign",
             "kanban_link",
         ):
             assert orch_tool in EXPOSED_TOOLS, (

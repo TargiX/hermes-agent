@@ -4570,16 +4570,36 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    previous_assignee = row["assignee"]
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
     # assign_task handles its own txn + the still-running guard.
     try:
-        return assign_task(conn, task_id, profile)
+        reassigned = assign_task(conn, task_id, profile)
     except RuntimeError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
         return False
+    if reassigned:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "reassigned",
+                {
+                    "from_assignee": previous_assignee,
+                    "to_assignee": _canonical_assignee(profile),
+                    "reason": reason,
+                    "reclaim_first": bool(reclaim_first),
+                },
+            )
+    return reassigned
 
 
 def _verify_created_cards(

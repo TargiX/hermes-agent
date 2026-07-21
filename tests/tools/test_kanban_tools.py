@@ -134,7 +134,7 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
 
     Even if a worker process happens to also have ``toolsets: [kanban]``
     in its config, the HERMES_KANBAN_TASK env var means it's a focused
-    worker and must not see kanban_list / kanban_unblock.
+    worker and must not see board-routing or recovery tools.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
@@ -153,9 +153,10 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
     assert {
         "kanban_list",
         "kanban_unblock",
+        "kanban_reassign",
     }.isdisjoint(kanban), (
         f"Board-routing tools leaked into worker schema: "
-        f"{kanban & {'kanban_list', 'kanban_unblock'}}"
+        f"{kanban & {'kanban_list', 'kanban_unblock', 'kanban_reassign'}}"
     )
 
 
@@ -179,7 +180,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
-        "kanban_unblock",
+        "kanban_unblock", "kanban_reassign",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -1554,6 +1555,96 @@ def test_unblock_happy_path(monkeypatch, worker_env):
         conn.close()
 
 
+def test_reassign_happy_path_preserves_blocked_state_and_reason(
+    monkeypatch, worker_env,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "phosphenelead")
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="blocked route", assignee="cursor-grok")
+        assert kb.block_task(conn, tid, reason="adapter exit", kind="capability")
+    finally:
+        conn.close()
+
+    result = json.loads(
+        kt._handle_reassign(
+            {
+                "task_id": tid,
+                "assignee": "terra-frontend",
+                "reason": "external worker produced no decision-changing evidence",
+            }
+        )
+    )
+
+    assert result == {
+        "ok": True,
+        "task_id": tid,
+        "previous_assignee": "cursor-grok",
+        "assignee": "terra-frontend",
+        "status": "blocked",
+        "reclaimed": False,
+    }
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "terra-frontend"
+        assert task.status == "blocked"
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='reassigned' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert event is not None
+        payload = json.loads(event["payload"])
+        assert payload == {
+            "from_assignee": "cursor-grok",
+            "to_assignee": "terra-frontend",
+            "reason": "external worker produced no decision-changing evidence",
+            "reclaim_first": False,
+        }
+    finally:
+        conn.close()
+
+
+def test_reassign_requires_audit_reason(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+
+    result = json.loads(
+        kt._handle_reassign(
+            {"task_id": worker_env, "assignee": "terra-frontend"}
+        )
+    )
+    assert "reason is required" in result["error"]
+
+
+def test_worker_cannot_reassign_foreign_task(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        sibling = kb.create_task(conn, title="sibling", assignee="cursor-grok")
+    finally:
+        conn.close()
+
+    result = json.loads(
+        kt._handle_reassign(
+            {
+                "task_id": sibling,
+                "assignee": "terra-frontend",
+                "reason": "not worker authority",
+            }
+        )
+    )
+    assert "orchestrator-only" in result["error"]
+
+
 def test_unblock_triage_requires_approved_authorizing_evidence(
     monkeypatch, worker_env,
 ):
@@ -2424,6 +2515,7 @@ def test_board_param_in_all_schemas():
         kt.KANBAN_COMMENT_SCHEMA,
         kt.KANBAN_CREATE_SCHEMA,
         kt.KANBAN_UNBLOCK_SCHEMA,
+        kt.KANBAN_REASSIGN_SCHEMA,
         kt.KANBAN_LINK_SCHEMA,
         kt.KANBAN_ATTACH_SCHEMA,
         kt.KANBAN_ATTACH_URL_SCHEMA,
