@@ -2609,6 +2609,49 @@ class TestExecuteToolCalls:
         assert "API call failed" not in output
         assert "Rate limit reached" not in output
 
+    def test_zai_coding_overload_exhaustion_is_terminal_rate_limit(
+        self, agent, monkeypatch
+    ):
+        """A Z.AI 1305 wall must reach the kanban EX_TEMPFAIL path.
+
+        The error classifier intentionally labels these 429s ``overloaded``
+        rather than ``rate_limit`` so Hermes does not rotate a valid API key.
+        At terminal exhaustion, however, kanban needs the rate-limit failure
+        reason so the CLI exits 75 and the dispatcher parks the card on its
+        cooldown instead of counting a task crash and immediately retrying it.
+        """
+
+        class _ZaiOverloadError(Exception):
+            status_code = 429
+
+            def __str__(self):
+                return (
+                    "HTTP 429 code 1305: The service may be temporarily "
+                    "overloaded, please try again later"
+                )
+
+        agent.provider = "zai"
+        agent.base_url = "https://api.z.ai/api/coding/paas/v4"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "glm-5.2"
+        agent._interruptible_api_call = MagicMock(side_effect=_ZaiOverloadError())
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
+
+        with (
+            patch(
+                "agent.conversation_loop.adaptive_rate_limit_backoff",
+                return_value=(0.0, "zai_coding_overload_short"),
+            ),
+            patch("run_agent.time.sleep", return_value=None),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["failure_reason"] == "rate_limit"
+        assert agent._interruptible_api_call.call_count == 3
+
 
 class TestRetryAfterCap:
     """#26293: the conversation loop owns rate-limit backoff and honors the

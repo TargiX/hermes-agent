@@ -3347,7 +3347,16 @@ def run_conversation(
                 _is_zai_coding_overload = is_zai_coding_overload_error(
                     base_url=str(_base), model=_model, error=api_error
                 )
-                if _is_zai_coding_overload:
+                if _is_zai_coding_overload and not os.environ.get(
+                    "HERMES_KANBAN_TASK"
+                ):
+                    # Interactive users benefit from the full adaptive
+                    # 30/60/90/120s recovery schedule. A kanban worker has a
+                    # stronger outer circuit breaker: exhaust its configured
+                    # short retry budget, exit EX_TEMPFAIL, and let the
+                    # dispatcher release the slot during provider cooldown.
+                    # Extending an unattended card to the interactive ceiling
+                    # only burns capacity while the shared endpoint is down.
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
                 _should_fallback = (
                     is_rate_limited
@@ -4296,7 +4305,19 @@ def run_conversation(
                         # transient throttle from a real failure and choose a
                         # different exit code. ``rate_limit`` / ``billing`` here
                         # mean "quota wall, not a task error".
-                        "failure_reason": classified.reason.value,
+                        # Z.AI Coding Plan deliberately classifies its
+                        # HTTP 429/code 1305 response as ``overloaded`` so a
+                        # valid credential is not rotated. Once the bounded
+                        # retry schedule is exhausted, however, a kanban
+                        # worker must surface the same terminal semantics as
+                        # a rate-limit wall: cli.py maps ``rate_limit`` to the
+                        # EX_TEMPFAIL sentinel and the dispatcher cools the
+                        # card down instead of counting/retrying a task crash.
+                        "failure_reason": (
+                            FailoverReason.rate_limit.value
+                            if _is_zai_coding_overload
+                            else classified.reason.value
+                        ),
                     }
 
                 # For rate limits, respect the Retry-After header if present
