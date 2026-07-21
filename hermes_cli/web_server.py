@@ -149,16 +149,22 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     scheduler provider here (no live adapters; delivery falls back to the
     per-platform send path).
 
-    Cross-process safe: the built-in provider's ``cron.scheduler.tick`` takes
-    the ``cron/.tick.lock`` file lock, so this never double-fires alongside a
-    real gateway on the same HERMES_HOME — whichever process grabs the lock
-    first wins the tick.
+    Desktop is a fallback scheduler. When a real gateway runtime lock is live,
+    its built-in provider owns dispatch and Desktop only keeps its ticker
+    thread warm. This avoids stale long-lived Desktop code winning a tick from
+    a newly updated gateway; the durable execution ledger remains the final
+    cross-process single-flight boundary.
     """
-    from cron.scheduler_provider import resolve_cron_scheduler
+    from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
 
     provider = resolve_cron_scheduler()
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
-    provider.start(stop_event, interval=interval)
+    start_kwargs: dict[str, object] = {"interval": interval}
+    if isinstance(provider, InProcessCronScheduler):
+        from gateway.status import is_gateway_runtime_lock_active
+
+        start_kwargs["can_dispatch"] = lambda: not is_gateway_runtime_lock_active()
+    provider.start(stop_event, **start_kwargs)
 
 
 def _warm_gateway_module() -> None:

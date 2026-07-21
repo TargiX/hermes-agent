@@ -51,7 +51,10 @@ def test_ticker_calls_tick_at_least_once_then_stops():
         calls.append(kwargs)
         return 0
 
-    with patch("cron.scheduler.tick", side_effect=fake_tick):
+    with (
+        patch("cron.scheduler.tick", side_effect=fake_tick),
+        patch("gateway.status.is_gateway_runtime_lock_active", return_value=False),
+    ):
         # interval=0 keeps the loop tight; stop after the first observed tick.
         t = threading.Thread(
             target=_start_cron_ticker,
@@ -99,6 +102,37 @@ def test_desktop_ticker_calls_tick_then_stops():
     assert not t.is_alive(), "desktop ticker did not exit after stop_event was set"
     assert len(calls) >= 1, "desktop ticker never called tick()"
     assert calls[0].get("sync") is False
+
+
+def test_desktop_ticker_defers_to_live_gateway_runtime_lock():
+    """Desktop remains a fallback and must not compete with a live gateway."""
+    from cron.scheduler_provider import InProcessCronScheduler
+    from hermes_cli.web_server import _start_desktop_cron_ticker
+
+    provider = InProcessCronScheduler()
+    captured = {}
+    gateway_active = {"value": True}
+
+    def fake_start(stop_event, **kwargs):
+        captured.update(kwargs)
+
+    with (
+        patch(
+            "cron.scheduler_provider.resolve_cron_scheduler",
+            return_value=provider,
+        ),
+        patch.object(provider, "start", side_effect=fake_start),
+        patch(
+            "gateway.status.is_gateway_runtime_lock_active",
+            side_effect=lambda: gateway_active["value"],
+        ),
+    ):
+        _start_desktop_cron_ticker(threading.Event(), interval=60)
+
+    can_dispatch = captured["can_dispatch"]
+    assert can_dispatch() is False
+    gateway_active["value"] = False
+    assert can_dispatch() is True
 
 
 # ── Phase 1: CronScheduler ABC + InProcessCronScheduler ──────────────────────
