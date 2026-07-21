@@ -32,6 +32,25 @@ from tools.environments.local import hermes_subprocess_env
 MIN_CODEX_VERSION = (0, 125, 0)
 
 
+# Codex launches configured MCP servers as grandchildren and does not preserve
+# arbitrary worker-scoped environment by default. Forward only the non-secret
+# Kanban lifecycle coordinates that the internal hermes-tools callback needs
+# to expose and safely bind terminal board operations to this exact run.
+_KANBAN_MCP_ENV_KEYS = (
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_BRANCH",
+    "HERMES_KANBAN_GOAL_MODE",
+    "HERMES_KANBAN_GOAL_MAX_TURNS",
+    "HERMES_SESSION_ID",
+)
+
+
 @dataclass
 class CodexAppServerError(RuntimeError):
     """Raised on JSON-RPC errors from the app-server."""
@@ -122,6 +141,17 @@ class CodexAppServerClient:
                     "sandbox_workspace_write.network_access=false",
                 ]
             )
+            for key in _KANBAN_MCP_ENV_KEYS:
+                value = spawn_env.get(key)
+                if not value:
+                    continue
+                app_server_args.extend(
+                    [
+                        "-c",
+                        f"mcp_servers.hermes-tools.env.{key}="
+                        f"{json.dumps(value)}",
+                    ]
+                )
 
         cmd = [codex_bin, "app-server"] + app_server_args
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.

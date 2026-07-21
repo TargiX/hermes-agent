@@ -278,6 +278,10 @@ class TestSpawnEnvIsolation:
         monkeypatch.setenv("HOME", "/users/alice")
         monkeypatch.setenv("HERMES_HOME", "/users/alice/.hermes/profiles/backend-worker")
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_smoke")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "host:123")
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "smoke")
+        monkeypatch.setenv("HERMES_SESSION_ID", "session-smoke")
         monkeypatch.setenv(
             "HERMES_KANBAN_DB",
             "/users/alice/.hermes/kanban/boards/smoke/kanban.db",
@@ -294,6 +298,25 @@ class TestSpawnEnvIsolation:
             in cmd
         )
         assert "sandbox_workspace_write.network_access=false" in cmd
+        assert (
+            'mcp_servers.hermes-tools.env.HERMES_KANBAN_TASK="t_smoke"'
+            in cmd
+        )
+        assert 'mcp_servers.hermes-tools.env.HERMES_KANBAN_RUN_ID="42"' in cmd
+        assert (
+            'mcp_servers.hermes-tools.env.HERMES_KANBAN_CLAIM_LOCK="host:123"'
+            in cmd
+        )
+        assert 'mcp_servers.hermes-tools.env.HERMES_KANBAN_BOARD="smoke"' in cmd
+        assert (
+            'mcp_servers.hermes-tools.env.HERMES_SESSION_ID="session-smoke"'
+            in cmd
+        )
+        assert (
+            'mcp_servers.hermes-tools.env.HERMES_KANBAN_DB='
+            '"/users/alice/.hermes/kanban/boards/smoke/kanban.db"'
+            in cmd
+        )
         assert all("danger" not in part for part in cmd)
 
 
