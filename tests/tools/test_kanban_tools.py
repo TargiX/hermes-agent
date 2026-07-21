@@ -456,6 +456,129 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_rejects_incomplete_declared_review_receipt(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET body = ? WHERE id = ?",
+            (
+                "- task_class: review\n"
+                "- required_receipt: phosphene-review/v1\n"
+                "- implementation_task_id: t_impl1234\n",
+                worker_env,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rejected = json.loads(
+        kt._handle_complete(
+            {
+                "summary": "APPROVE",
+                "metadata": {
+                    "handoff_version": "phosphene-review/v1",
+                    "verdict": "APPROVE",
+                    "approved": True,
+                    "implementation_task": "t_impl1234",
+                    "reviewed_fingerprint": "a" * 64,
+                    "blocking_findings": [],
+                    "authorized_next_task_ids": ["t_impl1234"],
+                },
+            }
+        )
+    )
+
+    assert "declared review receipt is incomplete" in rejected["error"]
+    assert "metadata.outcome" in rejected["error"]
+    assert "metadata.implementation_task_id" in rejected["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+    corrected = json.loads(
+        kt._handle_complete(
+            {
+                "summary": "APPROVE",
+                "metadata": {
+                    "handoff_version": "phosphene-review/v1",
+                    "outcome": "APPROVE",
+                    "approved": True,
+                    "implementation_task_id": "t_impl1234",
+                    "reviewed_fingerprint": "a" * 64,
+                    "blocking_findings": [],
+                    "authorized_next_task_ids": ["t_impl1234"],
+                },
+            }
+        )
+    )
+    assert corrected["ok"] is True
+
+
+def test_block_rejects_incomplete_declared_implementation_receipt(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET body = ? WHERE id = ?",
+            (
+                "- task_class: implementation\n"
+                "- required_receipt: phosphene-implementation/v1\n",
+                worker_env,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rejected = json.loads(
+        kt._handle_block(
+            {
+                "reason": "review-required: frozen artifact",
+                "kind": "review_required",
+                "metadata": {
+                    "handoff_version": "phosphene-implementation/v1",
+                    "diff_fingerprint": "a" * 64,
+                    "changed_files": ["feature.ts"],
+                    "next_owner": "agencyreviewer",
+                },
+            }
+        )
+    )
+
+    assert "declared implementation receipt is incomplete" in rejected["error"]
+    assert "metadata.diff_sha256" in rejected["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+    corrected = json.loads(
+        kt._handle_block(
+            {
+                "reason": "review-required: frozen artifact",
+                "kind": "review_required",
+                "metadata": {
+                    "handoff_version": "phosphene-implementation/v1",
+                    "diff_sha256": "a" * 64,
+                    "diff_fingerprint": "a" * 64,
+                    "changed_files": ["feature.ts"],
+                    "next_owner": "agencyreviewer",
+                },
+            }
+        )
+    )
+    assert corrected["ok"] is True
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt
