@@ -393,7 +393,8 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
     runs (attempt history), and the last N events. ``compact=true`` returns
-    only the task, graph edges, latest run receipt, and history counts."""
+    only the task, graph edges, latest run receipt, bounded latest comment,
+    and history counts."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -449,6 +450,30 @@ def _handle_show(args: dict, **kw) -> str:
 
             if compact:
                 latest_run = kb.latest_run(conn, tid)
+                latest_comment_row = conn.execute(
+                    """
+                    SELECT author, body, created_at
+                    FROM task_comments
+                    WHERE task_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (tid,),
+                ).fetchone()
+                latest_comment = None
+                if latest_comment_row is not None:
+                    comment_body = str(latest_comment_row["body"])
+                    comment_limit = 2000
+                    comment_truncated = len(comment_body) > comment_limit
+                    latest_comment = {
+                        "author": latest_comment_row["author"],
+                        "body": (
+                            comment_body[:comment_limit] + "…"
+                            if comment_truncated else comment_body
+                        ),
+                        "created_at": int(latest_comment_row["created_at"]),
+                        "truncated": comment_truncated,
+                    }
                 counts = conn.execute(
                     """
                     SELECT
@@ -466,6 +491,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "latest_run": (
                         _run_dict(latest_run) if latest_run is not None else None
                     ),
+                    "latest_comment": latest_comment,
                     "history_counts": {
                         "comments": int(counts["comments"]),
                         "events": int(counts["events"]),
@@ -1548,7 +1574,8 @@ KANBAN_SHOW_SCHEMA = {
         "starting work, especially on retries. The response includes a "
         "pre-formatted ``worker_context`` string suitable for recovery. "
         "Workers and orchestrators should start with ``compact=true`` to read "
-        "only the task, latest structured run receipt, and graph edges, then "
+        "only the task, latest structured run receipt, bounded latest comment, "
+        "and graph edges, then "
         "request full history only when that receipt is missing, malformed, "
         "or contradicts live state."
     ),
@@ -1563,8 +1590,9 @@ KANBAN_SHOW_SCHEMA = {
                 "type": "boolean",
                 "description": (
                     "Return a metadata-first view containing the task, graph "
-                    "edges, latest run, and history counts, while omitting "
-                    "comments, event history, prior runs, and worker_context. "
+                    "edges, latest run, bounded latest comment, and history "
+                    "counts, while omitting full comments, event history, "
+                    "prior runs, and worker_context. "
                     "Defaults to false for backward compatibility."
                 ),
             },

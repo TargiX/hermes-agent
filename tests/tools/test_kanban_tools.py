@@ -250,6 +250,11 @@ def test_show_compact_returns_latest_receipt_without_full_history(worker_env):
         },
     }))
     assert completed.get("ok") is True
+    commented = json.loads(kt._handle_comment({
+        "task_id": worker_env,
+        "body": "control-plane correction supersedes the run receipt",
+    }))
+    assert commented.get("ok") is True
 
     shown = json.loads(kt._handle_show({
         "task_id": worker_env,
@@ -258,7 +263,13 @@ def test_show_compact_returns_latest_receipt_without_full_history(worker_env):
     assert shown["task"]["status"] == "done"
     assert shown["latest_run"]["summary"] == "compact handoff"
     assert shown["latest_run"]["metadata"]["verdict"] == "APPROVE"
+    assert shown["latest_comment"]["author"] == "test-worker"
+    assert shown["latest_comment"]["body"] == (
+        "control-plane correction supersedes the run receipt"
+    )
+    assert shown["latest_comment"]["truncated"] is False
     assert shown["history_counts"]["runs"] == 1
+    assert shown["history_counts"]["comments"] == 1
     assert "comments" not in shown
     assert "events" not in shown
     assert "runs" not in shown
