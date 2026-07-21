@@ -489,6 +489,8 @@ def _handle_show(args: dict, **kw) -> str:
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
+                    "branch_name": t.branch_name,
+                    "project_id": t.project_id,
                     "created_by": t.created_by, "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,

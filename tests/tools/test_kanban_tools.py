@@ -240,7 +240,18 @@ def test_show_explicit_task_id(worker_env):
 
 
 def test_show_compact_returns_latest_receipt_without_full_history(worker_env):
+    from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET project_id = ?, branch_name = ? WHERE id = ?",
+            ("p_phosphene", "phosphene/test-compact-identity", worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
     completed = json.loads(kt._handle_complete({
         "summary": "compact handoff",
@@ -270,6 +281,8 @@ def test_show_compact_returns_latest_receipt_without_full_history(worker_env):
     assert shown["latest_comment"]["truncated"] is False
     assert shown["task"]["max_runtime_seconds"] is None
     assert shown["task"]["goal_mode"] is False
+    assert shown["task"]["project_id"] == "p_phosphene"
+    assert shown["task"]["branch_name"] == "phosphene/test-compact-identity"
     assert shown["latest_run"]["max_runtime_seconds"] is None
     assert shown["history_counts"]["runs"] == 1
     assert shown["history_counts"]["comments"] == 1
