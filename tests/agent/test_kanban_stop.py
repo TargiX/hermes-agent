@@ -166,3 +166,8 @@ def test_nudge_and_dispatcher_budgets_are_independent(clear_kanban_env):
 def test_kanban_guidance_names_codex_callbacks_and_repo_free_scratch() -> None:
     assert "mcp.hermes-tools.kanban_show" in KANBAN_GUIDANCE
     assert "scratch workspace is not a missing checkout" in KANBAN_GUIDANCE
+
+
+def test_kanban_guidance_forbids_self_polling_after_deliverable() -> None:
+    assert "Never wait, sleep, or poll your own task status" in KANBAN_GUIDANCE
+    assert "call the terminal board tool immediately" in KANBAN_GUIDANCE
