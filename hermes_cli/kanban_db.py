@@ -6788,6 +6788,7 @@ def _resolve_worktree_workspace(
 def _prepare_worktree_shared_paths(
     workspace: Path,
     shared_paths: Optional[list[str]],
+    shared_path_overlays: Optional[dict[str, list[str]]] = None,
 ) -> None:
     """Expose explicitly configured primary-checkout paths before spawn.
 
@@ -6795,7 +6796,9 @@ def _prepare_worktree_shared_paths(
     For ordinary non-bare repositories that directory is ``<repo>/.git``;
     its parent is therefore the only trusted source root. Missing sources are
     a no-op so one global opt-in can span heterogeneous repositories. Existing
-    destinations fail closed and are never replaced.
+    destinations fail closed and are never replaced, except that a legacy
+    symlink pointing at the exact configured source may be migrated to a
+    declared shallow overlay before the worker starts.
     """
     if not shared_paths:
         return
@@ -6808,10 +6811,135 @@ def _prepare_worktree_shared_paths(
     source_root = common_dir.parent.resolve(strict=True)
     workspace_root = workspace.resolve(strict=True)
 
+    overlays = shared_path_overlays or {}
+    if not isinstance(overlays, dict):
+        raise ValueError("worktree shared path overlays must be a mapping")
+    configured_paths = {
+        raw_path.strip()
+        for raw_path in shared_paths
+        if isinstance(raw_path, str) and raw_path.strip()
+    }
+    unknown_overlay_paths = set(overlays) - configured_paths
+    if unknown_overlay_paths:
+        raise ValueError(
+            "worktree shared path overlay keys must also appear in "
+            f"worktree_shared_paths: {sorted(unknown_overlay_paths)!r}"
+        )
+
+    marker_name = ".hermes-worktree-overlay.json"
+
+    def _overlay_children(relative_text: str) -> tuple[str, ...]:
+        raw_children = overlays.get(relative_text, [])
+        if not isinstance(raw_children, list):
+            raise ValueError(
+                f"worktree shared path overlay {relative_text!r} must be a list"
+            )
+        children: list[str] = []
+        for raw_child in raw_children:
+            if not isinstance(raw_child, str) or not raw_child.strip():
+                raise ValueError(
+                    "worktree shared path overlay children must be non-empty strings"
+                )
+            child = Path(raw_child.strip())
+            if (
+                child.is_absolute()
+                or len(child.parts) != 1
+                or child.name in {"", ".", "..", marker_name}
+            ):
+                raise ValueError(
+                    f"unsafe worktree shared path overlay child {raw_child!r}; "
+                    "use one direct child name"
+                )
+            children.append(child.name)
+        if len(set(children)) != len(children):
+            raise ValueError(
+                f"duplicate worktree shared path overlay child for {relative_text!r}"
+            )
+        return tuple(sorted(children))
+
+    def _populate_overlay(
+        root: Path,
+        source: Path,
+        relative_text: str,
+        local_children: tuple[str, ...],
+    ) -> None:
+        expected_marker = {
+            "version": 1,
+            "source": str(source.resolve(strict=True)),
+            "local_children": list(local_children),
+        }
+        marker = root / marker_name
+        if root.exists():
+            if root.is_symlink() or not root.is_dir() or not marker.is_file():
+                raise RuntimeError(
+                    f"worktree shared path overlay destination is not managed: {root}"
+                )
+            try:
+                actual_marker = json.loads(marker.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"invalid worktree shared path overlay marker: {marker}"
+                ) from exc
+            if actual_marker != expected_marker:
+                raise RuntimeError(
+                    f"worktree shared path overlay marker mismatch: {marker}"
+                )
+        else:
+            root.mkdir(parents=True)
+            marker.write_text(
+                json.dumps(expected_marker, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+        allowed_names = set(local_children) | {marker_name}
+        source_names = {entry.name for entry in source.iterdir()}
+        for child_name in local_children:
+            child = root / child_name
+            if os.path.lexists(child):
+                if child.is_symlink() or not child.is_dir():
+                    raise RuntimeError(
+                        f"worktree shared overlay child is not a local directory: {child}"
+                    )
+            else:
+                child.mkdir()
+
+        for entry in source.iterdir():
+            if entry.name in local_children:
+                continue
+            destination_entry = root / entry.name
+            if os.path.lexists(destination_entry):
+                if not destination_entry.is_symlink():
+                    raise RuntimeError(
+                        f"worktree shared overlay entry is not a symlink: {destination_entry}"
+                    )
+                try:
+                    matches = destination_entry.resolve(strict=True) == entry.resolve(
+                        strict=True
+                    )
+                except (FileNotFoundError, OSError):
+                    matches = False
+                if not matches:
+                    raise RuntimeError(
+                        f"worktree shared overlay entry target mismatch: {destination_entry}"
+                    )
+                continue
+            destination_entry.symlink_to(
+                entry.resolve(strict=True), target_is_directory=entry.is_dir()
+            )
+
+        unexpected = {
+            entry.name for entry in root.iterdir()
+        } - allowed_names - source_names
+        if unexpected:
+            raise RuntimeError(
+                f"worktree shared overlay contains unexpected entries: {sorted(unexpected)!r}"
+            )
+
     for raw_path in shared_paths:
         if not isinstance(raw_path, str) or not raw_path.strip():
             raise ValueError("worktree shared paths must be non-empty relative strings")
-        relative = Path(raw_path.strip())
+        relative_text = raw_path.strip()
+        relative = Path(relative_text)
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError(
                 f"unsafe worktree shared path {raw_path!r}; use a relative path without '..'"
@@ -6821,6 +6949,44 @@ def _prepare_worktree_shared_paths(
         if not source.exists():
             continue
         destination = workspace_root / relative
+        local_children = _overlay_children(relative_text)
+        if local_children:
+            if not source.is_dir():
+                raise RuntimeError(
+                    f"worktree shared path overlays require a directory source: {source}"
+                )
+            if destination.is_symlink():
+                try:
+                    points_to_shared = (
+                        destination.resolve(strict=True) == source.resolve(strict=True)
+                    )
+                except (FileNotFoundError, OSError):
+                    points_to_shared = False
+                if not points_to_shared:
+                    raise RuntimeError(
+                        f"worktree shared path destination already exists: {destination}"
+                    )
+                temporary = destination.parent / (
+                    f".{destination.name}.overlay.tmp.{os.getpid()}."
+                    f"{secrets.token_hex(4)}"
+                )
+                try:
+                    _populate_overlay(
+                        temporary, source, relative_text, local_children
+                    )
+                    destination.unlink()
+                    temporary.replace(destination)
+                except Exception:
+                    if temporary.exists():
+                        shutil.rmtree(temporary)
+                    if not os.path.lexists(destination):
+                        destination.symlink_to(
+                            source.resolve(strict=True), target_is_directory=True
+                        )
+                    raise
+                continue
+            _populate_overlay(destination, source, relative_text, local_children)
+            continue
         if os.path.lexists(destination):
             if destination.is_symlink() and destination.resolve(strict=True) == source.resolve(strict=True):
                 continue
@@ -8525,6 +8691,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     worktree_shared_paths: Optional[list[str]] = None,
+    worktree_shared_path_overlays: Optional[dict[str, list[str]]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8560,6 +8727,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             worktree_shared_paths=worktree_shared_paths,
+            worktree_shared_path_overlays=worktree_shared_path_overlays,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8577,6 +8745,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             worktree_shared_paths=worktree_shared_paths,
+            worktree_shared_path_overlays=worktree_shared_path_overlays,
         )
 
 
@@ -8594,6 +8763,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     worktree_shared_paths: Optional[list[str]] = None,
+    worktree_shared_path_overlays: Optional[dict[str, list[str]]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8839,7 +9009,11 @@ def _dispatch_once_locked(
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
-                _prepare_worktree_shared_paths(workspace, worktree_shared_paths)
+                _prepare_worktree_shared_paths(
+                    workspace,
+                    worktree_shared_paths,
+                    worktree_shared_path_overlays,
+                )
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:

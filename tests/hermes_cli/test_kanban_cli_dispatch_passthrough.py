@@ -44,6 +44,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
             "default_assignee": "default",
             "max_in_progress_per_profile": 2,
             "worktree_shared_paths": ["node_modules"],
+            "worktree_shared_path_overlays": {"node_modules": [".cache"]},
         }
     }
     monkeypatch.setattr(
@@ -71,6 +72,9 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     assert captured.get("default_assignee") == "default"
     assert captured.get("max_in_progress_per_profile") == 2
     assert captured.get("worktree_shared_paths") == ["node_modules"]
+    assert captured.get("worktree_shared_path_overlays") == {
+        "node_modules": [".cache"]
+    }
 
 
 def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypatch):

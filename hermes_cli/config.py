@@ -2900,6 +2900,14 @@ DEFAULT_CONFIG = {
         # a symlink only when the source exists in the primary checkout; it
         # never replaces a destination or accepts absolute / parent traversal.
         "worktree_shared_paths": [],
+        # Optional direct children that stay private and writable inside an
+        # otherwise shared directory. The dispatcher builds a shallow overlay
+        # before spawn: undeclared children symlink to the primary checkout,
+        # while declared children are real worktree-local directories. This is
+        # useful for dependency trees such as node_modules whose build cache
+        # must remain writable under a sandboxed worker.
+        # Example: {"node_modules": [".cache"]}.
+        "worktree_shared_path_overlays": {},
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or

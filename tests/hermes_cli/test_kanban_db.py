@@ -2592,6 +2592,144 @@ def test_dispatch_worktree_prepares_opt_in_shared_path_before_spawn(
     }
 
 
+def test_dispatch_worktree_shared_path_overlay_keeps_declared_child_local(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    shared_dependencies = repo / "node_modules"
+    (shared_dependencies / ".cache").mkdir(parents=True)
+    (shared_dependencies / ".cache" / "shared.txt").write_text(
+        "shared\n", encoding="utf-8"
+    )
+    (shared_dependencies / ".bin").mkdir()
+    (shared_dependencies / ".bin" / "vitest").write_text(
+        "tool\n", encoding="utf-8"
+    )
+    (shared_dependencies / "nuxt").mkdir()
+    kb.create_board("worktree-shared-overlay-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    observed: dict[str, object] = {}
+
+    def fake_spawn(task, workspace, board=None):
+        destination = Path(workspace) / "node_modules"
+        observed["root_is_directory"] = destination.is_dir()
+        observed["root_is_symlink"] = destination.is_symlink()
+        observed["cache_is_directory"] = (destination / ".cache").is_dir()
+        observed["cache_is_symlink"] = (destination / ".cache").is_symlink()
+        observed["shared_cache_visible"] = (
+            destination / ".cache" / "shared.txt"
+        ).exists()
+        observed["bin_target"] = (destination / ".bin").resolve(strict=True)
+        observed["nuxt_target"] = (destination / "nuxt").resolve(strict=True)
+        return None
+
+    with kb.connect(board="worktree-shared-overlay-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="worktree-shared-overlay-board",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            board="worktree-shared-overlay-board",
+            worktree_shared_paths=["node_modules"],
+            worktree_shared_path_overlays={"node_modules": [".cache"]},
+        )
+
+    expected = repo / ".worktrees" / tid
+    assert result.spawned == [(tid, "sentinel", str(expected))]
+    assert observed == {
+        "root_is_directory": True,
+        "root_is_symlink": False,
+        "cache_is_directory": True,
+        "cache_is_symlink": False,
+        "shared_cache_visible": False,
+        "bin_target": (shared_dependencies / ".bin").resolve(),
+        "nuxt_target": (shared_dependencies / "nuxt").resolve(),
+    }
+
+
+def test_worktree_shared_path_overlay_migrates_matching_legacy_link_and_reuses_it(
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    shared_dependencies = repo / "node_modules"
+    (shared_dependencies / ".cache").mkdir(parents=True)
+    (shared_dependencies / "nuxt").mkdir()
+    workspace = repo / ".worktrees" / "legacy"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt/legacy", str(workspace)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    destination = workspace / "node_modules"
+    destination.symlink_to(shared_dependencies, target_is_directory=True)
+
+    kb._prepare_worktree_shared_paths(
+        workspace,
+        ["node_modules"],
+        {"node_modules": [".cache"]},
+    )
+    kb._prepare_worktree_shared_paths(
+        workspace,
+        ["node_modules"],
+        {"node_modules": [".cache"]},
+    )
+
+    assert destination.is_dir()
+    assert not destination.is_symlink()
+    assert (destination / ".cache").is_dir()
+    assert not (destination / ".cache").is_symlink()
+    assert (destination / "nuxt").resolve(strict=True) == (
+        shared_dependencies / "nuxt"
+    ).resolve(strict=True)
+
+
+@pytest.mark.parametrize("unsafe_child", ["", ".", "../cache", "/tmp/cache", "a/b"])
+def test_dispatch_worktree_rejects_unsafe_shared_path_overlay_child(
+    kanban_home, tmp_path, monkeypatch, unsafe_child
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "node_modules").mkdir()
+    kb.create_board("unsafe-shared-overlay-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    spawned: list[str] = []
+
+    with kb.connect(board="unsafe-shared-overlay-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="unsafe-shared-overlay-board",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+            board="unsafe-shared-overlay-board",
+            worktree_shared_paths=["node_modules"],
+            worktree_shared_path_overlays={"node_modules": [unsafe_child]},
+            failure_limit=1,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert spawned == []
+    assert result.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+
+
 @pytest.mark.parametrize(
     "unsafe_path", ["/tmp/node_modules", "../node_modules", "", "."]
 )
