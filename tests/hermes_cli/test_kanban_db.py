@@ -5093,6 +5093,34 @@ def test_reap_worker_zombies_records_exit_status():
     assert calls == [(12345, 0)]
 
 
+def test_reap_worker_zombies_preserves_retained_popen_exit_code(monkeypatch):
+    """A retained worker handle must yield EX_TEMPFAIL before generic waitpid."""
+
+    class FakeProc:
+        pid = 24680
+
+        def poll(self):
+            return kb.KANBAN_RATE_LIMIT_EXIT_CODE
+
+    kb._recent_worker_exits.pop(FakeProc.pid, None)
+    kb._active_worker_processes[FakeProc.pid] = FakeProc()
+    monkeypatch.setattr(kb.os, "name", "posix")
+    monkeypatch.setattr(kb.os, "waitpid", lambda *_args: (0, 0))
+
+    try:
+        reaped = kb.reap_worker_zombies()
+
+        assert reaped == [FakeProc.pid]
+        assert kb._classify_worker_exit(FakeProc.pid) == (
+            "rate_limited",
+            kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+        )
+        assert FakeProc.pid not in kb._active_worker_processes
+    finally:
+        kb._active_worker_processes.pop(FakeProc.pid, None)
+        kb._recent_worker_exits.pop(FakeProc.pid, None)
+
+
 def test_reap_worker_zombies_handles_waitpid_os_error():
     """reap_worker_zombies() does not propagate generic OSError from os.waitpid."""
     from unittest.mock import patch

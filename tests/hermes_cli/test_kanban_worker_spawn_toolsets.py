@@ -163,6 +163,37 @@ def test_default_spawn_uses_machine_quiet_path_for_terminal_exit_semantics(
     assert "-Q" in captured["cmd"]
 
 
+def test_default_spawn_retains_process_handle_until_dispatcher_reaps_it(
+    monkeypatch, tmp_path
+):
+    """Dropping the Popen object lets subprocess._cleanup steal its status."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+
+    class FakeProc:
+        pid = 4247
+
+        def poll(self):
+            return None
+
+    process = FakeProc()
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    try:
+        kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+        assert kb._active_worker_processes[process.pid] is process
+    finally:
+        kb._active_worker_processes.pop(process.pid, None)
+
+
 def test_default_spawn_routes_configured_external_worker_without_a_shell(
     monkeypatch, tmp_path
 ):

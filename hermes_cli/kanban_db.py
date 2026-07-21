@@ -6809,6 +6809,15 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
+# Keep Popen handles alive until the dispatcher itself observes their exit.
+# If the handle is dropped immediately after spawn, ``Popen.__del__`` adds it
+# to subprocess's private cleanup registry; any unrelated later Popen can then
+# reap it before ``reap_worker_zombies`` runs, discarding the raw exit status.
+# Kanban would see only a vanished PID and lose critical classifications such
+# as EX_TEMPFAIL/rate_limited. The live concurrency cap keeps this registry
+# naturally bounded; completed handles are removed on the next dispatch tick.
+_active_worker_processes: "dict[int, Any]" = {}
+
 
 def _has_forced_evidence_recovery_after(
     conn: sqlite3.Connection,
@@ -6857,6 +6866,15 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
         ordered = sorted(_recent_worker_exits.items(), key=lambda kv: kv[1][1])
         for _pid, _ in ordered[: len(ordered) // 2]:
             _recent_worker_exits.pop(_pid, None)
+
+
+def _wait_status_from_returncode(returncode: int) -> int:
+    """Encode ``Popen.returncode`` as the POSIX wait status classifiers use."""
+    if returncode < 0:
+        # Popen uses ``-signal`` for signal termination. In a wait status the
+        # signal occupies the low seven bits.
+        return (-int(returncode)) & 0x7F
+    return (int(returncode) & 0xFF) << 8
 
 
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
@@ -6909,6 +6927,23 @@ def reap_worker_zombies() -> "list[int]":
     children (returns []). No-op on Windows.
     """
     reaped: "list[int]" = []
+
+    # Poll the handles we intentionally retain before the generic waitpid
+    # sweep. Popen.poll() both reaps and preserves the return code, which we
+    # convert back to wait-status form for the existing classifier. Holding
+    # the objects in this registry prevents subprocess._cleanup from stealing
+    # that status between dispatch ticks.
+    for pid, proc in list(_active_worker_processes.items()):
+        try:
+            returncode = proc.poll()
+        except Exception:
+            continue
+        if returncode is None:
+            continue
+        _record_worker_exit(pid, _wait_status_from_returncode(int(returncode)))
+        _active_worker_processes.pop(pid, None)
+        reaped.append(pid)
+
     if os.name != "nt":
         try:
             while True:
@@ -6919,7 +6954,8 @@ def reap_worker_zombies() -> "list[int]":
                 if pid == 0:
                     break
                 _record_worker_exit(pid, status)
-                reaped.append(pid)
+                if pid not in reaped:
+                    reaped.append(pid)
         except Exception:
             pass
     return reaped
@@ -9179,6 +9215,8 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    if callable(getattr(proc, "poll", None)):
+        _active_worker_processes[proc.pid] = proc
     return proc.pid
 
 
