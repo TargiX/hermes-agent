@@ -40,6 +40,29 @@ class ImmediateThread:
         self._target()
 
 
+def test_completed_kanban_learning_thread_survives_worker_exit(monkeypatch):
+    captured = {}
+
+    class CapturingThread:
+        def __init__(self, *, target, daemon=None, name=None):
+            captured["daemon"] = daemon
+            captured["name"] = name
+
+        def start(self):
+            pass
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_done")
+    monkeypatch.setattr(run_agent_module.threading, "Thread", CapturingThread)
+
+    AIAgent._spawn_background_review(
+        _bare_agent(),
+        messages_snapshot=[{"role": "user", "content": "validated result"}],
+        review_skills=True,
+    )
+
+    assert captured == {"daemon": False, "name": "bg-review"}
+
+
 def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
     events = []
 

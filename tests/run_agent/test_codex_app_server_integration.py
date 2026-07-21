@@ -402,8 +402,9 @@ class TestRunConversationCodexPath:
         # Counter should be reset after the review fires
         assert agent._iters_since_skill == 0
 
-    def test_unclosed_kanban_turn_never_trains_background_skills(
-        self, monkeypatch
+    @pytest.mark.parametrize("terminal_status", [None, "blocked"])
+    def test_unapproved_kanban_turn_never_trains_background_skills(
+        self, monkeypatch, terminal_status
     ):
         """A final Codex message without the required callback is not authority."""
         from agent.transports.codex_app_server_session import (
@@ -430,7 +431,7 @@ class TestRunConversationCodexPath:
         )
         monkeypatch.setattr(
             "agent.turn_finalizer._kanban_task_terminal_status",
-            lambda _task_id: None,
+            lambda _task_id: terminal_status,
         )
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_unclosed")
 

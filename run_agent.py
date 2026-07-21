@@ -1664,8 +1664,17 @@ class AIAgent:
         )
         # Carry the active profile into the review thread so MEMORY.md / skill
         # review writes land in the right profile (#54937).
+        # One-shot Kanban workers would otherwise exit immediately and kill a
+        # daemon review fork before it can persist validated learning. The
+        # finalizer only reaches this method for a durable ``done`` task, so
+        # keep that review joinable; interactive/gateway reviews stay daemonized.
+        keep_alive_for_kanban_learning = bool(
+            (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        )
         t = threading.Thread(
-            target=propagate_context_to_thread(target), daemon=True, name="bg-review"
+            target=propagate_context_to_thread(target),
+            daemon=not keep_alive_for_kanban_learning,
+            name="bg-review",
         )
         t.start()
 

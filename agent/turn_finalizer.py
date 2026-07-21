@@ -629,10 +629,14 @@ def finalize_turn(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
+    background_review_eligible = (
+        not _kanban_task or _kanban_terminal_status == "done"
+    )
     if (
         final_response
         and completed
         and not interrupted
+        and background_review_eligible
         and (_should_review_memory or _should_review_skills)
     ):
         try:

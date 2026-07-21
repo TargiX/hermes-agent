@@ -319,6 +319,31 @@ def test_budget_exhaustion_never_trains_background_skills(monkeypatch):
     agent._spawn_background_review.assert_not_called()
 
 
+def test_blocked_kanban_artifact_never_trains_background_skills(monkeypatch):
+    """Review-required is durable evidence, but it is not validated learning."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        "agent.turn_finalizer._kanban_task_terminal_status",
+        lambda _task_id: "blocked",
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review_required")
+    agent = _LimitAgent(budget_remaining=10)
+    agent._skill_nudge_interval = 1
+    agent._iters_since_skill = 1
+    agent.valid_tool_names = ["skill_manage"]
+    agent._spawn_background_review = MagicMock(name="spawn_background_review")
+
+    result = _finalize(
+        agent,
+        final_response="implementation receipt",
+        exit_reason="text_response(finish_reason=stop)",
+        api_call_count=2,
+    )
+
+    assert result["completed"] is True
+    agent._spawn_background_review.assert_not_called()
+
+
 def test_delegated_child_budget_exhaustion_does_not_timeout_parent(monkeypatch):
     from agent.execution_scope import delegated_child_scope
 

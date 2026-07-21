@@ -867,7 +867,9 @@ def run_codex_app_server_turn(
         from agent.turn_finalizer import _kanban_task_terminal_status
 
         kanban_terminal_status = _kanban_task_terminal_status(kanban_task_id)
-    background_review_eligible = not kanban_task_id or bool(kanban_terminal_status)
+    background_review_eligible = (
+        not kanban_task_id or kanban_terminal_status == "done"
+    )
     if (
         turn.final_text
         and not turn.interrupted
