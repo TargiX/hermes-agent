@@ -268,6 +268,9 @@ def test_show_compact_returns_latest_receipt_without_full_history(worker_env):
         "control-plane correction supersedes the run receipt"
     )
     assert shown["latest_comment"]["truncated"] is False
+    assert shown["task"]["max_runtime_seconds"] is None
+    assert shown["task"]["goal_mode"] is False
+    assert shown["latest_run"]["max_runtime_seconds"] is None
     assert shown["history_counts"]["runs"] == 1
     assert shown["history_counts"]["comments"] == 1
     assert "comments" not in shown

@@ -379,6 +379,9 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "max_runtime_seconds": task.max_runtime_seconds,
+        "goal_mode": task.goal_mode,
+        "goal_max_turns": task.goal_max_turns,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -425,6 +428,9 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "max_runtime_seconds": t.max_runtime_seconds,
+                    "goal_mode": t.goal_mode,
+                    "goal_max_turns": t.goal_max_turns,
                 }
 
             def _run_dict(r):
@@ -434,6 +440,9 @@ def _handle_show(args: dict, **kw) -> str:
                     "summary": r.summary, "error": r.error,
                     "metadata": r.metadata,
                     "session_id": r.session_id,
+                    "worker_pid": r.worker_pid,
+                    "max_runtime_seconds": r.max_runtime_seconds,
+                    "last_heartbeat_at": r.last_heartbeat_at,
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
