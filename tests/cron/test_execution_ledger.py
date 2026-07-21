@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _point_ledger(monkeypatch, tmp_path):
     import cron.executions as executions
@@ -56,6 +58,29 @@ def test_claim_execution_rejects_live_same_job_until_terminal(monkeypatch, tmp_p
     next_attempt = executions.claim_execution("single-lead", source="builtin")
     assert next_attempt is not None
     assert next_attempt["id"] != first["id"]
+
+
+def test_execution_ledger_schema_enforces_one_live_row_per_job(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    first = executions.create_execution("single-lead", source="direct")
+
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="executions.job_id"):
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, process_started_at,
+                    status, claimed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'running', ?)""",
+                (
+                    "duplicate-live-row",
+                    "single-lead",
+                    "builtin",
+                    "other-process",
+                    os.getpid(),
+                    None,
+                    first["claimed_at"],
+                ),
+            )
 
 
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):

@@ -56,6 +56,16 @@ def _connect() -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
     )
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_one_live_job "
+            "ON executions(job_id) WHERE status IN ('claimed','running')"
+        )
+    except sqlite3.IntegrityError:
+        # A previous runtime may already have overlapping live rows. Do not
+        # make the ledger unreadable while those attempts drain; the next
+        # connection after reconciliation/closeout will install the index.
+        pass
     return conn
 
 
@@ -153,21 +163,26 @@ def claim_execution(job_id: str, *, source: str) -> Optional[Dict[str, Any]]:
             )
         if live_owner:
             return None
-        conn.execute(
-            """INSERT INTO executions
-               (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
-            (
-                execution_id,
-                str(job_id),
-                str(source),
-                _PROCESS_ID,
-                pid,
-                _process_start_time(pid),
-                now,
-            ),
-        )
+        try:
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, process_started_at,
+                    status, claimed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+                (
+                    execution_id,
+                    str(job_id),
+                    str(source),
+                    _PROCESS_ID,
+                    pid,
+                    _process_start_time(pid),
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            if "executions.job_id" in str(exc):
+                return None
+            raise
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone()
