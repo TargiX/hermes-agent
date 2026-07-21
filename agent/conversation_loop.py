@@ -5646,6 +5646,15 @@ def run_conversation(
                     agent._kanban_stop_nudges = (
                         getattr(agent, "_kanban_stop_nudges", 0) + 1
                     )
+                    if (
+                        not getattr(agent, "_kanban_budget_grace_used", False)
+                        and (
+                            api_call_count >= agent.max_iterations
+                            or agent.iteration_budget.remaining <= 0
+                        )
+                    ):
+                        agent._budget_grace_call = True
+                        agent._kanban_budget_grace_used = True
                     final_msg["finish_reason"] = "kanban_terminal_required"
                     final_msg["_kanban_stop_synthetic"] = True
                     messages.append(final_msg)

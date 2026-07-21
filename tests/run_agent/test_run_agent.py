@@ -5621,6 +5621,57 @@ class TestRunConversation:
         assert call.kwargs.get("end_run") is True
         assert "Iteration budget exhausted" in call.kwargs.get("error", "")
 
+    def test_kanban_terminal_nudge_gets_one_budget_grace_call(
+        self, agent, monkeypatch
+    ):
+        """A final-turn narrated receipt gets one closure-only opportunity.
+
+        Without the grace call, the stop guard appends its terminal-tool nudge
+        at the exact iteration cap and the loop exits before the worker can call
+        kanban_complete, wasting a full retry for already-finished work.
+        """
+        self._setup_agent(agent)
+        agent.max_iterations = 1
+        agent.iteration_budget.max_total = 1
+        agent.valid_tool_names.add("kanban_complete")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
+
+        narrated_receipt = _mock_response(
+            content="The receipt is complete and ready to submit.",
+            finish_reason="stop",
+        )
+        terminal_call = _mock_tool_call(
+            name="kanban_complete",
+            arguments='{"summary":"STOP_NO_ELIGIBLE_BET","metadata":{"outcome":"STOP_NO_ELIGIBLE_BET"}}',
+            call_id="close-1",
+        )
+        terminal_response = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[terminal_call]
+        )
+        agent.client.chat.completions.create.side_effect = [
+            narrated_receipt,
+            terminal_response,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}'),
+            patch(
+                "agent.turn_finalizer._kanban_task_terminal_status",
+                return_value="done",
+            ),
+            patch("hermes_cli.kanban_db._record_task_failure") as record_failure,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("finish the kanban evidence card")
+
+        assert agent.client.chat.completions.create.call_count == 2
+        assert result["completed"] is True
+        assert "terminal state recorded" in result["final_response"].lower()
+        record_failure.assert_not_called()
+        assert agent._kanban_budget_grace_used is True
+
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK
         is unset (non-kanban runs are unaffected by #29747 gap 2)."""

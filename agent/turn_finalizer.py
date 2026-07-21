@@ -53,6 +53,25 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 )
 
 
+def _kanban_task_terminal_status(task_id: str) -> str | None:
+    """Return the durable terminal status for a dispatcher-spawned task."""
+
+    try:
+        from hermes_cli import kanban_db as kb
+
+        conn = kb.connect()
+        try:
+            task = kb.get_task(conn, task_id)
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    status = str(getattr(task, "status", "") or "") if task is not None else ""
+    if status in {"done", "blocked", "triage", "scheduled"}:
+        return status
+    return None
+
+
 def _drop_verification_continuation_scaffolding(messages) -> None:
     """Remove verification-continuation nudge messages from *messages* in place.
 
@@ -95,10 +114,20 @@ def finalize_turn(
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
     )
+    _kanban_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    _kanban_terminal_status = (
+        _kanban_task_terminal_status(_kanban_task) if _kanban_task else None
+    )
+    if final_response is None and budget_exhausted and _kanban_terminal_status:
+        final_response = (
+            f"Kanban terminal state recorded ({_kanban_terminal_status})."
+        )
+        _turn_exit_reason = "text_response(kanban_terminal_tool)"
     budget_fallback_eligible = (
         budget_exhausted
         and not interrupted
         and not failed
+        and not _kanban_terminal_status
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
     )
     continuation_budget_exhausted = (
@@ -151,7 +180,6 @@ def finalize_turn(
         # We route through ``_record_task_failure(outcome="timed_out")``
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
-        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb

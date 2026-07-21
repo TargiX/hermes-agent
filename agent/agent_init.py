@@ -723,6 +723,11 @@ def init_agent(
     # models to "give up" prematurely on complex tasks (#7915).
     agent._budget_exhausted_injected = False
     agent._budget_grace_call = False
+    # A kanban worker that narrates a complete receipt on its final normal
+    # iteration gets exactly one extra API call to invoke a terminal board
+    # tool. The flag prevents a model from turning that closeout allowance
+    # into an unbounded continuation loop.
+    agent._kanban_budget_grace_used = False
 
     # Activity tracking — updated on each API call, tool execution, and
     # stream chunk.  Used by the gateway timeout handler to report what the
