@@ -326,10 +326,68 @@ class TestSpawnEnvIsolation:
             in cmd
         )
         source_root = str(Path(cas.__file__).resolve().parents[2])
-        assert (
-            f"mcp_servers.hermes-tools.cwd={json.dumps(source_root)}" in cmd
-        )
+        assert f"mcp_servers.hermes-tools.cwd={json.dumps(source_root)}" in cmd
         assert all("danger" not in part for part in cmd)
+
+    @pytest.mark.parametrize(
+        ("value", "enabled"),
+        [
+            ("true", True),
+            ("", False),
+            ("0", False),
+            ("false", False),
+            ("yes", False),
+            ("enabled", False),
+            ("TRUE ", False),
+        ],
+    )
+    def test_kanban_worker_network_requires_exact_opt_in(
+        self, monkeypatch, value, enabled
+    ):
+        """Publisher profiles can opt in while every other value fails closed."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        monkeypatch.setenv(
+            "HERMES_KANBAN_DB", "/users/alice/.hermes/kanban/boards/agency/kanban.db"
+        )
+        monkeypatch.setenv("HERMES_CODEX_KANBAN_NETWORK_ACCESS", value)
+
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client._closed = True
+
+        expected = str(enabled).lower()
+        unexpected = str(not enabled).lower()
+        assert f"sandbox_workspace_write.network_access={expected}" in captured["cmd"]
+        assert (
+            f"sandbox_workspace_write.network_access={unexpected}"
+            not in captured["cmd"]
+        )
 
 
 class TestSpawnEnvSecretStripping:

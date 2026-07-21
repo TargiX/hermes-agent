@@ -141,7 +141,13 @@ class CodexAppServerClient:
                     "-c",
                     f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
                     "-c",
-                    "sandbox_workspace_write.network_access=false",
+                    "sandbox_workspace_write.network_access="
+                    + (
+                        "true"
+                        if spawn_env.get("HERMES_CODEX_KANBAN_NETWORK_ACCESS")
+                        == "true"
+                        else "false"
+                    ),
                     "-c",
                     "mcp_servers.hermes-tools.cwd="
                     f"{json.dumps(str(Path(__file__).resolve().parents[2]))}",
