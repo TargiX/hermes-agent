@@ -4774,7 +4774,7 @@ def validate_declared_handoff(
         return None
     payload = metadata if isinstance(metadata, dict) else {}
 
-    if task_class == "review" and receipt.endswith("-review/v1") and action == "complete":
+    if receipt.endswith("-review/v1") and action == "complete":
         issues: list[str] = []
         if payload.get("handoff_version") != receipt:
             issues.append(f"metadata.handoff_version must equal {receipt!r}")
@@ -4814,8 +4814,7 @@ def validate_declared_handoff(
             return "declared review receipt is incomplete: " + "; ".join(issues)
 
     if (
-        task_class == "implementation"
-        and receipt.endswith("-implementation/v1")
+        receipt.endswith("-implementation/v1")
         and action == "block"
         and block_kind == "review_required"
     ):

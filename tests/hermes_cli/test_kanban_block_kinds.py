@@ -268,6 +268,42 @@ def test_review_complete_cannot_bypass_declared_receipt_through_db(
         )
 
 
+def test_independent_review_alias_cannot_bypass_declared_receipt_through_db(
+    kanban_home: Path,
+) -> None:
+    """Review class aliases must not disable the immutable receipt contract."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (
+                    "task_class: independent_review\n"
+                    "required_receipt: portfolio-review/v1\n"
+                    "implementation_task_id: t_impl1234\n",
+                    tid,
+                ),
+            )
+
+        with pytest.raises(ValueError, match="metadata.handoff_version"):
+            kb.complete_task(
+                conn,
+                tid,
+                result="APPROVE",
+                metadata={
+                    "handoff_version": "phosphene-review/v1",
+                    "outcome": "APPROVE",
+                    "approved": True,
+                    "implementation_task_id": "t_impl1234",
+                    "reviewed_fingerprint": "a" * 64,
+                    "blocking_findings": [],
+                    "authorized_next_task_ids": ["t_impl1234"],
+                },
+            )
+
+        assert kb.get_task(conn, tid).status == "running"
+
+
 # ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------
