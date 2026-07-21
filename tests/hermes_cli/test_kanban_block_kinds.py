@@ -196,14 +196,34 @@ def test_review_required_preserves_structured_run_metadata(kanban_home: Path) ->
 # ---------------------------------------------------------------------------
 
 
-def test_dependency_block_routes_to_todo(kanban_home: Path) -> None:
-    """Dependency waits never enter the human 'blocked' bucket."""
+def test_dependency_block_requires_an_unfinished_parent(kanban_home: Path) -> None:
+    """A dependency label without a linked wait target must fail closed.
+
+    Otherwise a standalone task lands in ``todo`` and is immediately promoted
+    by ``recompute_ready`` because the empty parent set is vacuously complete,
+    creating a worker retry storm.
+    """
     with kb.connect_closing() as conn:
         tid = _running_task(conn)
-        assert kb.block_task(conn, tid, reason="need X first", kind="dependency")
+        with pytest.raises(ValueError, match="unfinished parent"):
+            kb.block_task(conn, tid, reason="need X first", kind="dependency")
         t = kb.get_task(conn, tid)
-        assert t.status == "todo"
-        assert t.block_kind == "dependency"
+        assert t.status == "running"
+        assert t.block_kind is None
+
+
+def test_dependency_block_routes_to_todo_with_unfinished_parent(
+    kanban_home: Path,
+) -> None:
+    """A real linked dependency waits in todo without human intervention."""
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        tid = _running_task(conn)
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
+        assert kb.block_task(conn, tid, reason="need parent first", kind="dependency")
+        task = kb.get_task(conn, tid)
+        assert task.status == "todo"
+        assert task.block_kind == "dependency"
 
 
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:

@@ -582,8 +582,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_block.add_argument(
         "--kind", default=None, choices=sorted(kb.VALID_BLOCK_KINDS),
         help=(
-            "Typed block reason. 'dependency' waits in todo (auto-promoted "
-            "when parents finish, no human); 'needs_input'/'capability' go to "
+            "Typed block reason. 'dependency' requires an unfinished linked "
+            "parent and waits in todo (auto-promoted when parents finish, no "
+            "human); 'needs_input'/'capability' go to "
             "blocked for a human; 'transient' marks a maybe-flaky failure; "
             "'review_required' parks a frozen implementation for independent "
             "review without counting it as an unblock loop. "
@@ -2120,14 +2121,20 @@ def _cmd_block(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                blocked = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except ValueError as exc:
+                failed.append(tid)
+                print(f"cannot block {tid}: {exc}", file=sys.stderr)
+                continue
+            if not blocked:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:

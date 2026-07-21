@@ -1128,6 +1128,14 @@ def test_block_goal_mode_allows_dependency_kind(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    conn = kb.connect()
+    try:
+        prerequisite = kb.create_task(
+            conn, title="unfinished prerequisite", assignee="other-worker"
+        )
+        kb.link_tasks(conn, parent_id=prerequisite, child_id=tid)
+    finally:
+        conn.close()
     out = kt._handle_block({"reason": "waiting on another task", "kind": "dependency"})
     d = json.loads(out)
     assert d.get("ok") is True
