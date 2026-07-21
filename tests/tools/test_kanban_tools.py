@@ -279,6 +279,46 @@ def test_show_compact_returns_latest_receipt_without_full_history(worker_env):
     assert "worker_context" not in shown
 
 
+def test_show_compact_bounds_large_body_and_receipt(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET body = ? WHERE id = ?",
+            ("body " * 1000, worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    completed = json.loads(kt._handle_complete({
+        "summary": "summary " * 500,
+        "metadata": {
+            "handoff_version": "phosphene-evidence/v1",
+            "outcome": "DISPATCH_EVIDENCE",
+            "evidence": [f"evidence-{index}-" + "x" * 1000 for index in range(10)],
+            "unbounded_transcript": "secret detail " * 1000,
+        },
+    }))
+    assert completed.get("ok") is True
+
+    shown = json.loads(kt._handle_show({
+        "task_id": worker_env,
+        "compact": True,
+    }))
+    assert shown["task"]["body_truncated"] is True
+    assert len(shown["task"]["body"]) <= 1401
+    assert shown["latest_run"]["summary_truncated"] is True
+    assert len(shown["latest_run"]["summary"]) <= 801
+    receipt = shown["latest_run"]["metadata"]
+    assert receipt["outcome"] == "DISPATCH_EVIDENCE"
+    assert receipt["evidence"][-1] == {"_omitted_items": 6}
+    assert "unbounded_transcript" in receipt["_omitted_keys"]
+    assert "secret detail" not in json.dumps(shown)
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

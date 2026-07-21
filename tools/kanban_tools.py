@@ -389,6 +389,67 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     }
 
 
+_COMPACT_METADATA_KEYS = (
+    "handoff_version", "schema", "status", "task_class", "outcome",
+    "verdict", "approved", "owner_profile", "model", "task_id", "intent",
+    "base_ref", "head_ref", "changed_files", "diff_fingerprint",
+    "reviewed_task_id", "reviewed_fingerprint", "blocking_findings",
+    "authorized_next_task_ids", "next_owner", "recommended_next_stage",
+    "environment_gap", "source_ref", "evidence", "falsifier",
+    "collision_result", "acceptance_checked", "verification", "risks",
+    "residual_uncertainty",
+)
+
+
+def _compact_json_value(value: Any, *, depth: int = 0) -> Any:
+    """Bound receipt fields so a compact read cannot recreate full history."""
+    if isinstance(value, str):
+        limit = 360
+        return value if len(value) <= limit else value[:limit] + "…"
+    if isinstance(value, list):
+        limit = 4
+        compacted = [
+            _compact_json_value(item, depth=depth + 1)
+            for item in value[:limit]
+        ]
+        if len(value) > limit:
+            compacted.append({"_omitted_items": len(value) - limit})
+        return compacted
+    if isinstance(value, dict):
+        if depth >= 2:
+            keys = [str(key) for key in value]
+            return {
+                "_keys": keys[:6],
+                "_omitted_keys": max(len(keys) - 6, 0),
+            }
+        items = list(value.items())
+        limit = 6
+        compacted = {
+            str(key): _compact_json_value(item, depth=depth + 1)
+            for key, item in items[:limit]
+        }
+        if len(items) > limit:
+            compacted["_omitted_keys"] = len(items) - limit
+        return compacted
+    return value
+
+
+def _compact_receipt_metadata(metadata: Any) -> Any:
+    """Keep routing-critical receipt fields and advertise omitted detail."""
+    if not isinstance(metadata, dict):
+        return _compact_json_value(metadata)
+    selected = {
+        key: _compact_json_value(metadata[key])
+        for key in _COMPACT_METADATA_KEYS
+        if key in metadata
+    }
+    omitted = [key for key in metadata if key not in selected]
+    if omitted:
+        selected["_omitted_keys"] = omitted[:12]
+        selected["_omitted_key_count"] = len(omitted)
+    return selected
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -415,9 +476,15 @@ def _handle_show(args: dict, **kw) -> str:
             children = kb.child_ids(conn, tid)
             relations = kb.list_task_relations(conn, tid)
 
-            def _task_dict(t):
+            def _task_dict(t, *, compact_view: bool = False):
+                body = t.body
+                body_truncated = False
+                if compact_view and isinstance(body, str) and len(body) > 1400:
+                    body = body[:1400] + "…"
+                    body_truncated = True
                 return {
-                    "id": t.id, "title": t.title, "body": t.body,
+                    "id": t.id, "title": t.title, "body": body,
+                    "body_truncated": body_truncated,
                     "assignee": t.assignee, "status": t.status,
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
@@ -433,12 +500,25 @@ def _handle_show(args: dict, **kw) -> str:
                     "goal_max_turns": t.goal_max_turns,
                 }
 
-            def _run_dict(r):
+            def _run_dict(r, *, compact_view: bool = False):
+                summary = r.summary
+                summary_truncated = False
+                if compact_view and isinstance(summary, str) and len(summary) > 800:
+                    summary = summary[:800] + "…"
+                    summary_truncated = True
+                error = r.error
+                if compact_view and isinstance(error, str) and len(error) > 500:
+                    error = error[:500] + "…"
                 return {
                     "id": r.id, "profile": r.profile,
                     "status": r.status, "outcome": r.outcome,
-                    "summary": r.summary, "error": r.error,
-                    "metadata": r.metadata,
+                    "summary": summary,
+                    "summary_truncated": summary_truncated,
+                    "error": error,
+                    "metadata": (
+                        _compact_receipt_metadata(r.metadata)
+                        if compact_view else r.metadata
+                    ),
                     "session_id": r.session_id,
                     "worker_pid": r.worker_pid,
                     "max_runtime_seconds": r.max_runtime_seconds,
@@ -472,7 +552,7 @@ def _handle_show(args: dict, **kw) -> str:
                 latest_comment = None
                 if latest_comment_row is not None:
                     comment_body = str(latest_comment_row["body"])
-                    comment_limit = 2000
+                    comment_limit = 800
                     comment_truncated = len(comment_body) > comment_limit
                     latest_comment = {
                         "author": latest_comment_row["author"],
@@ -493,12 +573,13 @@ def _handle_show(args: dict, **kw) -> str:
                     (tid, tid, tid),
                 ).fetchone()
                 return json.dumps({
-                    "task": _task_dict(task),
+                    "task": _task_dict(task, compact_view=True),
                     "parents": parents,
                     "children": children,
                     "relations": relation_rows,
                     "latest_run": (
-                        _run_dict(latest_run) if latest_run is not None else None
+                        _run_dict(latest_run, compact_view=True)
+                        if latest_run is not None else None
                     ),
                     "latest_comment": latest_comment,
                     "history_counts": {
