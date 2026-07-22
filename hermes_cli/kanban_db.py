@@ -2009,7 +2009,23 @@ def connect(
     * Neither → :func:`kanban_db_path` resolves via
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
+
+    Dispatcher workers have both ``HERMES_KANBAN_TASK`` and
+    ``HERMES_KANBAN_BOARD`` pinned at spawn.  In that scope an explicit
+    ``board=`` may repeat the pinned board, but cannot select a sibling board.
+    Orchestrators (no task pin) retain the intentional cross-board routing
+    interface.
     """
+    if board is not None and os.environ.get("HERMES_KANBAN_TASK"):
+        pinned_raw = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+        if pinned_raw:
+            requested_board = _normalize_board_slug(board)
+            pinned_board = _normalize_board_slug(pinned_raw)
+            if requested_board != pinned_board:
+                raise ValueError(
+                    f"kanban worker is pinned to board {pinned_board!r}; "
+                    f"refusing explicit board {requested_board!r}"
+                )
     if db_path is not None:
         path = db_path
     else:

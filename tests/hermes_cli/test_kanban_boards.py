@@ -374,6 +374,54 @@ class TestConnectionIsolation:
             assert [t.title for t in kb.list_tasks(conn)] == ["via-fallback"]
         assert not kb.board_exists("ephemeral")
 
+    def test_dispatcher_worker_cannot_override_its_pinned_board(
+        self, fresh_home, monkeypatch,
+    ):
+        """A spawned worker must not escape its board through ``board=``.
+
+        Orchestrators intentionally route explicit calls across boards, but a
+        dispatcher worker has both its task and board pinned in the
+        environment.  Letting that worker open another board would turn the
+        documented hard isolation boundary into a prompt-only convention.
+        """
+        kb.create_board("agency")
+        kb.create_board("growth")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "agency")
+
+        with kb.connect(board="agency") as conn:
+            assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+        with pytest.raises(ValueError, match="pinned to board 'agency'"):
+            kb.connect(board="growth")
+
+    @pytest.mark.parametrize("board", ["agency", "growth"])
+    def test_dependency_gate_is_shared_by_every_named_board(
+        self, fresh_home, board,
+    ):
+        """Every agency board inherits the same parent/claim invariant."""
+        kb.create_board(board)
+        with kb.connect(board=board) as conn:
+            parent = kb.create_task(conn, title="research", assignee="worker")
+            child = kb.create_task(
+                conn,
+                title="produce",
+                assignee="worker",
+                parents=[parent],
+            )
+            assert kb.get_task(conn, child).status == "todo"
+
+            # Even a racy/manual promotion cannot bypass the final claim gate.
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+            conn.commit()
+            assert kb.claim_task(conn, child, claimer="wrong-order") is None
+            assert kb.get_task(conn, child).status == "todo"
+
+            assert kb.claim_task(conn, parent, claimer="first-stage") is not None
+            assert kb.complete_task(conn, parent, result="evidence ready")
+            assert kb.get_task(conn, child).status == "ready"
+            assert kb.claim_task(conn, child, claimer="second-stage") is not None
+
 
 # ---------------------------------------------------------------------------
 # Worker spawn env injection

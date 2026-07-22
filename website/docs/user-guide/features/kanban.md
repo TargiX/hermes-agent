@@ -83,7 +83,10 @@ Per-board isolation is absolute:
 - Separate `workspaces/` and `logs/` directories.
 - Workers spawned for a task see **only** their board's tasks — the
   dispatcher sets `HERMES_KANBAN_BOARD` in the child env and every
-  `kanban_*` tool the worker has access to reads it.
+  `kanban_*` tool the worker has access to reads it. A dispatcher worker may
+  repeat that board through an explicit `board=` / `--board`, but the shared
+  connection layer rejects attempts to select a sibling board. Orchestrators
+  without a task pin retain intentional cross-board routing.
 - Linking tasks across boards is not allowed (keeps the schema simple; if
   you really need cross-project refs, use free-text mentions and look
   them up by id manually).
@@ -128,6 +131,10 @@ Board resolution order (highest precedence first):
 3. `~/.hermes/kanban/current` — the slug persisted by `hermes kanban
    boards switch`.
 4. `default`.
+
+The explicit override is intentionally restricted inside a dispatcher worker:
+when both `HERMES_KANBAN_TASK` and `HERMES_KANBAN_BOARD` are pinned, an
+explicit sibling board is rejected instead of taking precedence.
 
 Slugs are validated: lowercase alphanumerics + hyphens + underscores, 1-64
 chars, must start with alphanumeric. Uppercase input is auto-downcased.

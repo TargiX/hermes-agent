@@ -2400,6 +2400,24 @@ def test_board_param_routes_create_to_alt_board(multi_board_env):
         assert kb.get_task(conn, new_tid) is None
 
 
+def test_worker_board_param_cannot_escape_dispatcher_pin(
+    multi_board_env, monkeypatch,
+):
+    """Cross-board routing belongs to orchestrators, not task workers."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", multi_board_env["default_seed"])
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+
+    out = kt._handle_create({
+        "title": "rogue cross-board child",
+        "assignee": "worker",
+        "board": "alt",
+    })
+    err = json.loads(out).get("error", "")
+    assert "pinned to board 'default'" in err
+
+
 def test_board_param_routes_list_to_alt_board(multi_board_env):
     """kanban_list filters by the board parameter, not env-active."""
     from tools import kanban_tools as kt
