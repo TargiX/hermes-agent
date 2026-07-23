@@ -2391,7 +2391,7 @@
     const task = object.task || {};
     const color = reached ? YARD_CANVAS_COLORS.mint : YARD_CANVAS_COLORS.muted;
     ctx.save();
-    ctx.globalAlpha = reached ? 1 : 0.38;
+    ctx.globalAlpha = reached ? 1 : 0.68;
     ctx.fillStyle = "rgba(10,29,37,0.94)";
     ctx.strokeStyle = color;
     ctx.lineWidth = 1.5;
@@ -2410,8 +2410,9 @@
     ctx.stroke();
     ctx.fillStyle = color;
     ctx.textAlign = "center";
-    ctx.font = "800 7px ui-monospace, monospace";
-    ctx.fillText(reached ? "WORKED" : "WAITING", x, y - 5);
+    ctx.font = "800 6px ui-monospace, monospace";
+    ctx.fillText(reached ? "PAST RUN" : "NOT STARTED", x, y - 9);
+    ctx.fillText(reached ? "HANDLED BY" : "NEXT OWNER", x, y + 1);
     ctx.fillStyle = reached
       ? YARD_CANVAS_COLORS.fog
       : "rgba(234,240,236,0.45)";
@@ -2419,7 +2420,7 @@
     ctx.fillText(
       task.assignee ? "@" + task.assignee : "UNASSIGNED",
       x,
-      y + 8,
+      y + 13,
     );
     ctx.restore();
   }
@@ -2751,6 +2752,16 @@
       const task = object.task || {};
       const artifact = object.artifact;
       const events = (object.events || []).slice(-6).reverse();
+      const wasWorked = Boolean(task.started_at) || (object.events || []).some(
+        function (event) {
+          return [
+            "claimed",
+            "spawned",
+            "blocked",
+            "completed",
+          ].includes(event.kind);
+        },
+      );
       return h("aside", {
         className: "hermes-canvas-tooltip hermes-canvas-tooltip--mission",
         role: "tooltip",
@@ -2777,7 +2788,7 @@
             h("strong", null, task.id || "Unknown"),
           ),
           h("span", null,
-            h("small", null, "WORKER"),
+            h("small", null, wasWorked ? "HANDLED BY" : "NEXT OWNER"),
             h("strong", null, task.assignee ? "@" + task.assignee : "Unassigned"),
           ),
           h("span", null,
@@ -3392,7 +3403,12 @@
             layout.fieldLeft,
             headerY,
           );
-          const stageLabels = ["TASK INTAKE", "WORKBENCH", "OUTPUT", "GATE"];
+          const stageLabels = [
+            "TASK INTAKE",
+            "WORKBENCH RECEIPT",
+            "OUTPUT",
+            "GATE",
+          ];
           ctx.fillStyle = "rgba(234,240,236,0.46)";
           ctx.textAlign = "center";
           stageLabels.forEach(function (label, index) {
@@ -3646,7 +3662,7 @@
             h("strong", null, "No agent work is running right now"),
             h("small", null,
               props.scene.factoryObjects.length > 0
-                ? "The conveyor below preserves what recent tasks became."
+                ? "Workbench names below are past receipts; live agents would leave their base."
                 : "Building, planning, review, and recovery appear here when an agent run starts."),
           )
         : null,
@@ -3815,7 +3831,7 @@
         h("span", null, h("i", { className: "is-review" }), "PR, patch, or result"),
         h("span", null, h("i", { className: "is-blocked" }), "Blocked transformation"),
         h("strong", null,
-          "The conveyor uses explicit board events and machine-readable receipts—not private reasoning."),
+          "Workbench names are past handlers or next owners. Only agents outside a base are live."),
       ),
     );
   }
