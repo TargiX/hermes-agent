@@ -971,6 +971,7 @@ BOARD_COLUMNS: list[str] = [
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 _FACTORY_FLOW_WINDOW_SECONDS = 2 * 60 * 60
 _FACTORY_FLOW_MAX_OBJECTS = 8
+_FACTORY_FLOW_TEXT_CHARS = 1200
 _FACTORY_FLOW_EVENT_KINDS = frozenset(
     {
         "created",
@@ -1091,6 +1092,36 @@ def _factory_artifact_from_runs(
     return None
 
 
+def _factory_text_excerpt(value: Optional[str]) -> Optional[str]:
+    """Keep factory hover payloads useful without shipping entire task logs."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if len(text) <= _FACTORY_FLOW_TEXT_CHARS:
+        return text
+    return text[: _FACTORY_FLOW_TEXT_CHARS - 1].rstrip() + "…"
+
+
+def _factory_workbench_receipt(
+    conn: sqlite3.Connection,
+    task: kanban_db.Task,
+) -> dict[str, Any] | None:
+    """Return the latest run handoff as a distinct workbench-stage object."""
+    run = kanban_db.latest_run(conn, task.id)
+    if run is None:
+        return None
+    return {
+        "run_id": run.id,
+        "profile": run.profile,
+        "status": run.status,
+        "outcome": run.outcome,
+        "summary": _factory_text_excerpt(run.summary),
+        "error": _factory_text_excerpt(run.error),
+        "started_at": run.started_at,
+        "ended_at": run.ended_at,
+    }
+
+
 def _recent_factory_objects(
     conn: sqlite3.Connection,
     *,
@@ -1151,6 +1182,7 @@ def _recent_factory_objects(
             )
         newest = task_rows[0]
         artifact = _factory_artifact_from_runs(conn, task)
+        workbench_receipt = _factory_workbench_receipt(conn, task)
         blocker = (
             {
                 "kind": str(task.block_kind or "unclassified"),
@@ -1170,6 +1202,13 @@ def _recent_factory_objects(
                 "task": {
                     "id": task.id,
                     "title": task.title,
+                    "body": _factory_text_excerpt(task.body),
+                    "result": _factory_text_excerpt(task.result),
+                    "latest_summary": (
+                        workbench_receipt.get("summary")
+                        if workbench_receipt is not None
+                        else None
+                    ),
                     "assignee": task.assignee,
                     "status": task.status,
                     "priority": task.priority,
@@ -1182,6 +1221,7 @@ def _recent_factory_objects(
                 "events": events,
                 "latest_event_kind": str(newest["kind"]),
                 "last_event_at": int(newest["created_at"]),
+                "workbench_receipt": workbench_receipt,
                 "artifact": artifact,
                 "blocker": blocker,
             }

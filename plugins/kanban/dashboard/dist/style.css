@@ -2549,6 +2549,32 @@
   font: 520 0.58rem/1.42 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 }
 
+.hermes-canvas-tooltip-factory-focus {
+  display: flex;
+  flex-direction: column;
+  gap: 0.28rem;
+  margin-top: 0.62rem;
+  padding: 0.58rem 0.62rem;
+  border-left: 3px solid var(--tooltip-tone);
+  border-radius: 0 0.36rem 0.36rem 0;
+  background: color-mix(in srgb, var(--tooltip-tone) 9%, transparent);
+}
+
+.hermes-canvas-tooltip-factory-focus p {
+  max-height: 9.2rem;
+  margin: 0;
+  overflow: hidden;
+  color: color-mix(in srgb, var(--yard-fog) 86%, white);
+  font: 560 0.63rem/1.5 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.hermes-canvas-tooltip-factory-focus.is-muted p {
+  color: color-mix(in srgb, var(--yard-fog) 48%, transparent);
+  font-style: italic;
+}
+
 .hermes-canvas-tooltip-agents {
   display: flex;
   flex-wrap: wrap;

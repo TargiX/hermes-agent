@@ -172,6 +172,7 @@ def test_agency_overview_exposes_recent_factory_objects(client):
         published_id = kb.create_task(
             conn,
             title="Publish creator export",
+            body="Ship the reviewed creator export and preserve exact PR provenance.",
             assignee="agency-publisher",
         )
         blocked_id = kb.create_task(
@@ -182,10 +183,16 @@ def test_agency_overview_exposes_recent_factory_objects(client):
         conn.execute(
             """
             UPDATE tasks
-            SET status = 'done', started_at = ?, completed_at = ?
+            SET status = 'done', started_at = ?, completed_at = ?,
+                result = ?
             WHERE id = ?
             """,
-            (now - 90, now - 10, published_id),
+            (
+                now - 90,
+                now - 10,
+                "Creator export published in draft PR #951.",
+                published_id,
+            ),
         )
         conn.execute(
             """
@@ -200,14 +207,15 @@ def test_agency_overview_exposes_recent_factory_objects(client):
             """
             INSERT INTO task_runs (
                 task_id, profile, status, started_at, ended_at,
-                outcome, metadata
-            ) VALUES (?, ?, 'done', ?, ?, 'completed', ?)
+                outcome, summary, metadata
+            ) VALUES (?, ?, 'done', ?, ?, 'completed', ?, ?)
             """,
             (
                 published_id,
                 "agency-publisher",
                 now - 90,
                 now - 10,
+                "Implemented the export, verified it locally, and opened the draft PR.",
                 json.dumps(
                     {
                         "pr_url": (
@@ -271,6 +279,28 @@ def test_agency_overview_exposes_recent_factory_objects(client):
         "draft": True,
         "run_id": published["artifact"]["run_id"],
     }
+    assert published["task"]["body"] == (
+        "Ship the reviewed creator export and preserve exact PR provenance."
+    )
+    assert published["task"]["result"] == (
+        "Creator export published in draft PR #951."
+    )
+    assert published["task"]["latest_summary"] == (
+        "Implemented the export, verified it locally, and opened the draft PR."
+    )
+    assert published["workbench_receipt"] == {
+        "run_id": published["artifact"]["run_id"],
+        "profile": "agency-publisher",
+        "status": "done",
+        "outcome": "completed",
+        "summary": (
+            "Implemented the export, verified it locally, and opened the draft PR."
+        ),
+        "error": None,
+        "started_at": now - 90,
+        "ended_at": now - 10,
+    }
+    assert "final_result" not in published
     assert {
         event["kind"] for event in published["events"]
     } >= {"created", "claimed", "spawned", "completed"}

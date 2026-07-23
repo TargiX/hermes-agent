@@ -2902,12 +2902,22 @@
       y - 43,
     );
     ctx.restore();
-    return {
-      x: layout.fieldLeft,
-      y: y - 52,
-      width: layout.width - layout.fieldLeft - layout.fieldRight,
-      height: 105,
-    };
+    const stageNames = ["task", "workbench", "output", "gate"];
+    return stageXs.map(function (stageX, stageIndex) {
+      const left = stageIndex === 0
+        ? layout.fieldLeft
+        : (stageXs[stageIndex - 1] + stageX) / 2;
+      const right = stageIndex === stageXs.length - 1
+        ? layout.width - layout.fieldRight
+        : (stageX + stageXs[stageIndex + 1]) / 2;
+      return {
+        stage: stageNames[stageIndex],
+        x: left,
+        y: y - 52,
+        width: right - left,
+        height: 105,
+      };
+    });
   }
 
   function yardBaseStackHeight(bases, compact) {
@@ -3017,6 +3027,63 @@
     }, yardStatusLabel(props.status));
   }
 
+  function yardFactoryStageTone(object, stage) {
+    if (stage === "task") return YARD_CANVAS_COLORS.amber;
+    if (stage === "workbench") {
+      return object.workbench_receipt
+        ? YARD_CANVAS_COLORS.control
+        : YARD_CANVAS_COLORS.muted;
+    }
+    if (stage === "output") {
+      if (object.blocker) return YARD_CANVAS_COLORS.coral;
+      return object.artifact
+        ? object.artifact.kind === "pull_request"
+          ? YARD_CANVAS_COLORS.review
+          : YARD_CANVAS_COLORS.mint
+        : YARD_CANVAS_COLORS.muted;
+    }
+    if (object.blocker) {
+      return object.blocker.kind === "review_required"
+        ? YARD_CANVAS_COLORS.review
+        : YARD_CANVAS_COLORS.coral;
+    }
+    return yardStateColor(object.task && object.task.status);
+  }
+
+  function yardFactoryStageLabel(stage) {
+    const labels = {
+      task: "Task intake",
+      workbench: "Workbench receipt",
+      output: "Produced object",
+      gate: "Final gate",
+    };
+    return labels[stage] || "Factory object";
+  }
+
+  function YardFactoryFacts(props) {
+    return h("div", { className: "hermes-canvas-tooltip-facts" },
+      (props.facts || []).map(function (fact) {
+        return h("span", { key: fact.label },
+          h("small", null, fact.label),
+          h("strong", { title: fact.value }, fact.value),
+        );
+      }),
+    );
+  }
+
+  function YardFactoryFocus(props) {
+    return h("div", {
+      className: cn(
+        "hermes-canvas-tooltip-factory-focus",
+        props.muted && "is-muted",
+      ),
+    },
+      h("span", { className: "hermes-canvas-tooltip-section-label" },
+        props.label),
+      h("p", null, props.text),
+    );
+  }
+
   function AgencyHoverInspector(props) {
     const hover = props.hover;
     if (!hover) return null;
@@ -3025,13 +3092,7 @@
       : hover.type === "dock"
         ? yardStateColor(hover.dock.state)
         : hover.type === "factory"
-          ? hover.factory.blocker
-            ? hover.factory.blocker.kind === "review_required"
-              ? YARD_CANVAS_COLORS.review
-              : YARD_CANVAS_COLORS.coral
-            : hover.factory.artifact
-              ? YARD_CANVAS_COLORS.mint
-              : YARD_CANVAS_COLORS.amber
+          ? yardFactoryStageTone(hover.factory, hover.stage || "task")
           : yardStateColor(hover.mission.status);
     const style = {
       left: hover.left + "px",
@@ -3044,17 +3105,150 @@
       const object = hover.factory;
       const task = object.task || {};
       const artifact = object.artifact;
-      const events = (object.events || []).slice(-6).reverse();
-      const wasWorked = Boolean(task.started_at) || (object.events || []).some(
-        function (event) {
-          return [
-            "claimed",
-            "spawned",
-            "blocked",
-            "completed",
-          ].includes(event.kind);
-        },
-      );
+      const receipt = object.workbench_receipt;
+      const stage = hover.stage || "task";
+      let heading = task.title || "Untitled task";
+      let description = "";
+      let focusLabel = "";
+      let focusText = "";
+      let focusMuted = false;
+      let facts = [];
+      let foot = "";
+
+      if (stage === "task") {
+        description = "The input handed to the agency before any worker transformed it.";
+        focusLabel = "Task brief";
+        focusText = task.body || "No task description was recorded.";
+        focusMuted = !task.body;
+        facts = [
+          { label: "TASK", value: task.id || "Unknown" },
+          { label: "PRIORITY", value: String(task.priority || 0) },
+          { label: "CREATED BY", value: task.created_by || "Unknown" },
+        ];
+        foot = "Click to open the complete task card.";
+      } else if (stage === "workbench") {
+        heading = receipt && receipt.profile
+          ? `@${receipt.profile} worker handoff`
+          : "No worker receipt";
+        description = receipt
+          ? "The latest recorded worker attempt, separated from the original brief and final gate."
+          : "No worker run has produced a receipt for this task.";
+        focusLabel = receipt && receipt.error ? "Worker error" : "What the worker did";
+        focusText = receipt
+          ? receipt.error || receipt.summary || "The run ended without a written handoff summary."
+          : "This object has not reached a workbench run.";
+        focusMuted = !receipt || (!receipt.error && !receipt.summary);
+        facts = [
+          { label: "WORKER", value: receipt && receipt.profile ? `@${receipt.profile}` : "None" },
+          { label: "RUN", value: receipt && receipt.run_id ? `#${receipt.run_id}` : "None" },
+          {
+            label: "OUTCOME",
+            value: receipt && (receipt.outcome || receipt.status)
+              ? receipt.outcome || receipt.status
+              : "Pending",
+          },
+        ];
+        foot = "This is the worker handoff receipt—not the final product result.";
+      } else if (stage === "output") {
+        heading = artifact
+          ? artifact.label || artifact.kind
+          : object.blocker
+            ? "No output produced"
+            : "Output pending";
+        description = artifact
+          ? "The machine-readable object produced by the workbench."
+          : object.blocker
+            ? `The run stopped at ${yardBlockCauseLabel(object.blocker.kind)} before producing an object.`
+            : "No machine-readable output has been recorded yet.";
+        focusLabel = artifact && artifact.kind === "pull_request"
+          ? "Pull request"
+          : artifact && artifact.kind === "patch"
+            ? "Code patch"
+            : artifact
+              ? "Result object"
+              : object.blocker
+                ? "Blocking condition"
+                : "Output state";
+        focusText = artifact && artifact.kind === "pull_request"
+          ? [
+              artifact.label,
+              artifact.state,
+              artifact.draft === true ? "draft" : artifact.draft === false ? "ready" : "",
+            ].filter(Boolean).join(" · ")
+          : artifact && artifact.kind === "patch"
+            ? `${artifact.files_count || 0} changed files · fingerprint ${artifact.fingerprint || "unknown"}`
+            : artifact
+              ? artifact.label || "Completed result object"
+              : object.blocker
+                ? yardBlockCauseLabel(object.blocker.kind)
+                : "Nothing produced yet.";
+        focusMuted = !artifact;
+        facts = [
+          { label: "TYPE", value: artifact ? artifact.kind.replace(/_/g, " ") : "None" },
+          { label: "RUN", value: artifact && artifact.run_id ? `#${artifact.run_id}` : "None" },
+          {
+            label: "STATE",
+            value: artifact && artifact.state
+              ? artifact.state
+              : object.blocker
+                ? "Blocked"
+                : artifact
+                  ? "Produced"
+                  : "Pending",
+          },
+        ];
+        foot = artifact && artifact.kind === "pull_request"
+          ? "PR identity comes from the exact publication receipt, never from text mentions."
+          : "Only machine-readable output receipts become objects here.";
+      } else {
+        heading = task.status === "done"
+          ? "Completed result"
+          : object.blocker
+            ? yardBlockCauseLabel(object.blocker.kind)
+            : yardStatusLabel(task.status);
+        description = task.status === "done"
+          ? "The final result that left the factory."
+          : object.blocker
+            ? "The exact condition preventing this object from passing the gate."
+            : "The task has not reached a terminal gate yet.";
+        focusLabel = task.status === "done"
+          ? "Final result"
+          : object.blocker
+            ? "Why it stopped"
+            : "Current gate";
+        focusText = task.status === "done"
+          ? task.result || task.latest_summary ||
+            "Completed without a written final result."
+          : object.blocker
+            ? yardBlockCauseLabel(object.blocker.kind)
+            : yardStatusLabel(task.status);
+        focusMuted = task.status === "done" &&
+          !task.result && !task.latest_summary;
+        facts = [
+          { label: "STATUS", value: yardStatusLabel(task.status) },
+          {
+            label: "FINISHED",
+            value: task.completed_at
+              ? new Date(task.completed_at * 1000).toLocaleTimeString(
+                  [],
+                  { hour: "2-digit", minute: "2-digit" },
+                )
+              : "Not yet",
+          },
+          {
+            label: "OUTPUT",
+            value: artifact
+              ? artifact.label
+              : object.blocker
+                ? "Blocked"
+                : "None",
+          },
+        ];
+        foot = task.status === "done"
+          ? "This view intentionally leads with the result, not the earlier event history."
+          : "Resolve the gate condition before treating this task as complete.";
+      }
+
       return h("aside", {
         className: "hermes-canvas-tooltip hermes-canvas-tooltip--mission",
         role: "tooltip",
@@ -3063,68 +3257,22 @@
         h("div", { className: "hermes-canvas-tooltip-head" },
           h("div", { className: "hermes-canvas-tooltip-heading" },
             h("span", { className: "hermes-canvas-tooltip-kicker" },
-              "FACTORY OBJECT · " +
+              `${yardFactoryStageLabel(stage).toUpperCase()} · ` +
               String(object.board_name || object.board_slug || "BOARD").toUpperCase()),
-            h("strong", null, task.title || "Untitled task"),
+            h("strong", null, heading),
           ),
           h(YardTooltipStatus, { status: task.status }),
         ),
         h("p", { className: "hermes-canvas-tooltip-description" },
-          artifact
-            ? `This task produced ${artifact.label || artifact.kind}.`
-            : object.blocker
-              ? `Work stopped at ${yardBlockCauseLabel(object.blocker.kind)}.`
-              : "This task has not produced a machine-readable output yet."),
-        h("div", { className: "hermes-canvas-tooltip-facts" },
-          h("span", null,
-            h("small", null, "TASK"),
-            h("strong", null, task.id || "Unknown"),
-          ),
-          h("span", null,
-            h("small", null, wasWorked ? "HANDLED BY" : "NEXT OWNER"),
-            h("strong", null, task.assignee ? "@" + task.assignee : "Unassigned"),
-          ),
-          h("span", null,
-            h("small", null, "OUTPUT"),
-            h("strong", null,
-              artifact
-                ? artifact.label
-                : object.blocker
-                  ? "Blocker"
-                  : "Pending"),
-          ),
-        ),
-        events.length
-          ? h("div", { className: "hermes-canvas-tooltip-task-list" },
-              h("span", { className: "hermes-canvas-tooltip-section-label" },
-                "RECORDED TRANSFORMATIONS"),
-              events.map(function (event) {
-                return h("div", {
-                  className: "hermes-canvas-tooltip-task",
-                  key: event.id,
-                },
-                  h("i", { style: { "--task-tone": tone } }),
-                  h("span", null,
-                    h("strong", null, yardFactoryEventLabel(event.kind)),
-                    h("code", null,
-                      [
-                        event.actor ? "@" + event.actor : "",
-                        event.created_at
-                          ? new Date(event.created_at * 1000).toLocaleTimeString(
-                              [],
-                              { hour: "2-digit", minute: "2-digit" },
-                            )
-                          : "",
-                      ].filter(Boolean).join(" · ")),
-                  ),
-                );
-              }),
-            )
-          : null,
+          description),
+        h(YardFactoryFacts, { facts }),
+        h(YardFactoryFocus, {
+          label: focusLabel,
+          text: focusText,
+          muted: focusMuted,
+        }),
         h("div", { className: "hermes-canvas-tooltip-foot" },
-          artifact && artifact.kind === "pull_request"
-            ? "PR identity comes from the exact publication receipt, never from text mentions."
-            : "Only explicit board events are shown; this is operational history, not private reasoning."),
+          foot),
       );
     }
 
@@ -3712,11 +3860,13 @@
           props.scene.factoryObjects
             .slice(0, layout.visibleFactoryCount)
             .forEach(function (object, index) {
-              const bounds = yardDrawFactoryRow(ctx, object, layout, index);
-              hits.push(Object.assign({
-                type: "factory",
-                factory: object,
-              }, bounds));
+              const stageBounds = yardDrawFactoryRow(ctx, object, layout, index);
+              stageBounds.forEach(function (bounds) {
+                hits.push(Object.assign({
+                  type: "factory",
+                  factory: object,
+                }, bounds));
+              });
             });
           if (props.scene.factoryObjects.length > layout.visibleFactoryCount) {
             ctx.save();
@@ -3828,7 +3978,9 @@
       top = Math.max(12, Math.min(top, viewportHeight - estimatedHeight - 12));
       const identity = hit.type === "agent" ? hit.agent.name :
         hit.type === "dock" ? hit.dock.key :
-          hit.type === "factory" ? hit.factory.id : hit.mission.id;
+          hit.type === "factory"
+            ? `${hit.factory.id}:${hit.stage || "task"}`
+            : hit.mission.id;
       setHovered(function (previous) {
         if (previous &&
             previous.type === hit.type &&
@@ -3842,7 +3994,7 @@
           : hit.type === "dock"
             ? { dock: hit.dock }
             : hit.type === "factory"
-              ? { factory: hit.factory }
+              ? { factory: hit.factory, stage: hit.stage || "task" }
               : { mission: hit.mission };
         return Object.assign({
           type: hit.type,
