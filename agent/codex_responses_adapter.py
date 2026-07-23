@@ -180,6 +180,28 @@ def _summarize_user_message_for_log(content: Any, *, sep: str = " ") -> str:
 # ---------------------------------------------------------------------------
 
 _MAX_RESPONSES_CALL_ID_LENGTH = 64
+_INVALID_RESPONSES_FUNCTION_NAME_CHAR = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _normalize_responses_function_name(raw_name: str) -> str:
+    """Normalize replayed function names to the Responses API contract.
+
+    Older Codex app-server projections persisted MCP calls as
+    ``mcp.<server>.<tool>``. Those historical rows are otherwise valid, but
+    Responses rejects the dots before a resumed turn can do any work. Keep
+    already-valid names unchanged and deterministically replace invalid runs
+    so both legacy and newly projected histories remain replayable.
+    """
+    name = raw_name.strip()
+    if name.startswith("mcp."):
+        parts = name.split(".")
+        server = parts[1] if len(parts) > 1 else "mcp"
+        tool = "_".join(parts[2:]) if len(parts) > 2 else "unknown"
+        safe_server = re.sub(r"[^A-Za-z0-9_]+", "_", server).strip("_") or "mcp"
+        safe_tool = re.sub(r"[^A-Za-z0-9_]+", "_", tool).strip("_") or "unknown"
+        return f"mcp__{safe_server}__{safe_tool}"
+    normalized = _INVALID_RESPONSES_FUNCTION_NAME_CHAR.sub("_", name).strip("_")
+    return normalized or "unknown"
 
 
 def _deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
@@ -568,7 +590,7 @@ def _chat_messages_to_responses_input(
                         items.append({
                             "type": "function_call",
                             "call_id": call_id,
-                            "name": fn_name,
+                            "name": _normalize_responses_function_name(fn_name),
                             "arguments": arguments,
                         })
                 continue
@@ -656,7 +678,7 @@ def _preflight_codex_input_items(
                 {
                     "type": "function_call",
                     "call_id": _normalize_responses_call_id(call_id),
-                    "name": name.strip(),
+                    "name": _normalize_responses_function_name(name),
                     "arguments": arguments,
                 }
             )

@@ -13,6 +13,7 @@ from agent.transports.codex_event_projector import (
     CodexEventProjector,
     _deterministic_call_id,
     _format_tool_args,
+    _mcp_function_name,
 )
 
 
@@ -209,8 +210,27 @@ class TestMcpToolCallProjection:
         msgs = CodexEventProjector().project(
             {"method": "item/completed", "params": {"item": item}}
         ).messages
-        assert msgs[0]["tool_calls"][0]["function"]["name"] == "mcp.obsidian.search_notes"
+        assert msgs[0]["tool_calls"][0]["function"]["name"] == "mcp__obsidian__search_notes"
         assert "found" in msgs[1]["content"]
+
+    def test_mcp_tool_call_name_is_responses_safe(self) -> None:
+        item = {
+            "type": "mcpToolCall",
+            "id": "m-safe",
+            "server": "hermes-tools",
+            "tool": "kanban.complete",
+            "status": "completed",
+            "arguments": {},
+            "result": {"ok": True},
+            "error": None,
+        }
+        msgs = CodexEventProjector().project(
+            {"method": "item/completed", "params": {"item": item}}
+        ).messages
+        assert (
+            msgs[0]["tool_calls"][0]["function"]["name"]
+            == "mcp__hermes_tools__kanban_complete"
+        )
 
     def test_mcp_error_surfaced(self) -> None:
         item = {
@@ -270,6 +290,12 @@ class TestHelpers:
         a = _format_tool_args({"b": 1, "a": 2})
         b = _format_tool_args({"a": 2, "b": 1})
         assert a == b
+
+    def test_mcp_function_name_normalizes_invalid_component_characters(self) -> None:
+        assert (
+            _mcp_function_name("hermes-tools", "kanban.complete")
+            == "mcp__hermes_tools__kanban_complete"
+        )
 
 
 class TestRoleAlternationInvariant:

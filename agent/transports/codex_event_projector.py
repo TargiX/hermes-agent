@@ -11,7 +11,7 @@ Codex emits items with a discriminator field `type`:
   - reasoning           → stashed in the assistant's "reasoning" field
   - commandExecution    → assistant tool_call(name="exec") + tool result
   - fileChange          → assistant tool_call(name="apply_patch") + tool result
-  - mcpToolCall         → assistant tool_call(name=f"mcp.{server}.{tool}") + tool result
+  - mcpToolCall         → assistant tool_call(name=f"mcp__{server}__{tool}") + tool result
   - dynamicToolCall     → assistant tool_call(name=tool) + tool result
   - plan/hookPrompt/collabAgentToolCall → recorded as opaque assistant notes
 
@@ -30,8 +30,27 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+
+_INVALID_MCP_COMPONENT_CHAR = re.compile(r"[^A-Za-z0-9_]+")
+
+
+def _mcp_function_name(server: str, tool: str) -> str:
+    """Return a Responses-safe persisted name for a Codex MCP call.
+
+    Codex app-server reports MCP identities as separate ``server`` and
+    ``tool`` fields. Persisting them as ``mcp.<server>.<tool>`` made resumed
+    Responses turns fail because function names may contain only letters,
+    digits, underscores, and hyphens. Use the native MCP namespace shape and
+    normalize each component so projected history remains replayable.
+    """
+    # Codex registers ``server-name`` as ``mcp__server_name__tool``.
+    safe_server = _INVALID_MCP_COMPONENT_CHAR.sub("_", server).strip("_") or "mcp"
+    safe_tool = _INVALID_MCP_COMPONENT_CHAR.sub("_", tool).strip("_") or "unknown"
+    return f"mcp__{safe_server}__{safe_tool}"
 
 
 def _deterministic_call_id(item_type: str, item_id: str) -> str:
@@ -217,9 +236,10 @@ class CodexEventProjector:
     def _project_mcp_tool_call(self, item: dict, item_id: str) -> ProjectionResult:
         server = item.get("server") or "mcp"
         tool = item.get("tool") or "unknown"
+        function_name = _mcp_function_name(server, tool)
         # Mirror the native MCP tool-name convention (mcp__server__tool) so the
         # deterministic call_id input stays consistent with registration names.
-        call_id = _deterministic_call_id(f"mcp__{server}__{tool}", item_id)
+        call_id = _deterministic_call_id(function_name, item_id)
         args = item.get("arguments") or {}
         if not isinstance(args, dict):
             args = {"arguments": args}
@@ -231,7 +251,7 @@ class CodexEventProjector:
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": f"mcp.{server}.{tool}",
+                        "name": function_name,
                         "arguments": _format_tool_args(args),
                     },
                 }

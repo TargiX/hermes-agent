@@ -6,6 +6,7 @@ from agent.codex_responses_adapter import (
     _chat_messages_to_responses_input,
     _format_responses_error,
     _normalize_codex_response,
+    _normalize_responses_function_name,
     _preflight_codex_api_kwargs,
     _preflight_codex_input_items,
 )
@@ -305,6 +306,56 @@ def test_preflight_codex_api_kwargs_drops_oversized_message_id_end_to_end():
 
     message_item = next(item for item in kwargs["input"] if item.get("type") == "message")
     assert "id" not in message_item
+
+
+def test_legacy_projected_mcp_name_is_responses_safe_on_replay():
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_legacy",
+                    "type": "function",
+                    "function": {
+                        "name": "mcp.hermes-tools.kanban_complete",
+                        "arguments": "{}",
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_legacy",
+            "content": "done",
+        },
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    call = next(item for item in items if item.get("type") == "function_call")
+    assert call["name"] == "mcp__hermes_tools__kanban_complete"
+    assert call["call_id"] == "call_legacy"
+    output = next(
+        item for item in items if item.get("type") == "function_call_output"
+    )
+    assert output["call_id"] == call["call_id"]
+
+
+def test_preflight_normalizes_legacy_function_name():
+    items = _preflight_codex_input_items(
+        [
+            {
+                "type": "function_call",
+                "call_id": "call_legacy",
+                "name": "mcp.hermes-tools.kanban_complete",
+                "arguments": "{}",
+            }
+        ]
+    )
+
+    assert items[0]["name"] == "mcp__hermes_tools__kanban_complete"
+    assert _normalize_responses_function_name("read_file") == "read_file"
 
 
 # ---------------------------------------------------------------------------
