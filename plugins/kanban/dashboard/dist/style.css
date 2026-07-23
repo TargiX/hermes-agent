@@ -2070,6 +2070,44 @@
     inset 0 -26px 70px color-mix(in srgb, #061216 28%, transparent);
 }
 
+.hermes-canvas-idle-truth {
+  position: absolute;
+  z-index: 2;
+  top: max(1.2rem, calc(var(--yard-mission-top, 9rem) - 4.6rem));
+  left: 50%;
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+  width: min(28rem, calc(100% - 31rem));
+  min-width: 16rem;
+  padding: 0.72rem 1rem;
+  border: 1px solid color-mix(in srgb, var(--yard-amber) 32%, transparent);
+  border-radius: 0.65rem;
+  background: color-mix(in srgb, #07171d 88%, transparent);
+  box-shadow: 0 12px 32px color-mix(in srgb, #061216 32%, transparent);
+  text-align: center;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.hermes-canvas-idle-truth span {
+  color: var(--yard-amber);
+  font: 760 0.56rem/1 var(--font-mono, ui-monospace, monospace);
+  letter-spacing: 0.12em;
+}
+
+.hermes-canvas-idle-truth strong {
+  margin-top: 0.34rem;
+  color: #fff;
+  font: 720 0.9rem/1.18 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+}
+
+.hermes-canvas-idle-truth small {
+  margin-top: 0.28rem;
+  color: color-mix(in srgb, var(--yard-fog) 56%, transparent);
+  font: 560 0.59rem/1.3 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+}
+
 .hermes-agency-canvas {
   display: block;
   max-width: 100%;
@@ -2425,6 +2463,11 @@
 }
 
 @media (max-width: 720px) {
+  .hermes-canvas-idle-truth {
+    width: min(22rem, calc(100% - 2rem));
+    min-width: 0;
+  }
+
   .hermes-yard-masthead {
     flex-direction: column;
     gap: 0.8rem;
