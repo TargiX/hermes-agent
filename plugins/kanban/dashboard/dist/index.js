@@ -1282,7 +1282,7 @@
 
     const tasksByName = {};
     for (const task of openTasks) {
-      if (!task.assignee) continue;
+      if (!task.assignee || task.status !== "running") continue;
       names.add(task.assignee);
       (tasksByName[task.assignee] = tasksByName[task.assignee] || []).push(task);
     }
@@ -1292,20 +1292,6 @@
       const focus = tasks.find(function (task) {
         return task.status === "running";
       }) || null;
-      const nextReady = tasks.find(function (task) {
-        return task.status === "ready";
-      }) || null;
-      const queueCounts = {
-        review: tasks.filter(function (task) {
-          return yardOperationalState(task) === "review";
-        }).length,
-        blocked: tasks.filter(function (task) {
-          return yardOperationalState(task) === "blocked";
-        }).length,
-        planning: tasks.filter(function (task) {
-          return ["todo", "triage", "scheduled"].includes(task.status);
-        }).length,
-      };
       const controller = controllerByName[name] || null;
       const state = controller && controller.state === "running"
         ? "supervising"
@@ -1318,11 +1304,8 @@
         controller,
         agency: yardAgency(profileByName[name] || null),
         focus,
-        nextReady,
-        queueCounts,
         state,
         placement: yardPlacementForState(state),
-        openCount: tasks.length,
       };
     });
 
@@ -1330,12 +1313,8 @@
       const rankA = YARD_FOCUS_RANK[a.state] == null ? 98 : YARD_FOCUS_RANK[a.state];
       const rankB = YARD_FOCUS_RANK[b.state] == null ? 98 : YARD_FOCUS_RANK[b.state];
       if (rankA !== rankB) return rankA - rankB;
-      const priorityA = (a.focus || a.nextReady)
-        ? ((a.focus || a.nextReady).priority || 0)
-        : 0;
-      const priorityB = (b.focus || b.nextReady)
-        ? ((b.focus || b.nextReady).priority || 0)
-        : 0;
+      const priorityA = a.focus ? (a.focus.priority || 0) : 0;
+      const priorityB = b.focus ? (b.focus.priority || 0) : 0;
       if (priorityA !== priorityB) return priorityB - priorityA;
       return a.name.localeCompare(b.name);
     });
@@ -1635,7 +1614,7 @@
     }
 
     const floorTasks = roster.openTasks.filter(function (task) {
-      return task.status === "running" || task.status === "ready";
+      return task.status === "running";
     });
     const missionByKey = {};
     for (const task of floorTasks) {
@@ -1681,20 +1660,11 @@
       return b.priority - a.priority;
     });
 
-    const reviewTasks = roster.openTasks.filter(function (task) {
-      return yardOperationalState(task) === "review";
-    });
-    const blockedTasks = roster.openTasks.filter(function (task) {
-      return yardOperationalState(task) === "blocked";
-    });
-    const planningTasks = roster.openTasks.filter(function (task) {
-      return ["todo", "triage", "scheduled"].includes(task.status);
-    });
     const fieldMissions = missions;
 
-    // The floor is for work that is executing now or can be picked up next.
-    // Review handoffs and genuine blockers have their own shared operational
-    // zones, so they cannot flood the field with identical red missions.
+    // This scene is a live execution floor, not a second rendering of the
+    // board database. Only task runs executing now belong here; ready,
+    // planning, review, blocked, and terminal cards remain on the Board tab.
     const visibleMissions = [];
     const representedMissionIds = new Set();
     for (const agencyKey of ["development", "marketing", "unassigned"]) {
@@ -1724,8 +1694,8 @@
       }
       visibleMissions.push({
         id: "mission:overflow",
-        title: `${overflowMissions.length} other active or ready workstreams`,
-        status: "ready",
+        title: `${overflowMissions.length} other live workstreams`,
+        status: "running",
         priority: 0,
         tasks: overflowTasks,
         agents: overflowAgents,
@@ -1756,16 +1726,6 @@
         (baseOrder[b.agency.key] == null ? 99 : baseOrder[b.agency.key]);
     });
 
-    const blockedCauseCounts = {};
-    for (const task of blockedTasks) {
-      const cause = task.block_kind || "unclassified";
-      blockedCauseCounts[cause] = (blockedCauseCounts[cause] || 0) + 1;
-    }
-    const planningCauseCounts = {};
-    for (const task of planningTasks) {
-      const cause = task.status || "unclassified";
-      planningCauseCounts[cause] = (planningCauseCounts[cause] || 0) + 1;
-    }
     const docks = [
       {
         key: "control",
@@ -1780,39 +1740,6 @@
         }),
         causeCounts: {},
       },
-      {
-        key: "planning",
-        kind: "queue",
-        label: "Planning Queue",
-        shortLabel: "NOT DISPATCHABLE",
-        state: "triage",
-        note: "Cards exist, but are not ready for an agent",
-        tasks: planningTasks,
-        agents: [],
-        causeCounts: planningCauseCounts,
-      },
-      {
-        key: "review",
-        kind: "queue",
-        label: "Review Queue",
-        shortLabel: "AWAITING REVIEW",
-        state: "review",
-        note: "Cards awaiting independent review",
-        tasks: reviewTasks,
-        agents: [],
-        causeCounts: { review_required: reviewTasks.length },
-      },
-      {
-        key: "blocked",
-        kind: "queue",
-        label: "Blocked Queue",
-        shortLabel: "NEEDS ACTION",
-        state: "blocked",
-        note: "Cards needing input, capability, or recovery",
-        tasks: blockedTasks,
-        agents: [],
-        causeCounts: blockedCauseCounts,
-      },
     ].filter(function (dock) {
       return dock.tasks.length > 0 || dock.agents.length > 0;
     });
@@ -1823,15 +1750,7 @@
       idleAgents: roster.rows.filter(function (row) { return !row.focus; }),
       bases,
       docks,
-      reviewTaskCount: reviewTasks.length,
-      blockedTaskCount: blockedTasks.length,
-      planningTaskCount: planningTasks.length,
-      readyTaskCount: floorTasks.filter(function (task) {
-        return task.status === "ready";
-      }).length,
-      runningTaskCount: floorTasks.filter(function (task) {
-        return task.status === "running";
-      }).length,
+      runningTaskCount: floorTasks.length,
       fieldMissionCount: fieldMissions.length,
       totalMissionCount: missions.length,
     };
@@ -2255,8 +2174,8 @@
             h("strong", null, agent.state === "running" ? "1" : "0"),
           ),
           h("span", null,
-            h("small", null, "OPEN CARDS"),
-            h("strong", null, String(agent.openCount || 0)),
+            h("small", null, "HOME BASE"),
+            h("strong", null, agent.agency.label),
           ),
           h("span", null,
             h("small", null, "LOADED SKILLS"),
@@ -2281,20 +2200,11 @@
               h("code", null,
                 `${focus.board_name ? focus.board_name + " · " : ""}${focus.id} · P${focus.priority || 0}`),
             )
-          : agent.nextReady
-          ? h("div", { className: "hermes-canvas-tooltip-current is-idle" },
-              h("span", { className: "hermes-canvas-tooltip-section-label" },
-                "NEXT READY CARD"),
-              h("strong", null, agent.nextReady.title || "Untitled task"),
-              h("code", null,
-                `${agent.nextReady.board_name ? agent.nextReady.board_name + " · " : ""}${agent.nextReady.id} · waiting for claim`),
-            )
           : h("div", { className: "hermes-canvas-tooltip-current is-idle" },
               h("span", { className: "hermes-canvas-tooltip-section-label" },
                 "AT HOME BASE"),
               h("strong", null, "No active task run"),
-              h("code", null,
-                `${agent.queueCounts.review} review · ${agent.queueCounts.blocked} blocked · ${agent.queueCounts.planning} planning cards`),
+              h("code", null, "Not executing product work"),
             ),
       );
     }
@@ -2545,11 +2455,11 @@
           ctx.textAlign = "center";
           ctx.fillText("AGENT BASES", 108, 28);
           ctx.fillText(
-            props.scene.runningTaskCount > 0 ? "LIVE TASK FLOOR" : "ACTIVE / READY TASK FLOOR",
+            "LIVE TASK FLOOR",
             layout.fieldLeft + (width - layout.fieldLeft - layout.fieldRight) / 2,
             28,
           );
-          ctx.fillText("CONTROL + CARD QUEUES", width - 108, 28);
+          ctx.fillText("LIVE CONTROL", width - 108, 28);
         }
 
         const hits = [];
@@ -2853,6 +2763,9 @@
     const supervisingRows = props.scene.roster.rows.filter(function (row) {
       return row.state === "supervising";
     });
+    const baseRows = props.scene.roster.rows.filter(function (row) {
+      return row.state === "idle";
+    });
 
     return h("div", {
       className: "hermes-agency-canvas-wrap",
@@ -2874,11 +2787,9 @@
         "data-supervising-agents": props.scene.roster.rows.filter(function (row) {
           return row.state === "supervising";
         }).length,
-        "data-review-tasks": props.scene.reviewTaskCount,
-        "data-blocked-tasks": props.scene.blockedTaskCount,
-        "data-planning-tasks": props.scene.planningTaskCount,
-        "data-ready-tasks": props.scene.readyTaskCount,
-        "aria-label": `${runningRows.length} agents executing, ${supervisingRows.length} supervisors active, ${props.scene.readyTaskCount} cards ready, ${props.scene.planningTaskCount} planning cards not dispatchable, ${props.scene.reviewTaskCount} review cards, and ${props.scene.blockedTaskCount} blocked cards. An agent is drawn beside a task only when a live task run exists.`,
+        "data-running-tasks": props.scene.runningTaskCount,
+        "data-agents-at-base": baseRows.length,
+        "aria-label": `${runningRows.length} agents executing across ${props.scene.runningTaskCount} live task runs, ${supervisingRows.length} supervisors active, and ${baseRows.length} agents at base. Queued and historical cards are excluded from this live scene.`,
         onClick: handleClick,
         onPointerMove: handlePointerMove,
         onPointerLeave: function () {
@@ -2894,12 +2805,8 @@
             "data-testid": "agency-idle-truth",
           },
             h("span", null, "LIVE EXECUTION"),
-            h("strong", null, "No agents are executing right now"),
-            h("small", null,
-              props.scene.readyTaskCount > 0
-                ? `${props.scene.readyTaskCount} ready card${props.scene.readyTaskCount === 1 ? "" : "s"} waiting to be claimed.`
-                : `0 ready cards · ${props.scene.planningTaskCount} cards are still in planning.`,
-            ),
+            h("strong", null, "No product work is running right now"),
+            h("small", null, "Agents remain at base. A task appears here only when its run starts."),
           )
         : null,
       h(AgencyHoverInspector, { hover: hovered }),
@@ -2917,7 +2824,9 @@
             }, "Clear"),
           )
         : h("div", { className: "hermes-canvas-hint" },
-            "Click a mission to open it. Click agents to inspect selection; Shift-click selects several."),
+            runningRows.length > 0
+              ? "Click a live task to open it. Click agents to inspect selection; Shift-click selects several."
+              : "Hover or click an agent to inspect it. Live task runs will appear in the center."),
     );
   }
 
@@ -2997,9 +2906,10 @@
       running: scene.roster.rows.filter(function (row) {
         return row.state === "running";
       }).length,
-      ready: scene.readyTaskCount,
-      review: scene.reviewTaskCount,
-      blocked: scene.blockedTaskCount,
+      taskRuns: scene.runningTaskCount,
+      atBase: scene.roster.rows.filter(function (row) {
+        return row.state === "idle";
+      }).length,
     };
 
     return h("section", { className: "hermes-agency-yard", "aria-labelledby": "agency-yard-title" },
@@ -3011,7 +2921,7 @@
           ),
           h("h2", { id: "agency-yard-title" }, "The agencies, on one floor"),
           h("p", null,
-            "Agents leave their base only for a live task run. Planning, review, and blocked numbers are card queues—not people.",
+            "This is the live shift, not the backlog. Agents and tasks move onto the floor only while work is actually running.",
           ),
         ),
         h("div", { className: "hermes-yard-actions" },
@@ -3029,9 +2939,8 @@
       h("div", { className: "hermes-yard-metrics", "aria-label": "Live task totals" },
         h(YardMetric, { value: taskCounts.supervising, label: "supervisors active", tone: "supervising" }),
         h(YardMetric, { value: taskCounts.running, label: "agents executing", tone: "running" }),
-        h(YardMetric, { value: taskCounts.ready, label: "cards ready", tone: "ready" }),
-        h(YardMetric, { value: taskCounts.review, label: "cards awaiting review", tone: "review" }),
-        h(YardMetric, { value: taskCounts.blocked, label: "cards need action", tone: "blocked" }),
+        h(YardMetric, { value: taskCounts.taskRuns, label: "live task runs", tone: "running" }),
+        h(YardMetric, { value: taskCounts.atBase, label: "agents at base", tone: "idle" }),
       ),
       h(AgencyHealthPanel, { health: agencyHealth }),
       scene.roster.rows.length === 0
@@ -3045,10 +2954,7 @@
         h("span", null, h("i", { className: "is-supervising" }), "Control-plane supervisor"),
         h("span", null, h("i", { className: "is-idle" }), "Agent at home base"),
         h("span", null, h("i", { className: "is-running" }), "Agent executing beside a task"),
-        h("span", null, h("i", { className: "is-ready" }), "Ready task card"),
-        h("span", null, h("i", { className: "is-review" }), "Review card queue"),
-        h("span", null, h("i", { className: "is-blocked" }), "Blocked card queue"),
-        h("strong", null, "Only an agent beside a task is working."),
+        h("strong", null, "Backlog and historical cards stay on the Board tab."),
       ),
     );
   }
