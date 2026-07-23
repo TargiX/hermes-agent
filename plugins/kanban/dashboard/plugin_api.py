@@ -42,7 +42,9 @@ import os
 import sqlite3
 import time
 from dataclasses import asdict
+from datetime import datetime, timedelta
 from pathlib import Path
+from statistics import median
 from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
@@ -57,15 +59,24 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _agency_controller_roster() -> list[dict[str, Any]]:
-    """Return machine-configured supervisors that do not own Kanban cards.
+_EXECUTION_INCIDENT_OUTCOMES = frozenset(
+    {
+        "crashed",
+        "failed",
+        "gave_up",
+        "rate_limited",
+        "reclaimed",
+        "spawn_failed",
+        "timed_out",
+    }
+)
+_WORKFLOW_FAULT_EVENT_KINDS = frozenset(
+    {"block_loop_detected", "protocol_violation"}
+)
 
-    Product workers are visible through task claims. Lead/operator cron runs
-    live in separate execution ledgers, so treating the board as the entire
-    runtime made an active supervisor look idle. The optional runtime manifest
-    joins those ledgers without guessing roles from prompt text or profile
-    names.
-    """
+
+def _agency_controller_specs() -> list[dict[str, Any]]:
+    """Return validated controller definitions and their execution ledgers."""
     hermes_home = Path(
         os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
     ).expanduser()
@@ -79,7 +90,7 @@ def _agency_controller_roster() -> list[dict[str, Any]]:
     if not isinstance(raw_controllers, list):
         return []
 
-    controllers: list[dict[str, Any]] = []
+    specs: list[dict[str, Any]] = []
     for raw in raw_controllers[:16]:
         if not isinstance(raw, dict):
             continue
@@ -102,7 +113,34 @@ def _agency_controller_roster() -> list[dict[str, Any]]:
             if cron_profile == "default"
             else hermes_home / "profiles" / cron_profile
         )
-        executions_database = profile_home / "cron/executions.db"
+        specs.append(
+            {
+                "profile": profile,
+                "role": role,
+                "job_id": job_id,
+                "cron_profile": cron_profile,
+                "executions_database": profile_home / "cron/executions.db",
+            }
+        )
+    return specs
+
+
+def _agency_controller_roster() -> list[dict[str, Any]]:
+    """Return machine-configured supervisors that do not own Kanban cards.
+
+    Product workers are visible through task claims. Lead/operator cron runs
+    live in separate execution ledgers, so treating the board as the entire
+    runtime made an active supervisor look idle. The optional runtime manifest
+    joins those ledgers without guessing roles from prompt text or profile
+    names.
+    """
+    controllers: list[dict[str, Any]] = []
+    for spec in _agency_controller_specs():
+        profile = str(spec["profile"])
+        role = str(spec["role"])
+        job_id = str(spec["job_id"])
+        cron_profile = str(spec["cron_profile"])
+        executions_database = Path(spec["executions_database"])
         latest: dict[str, Any] | None = None
         try:
             connection = sqlite3.connect(
@@ -151,6 +189,445 @@ def _agency_controller_roster() -> list[dict[str, Any]]:
             }
         )
     return controllers
+
+
+def _json_object(raw: Any) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        value = json.loads(str(raw))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _controller_timestamp(raw: Any) -> int | None:
+    if not raw:
+        return None
+    try:
+        return int(datetime.fromisoformat(str(raw)).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def _rate_per_ten(numerator: int, denominator: int) -> float | None:
+    if denominator <= 0:
+        return None
+    return round((numerator / denominator) * 10, 2)
+
+
+def _percent(numerator: int, denominator: int) -> float | None:
+    if denominator <= 0:
+        return None
+    return round((numerator / denominator) * 100, 1)
+
+
+def _agency_health_report(
+    *,
+    history_days: int,
+    window_hours: int,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Build a normalized agency reliability report from durable receipts.
+
+    Raw error totals grow when throughput grows, so the primary rates use
+    completed-or-failed worker runs as their denominator. Expected review
+    handoffs are intentionally excluded from execution faults. "Intervention"
+    means an explicit ``promoted_manual`` or ``reclaimed`` event with
+    ``manual: true``; code-only repairs without such a receipt are not guessed.
+    """
+    now_ts = int(now if now is not None else time.time())
+    current_start = now_ts - window_hours * 60 * 60
+    previous_start = current_start - window_hours * 60 * 60
+    local_now = datetime.fromtimestamp(now_ts).astimezone()
+    history_start_date = local_now.date() - timedelta(days=history_days - 1)
+    history_start = int(
+        datetime.combine(
+            history_start_date,
+            datetime.min.time(),
+            tzinfo=local_now.tzinfo,
+        ).timestamp()
+    )
+    range_start = min(history_start, previous_start)
+    # A short lookback lets a recovery episode that started just before the
+    # comparison window retain its repeat/manual-assisted classification.
+    context_start = range_start - 7 * 24 * 60 * 60
+
+    run_records: list[dict[str, Any]] = []
+    event_records: list[dict[str, Any]] = []
+    controller_records: list[dict[str, Any]] = []
+    earliest_receipt: int | None = None
+    board_sources: list[str] = []
+
+    for board_meta in kanban_db.list_boards(include_archived=False):
+        slug = str(board_meta.get("slug") or "default")
+        conn = kanban_db.connect(board=slug)
+        try:
+            earliest = conn.execute(
+                """
+                SELECT
+                    (SELECT MIN(created_at) FROM task_events) AS first_event,
+                    (SELECT MIN(COALESCE(ended_at, started_at))
+                     FROM task_runs) AS first_run
+                """
+            ).fetchone()
+            first_event = earliest["first_event"] if earliest else None
+            first_run = earliest["first_run"] if earliest else None
+            first_board_receipt = (
+                first_event if first_event is not None else first_run
+            )
+            if first_board_receipt is not None:
+                board_sources.append(slug)
+                value = int(first_board_receipt)
+                earliest_receipt = (
+                    value
+                    if earliest_receipt is None
+                    else min(earliest_receipt, value)
+                )
+
+            for row in conn.execute(
+                """
+                SELECT id, task_id, status, outcome, started_at, ended_at
+                FROM task_runs
+                WHERE COALESCE(ended_at, started_at) >= ?
+                  AND COALESCE(ended_at, started_at) <= ?
+                ORDER BY task_id, COALESCE(ended_at, started_at), id
+                """,
+                (context_start, now_ts),
+            ).fetchall():
+                outcome = str(row["outcome"] or row["status"] or "")
+                run_records.append(
+                    {
+                        "board": slug,
+                        "task_key": f"{slug}:{row['task_id']}",
+                        "timestamp": int(row["ended_at"] or row["started_at"]),
+                        "outcome": outcome,
+                    }
+                )
+
+            for row in conn.execute(
+                """
+                SELECT task_id, kind, payload, created_at
+                FROM task_events
+                WHERE created_at >= ? AND created_at <= ?
+                ORDER BY created_at, id
+                """,
+                (context_start, now_ts),
+            ).fetchall():
+                event_records.append(
+                    {
+                        "board": slug,
+                        "task_key": f"{slug}:{row['task_id']}",
+                        "timestamp": int(row["created_at"]),
+                        "kind": str(row["kind"] or ""),
+                        "payload": _json_object(row["payload"]),
+                    }
+                )
+        finally:
+            conn.close()
+
+    for spec in _agency_controller_specs():
+        database = Path(spec["executions_database"])
+        try:
+            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+            connection.row_factory = sqlite3.Row
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT id, status, claimed_at, finished_at
+                    FROM executions
+                    WHERE job_id = ?
+                    ORDER BY claimed_at, id
+                    """,
+                    (str(spec["job_id"]),),
+                ).fetchall()
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error):
+            continue
+        for row in rows:
+            timestamp = _controller_timestamp(row["finished_at"] or row["claimed_at"])
+            if timestamp is None or timestamp < context_start or timestamp > now_ts:
+                continue
+            earliest_receipt = (
+                timestamp
+                if earliest_receipt is None
+                else min(earliest_receipt, timestamp)
+            )
+            controller_records.append(
+                {
+                    "profile": str(spec["profile"]),
+                    "timestamp": timestamp,
+                    "status": str(row["status"] or ""),
+                }
+            )
+
+    def is_manual_intervention(event: dict[str, Any]) -> bool:
+        if event["kind"] == "promoted_manual":
+            return True
+        return (
+            event["kind"] == "reclaimed"
+            and event["payload"].get("manual") is True
+        )
+
+    manual_events = [
+        event for event in event_records if is_manual_intervention(event)
+    ]
+    manual_by_task: dict[str, list[int]] = {}
+    for event in manual_events:
+        manual_by_task.setdefault(event["task_key"], []).append(event["timestamp"])
+
+    run_by_task: dict[str, list[dict[str, Any]]] = {}
+    for run in run_records:
+        if run["outcome"] == "completed" or (
+            run["outcome"] in _EXECUTION_INCIDENT_OUTCOMES
+        ):
+            run_by_task.setdefault(run["task_key"], []).append(run)
+
+    episodes: list[dict[str, Any]] = []
+    repeat_incident_timestamps: list[int] = []
+    for task_key, runs in run_by_task.items():
+        active: dict[str, Any] | None = None
+        for run in sorted(runs, key=lambda item: item["timestamp"]):
+            if run["outcome"] in _EXECUTION_INCIDENT_OUTCOMES:
+                if active is None:
+                    active = {
+                        "task_key": task_key,
+                        "started_at": run["timestamp"],
+                        "repeat_count": 0,
+                    }
+                else:
+                    active["repeat_count"] += 1
+                    repeat_incident_timestamps.append(run["timestamp"])
+                continue
+            if run["outcome"] == "completed" and active is not None:
+                recovered_at = run["timestamp"]
+                interventions = manual_by_task.get(task_key, [])
+                active["recovered_at"] = recovered_at
+                active["manual_assisted"] = any(
+                    active["started_at"] <= timestamp <= recovered_at
+                    for timestamp in interventions
+                )
+                episodes.append(active)
+                active = None
+        if active is not None:
+            active["recovered_at"] = None
+            active["manual_assisted"] = any(
+                timestamp >= active["started_at"]
+                for timestamp in manual_by_task.get(task_key, [])
+            )
+            episodes.append(active)
+
+    def window_metrics(start: int, end: int) -> dict[str, Any]:
+        runs = [
+            run for run in run_records if start <= run["timestamp"] < end
+        ]
+        completed_runs = sum(run["outcome"] == "completed" for run in runs)
+        failed_runs = sum(
+            run["outcome"] in _EXECUTION_INCIDENT_OUTCOMES for run in runs
+        )
+        blocked_runs = sum(run["outcome"] == "blocked" for run in runs)
+        decisive_runs = completed_runs + failed_runs
+        events = [
+            event for event in event_records if start <= event["timestamp"] < end
+        ]
+        interventions = sum(is_manual_intervention(event) for event in events)
+        protocol_faults = sum(
+            event["kind"] == "protocol_violation" for event in events
+        )
+        block_loops = sum(
+            event["kind"] == "block_loop_detected" for event in events
+        )
+        workflow_faults = sum(
+            event["kind"] in _WORKFLOW_FAULT_EVENT_KINDS for event in events
+        )
+        block_kind_counts: dict[str, int] = {}
+        for event in events:
+            if event["kind"] != "blocked":
+                continue
+            block_kind = str(event["payload"].get("kind") or "unclassified")
+            block_kind_counts[block_kind] = block_kind_counts.get(block_kind, 0) + 1
+        actionable_blocks = sum(
+            count
+            for kind, count in block_kind_counts.items()
+            if kind != "review_required"
+        )
+        window_episodes = [
+            episode
+            for episode in episodes
+            if start <= episode["started_at"] < end
+        ]
+        recovered = [
+            episode
+            for episode in window_episodes
+            if episode["recovered_at"] is not None
+        ]
+        autonomous = sum(
+            not episode["manual_assisted"] for episode in recovered
+        )
+        recovery_minutes = [
+            (episode["recovered_at"] - episode["started_at"]) / 60
+            for episode in recovered
+        ]
+        repeat_failures = sum(
+            start <= timestamp < end
+            for timestamp in repeat_incident_timestamps
+        )
+        controller_window = [
+            record
+            for record in controller_records
+            if start <= record["timestamp"] < end
+        ]
+        controller_failures = sum(
+            record["status"] in {"failed", "unknown"}
+            for record in controller_window
+        )
+        controller_completions = sum(
+            record["status"] == "completed"
+            for record in controller_window
+        )
+        return {
+            "completed_runs": completed_runs,
+            "failed_runs": failed_runs,
+            "blocked_runs": blocked_runs,
+            "decisive_runs": decisive_runs,
+            "failure_rate_per_10": _rate_per_ten(failed_runs, decisive_runs),
+            "explicit_interventions": interventions,
+            "interventions_per_10": _rate_per_ten(
+                interventions,
+                decisive_runs,
+            ),
+            "repeat_failures": repeat_failures,
+            "repeat_failure_rate": _percent(repeat_failures, failed_runs),
+            "workflow_faults": workflow_faults,
+            "protocol_faults": protocol_faults,
+            "block_loops": block_loops,
+            "actionable_block_events": actionable_blocks,
+            "block_kinds": dict(
+                sorted(
+                    block_kind_counts.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+            ),
+            "incident_episodes": len(window_episodes),
+            "autonomous_recoveries": autonomous,
+            "manual_assisted_recoveries": len(recovered) - autonomous,
+            "unrecovered_episodes": len(window_episodes) - len(recovered),
+            "autonomous_recovery_rate": _percent(autonomous, len(recovered)),
+            "median_recovery_minutes": (
+                round(float(median(recovery_minutes)), 1)
+                if recovery_minutes
+                else None
+            ),
+            "controller_completions": controller_completions,
+            "controller_failures": controller_failures,
+        }
+
+    current = window_metrics(current_start, now_ts + 1)
+    previous = window_metrics(previous_start, current_start)
+
+    signals: dict[str, str] = {}
+
+    def compare_lower(
+        key: str,
+        current_value: float | None,
+        previous_value: float | None,
+        *,
+        threshold: float,
+    ) -> None:
+        if current_value is None or previous_value is None:
+            signals[key] = "insufficient"
+        elif current_value <= previous_value - threshold:
+            signals[key] = "improving"
+        elif current_value >= previous_value + threshold:
+            signals[key] = "regressing"
+        else:
+            signals[key] = "steady"
+
+    compare_lower(
+        "failure_rate",
+        current["failure_rate_per_10"],
+        previous["failure_rate_per_10"],
+        threshold=0.2,
+    )
+    compare_lower(
+        "intervention_rate",
+        current["interventions_per_10"],
+        previous["interventions_per_10"],
+        threshold=0.1,
+    )
+    compare_lower(
+        "repeat_failure_rate",
+        current["repeat_failure_rate"],
+        previous["repeat_failure_rate"],
+        threshold=5,
+    )
+    sufficient_comparison = (
+        current["decisive_runs"] >= 10 and previous["decisive_runs"] >= 10
+    )
+    signal_values = set(signals.values())
+    if not sufficient_comparison:
+        trend = "collecting_baseline"
+    elif "improving" in signal_values and "regressing" in signal_values:
+        trend = "mixed"
+    elif "regressing" in signal_values:
+        trend = "regressing"
+    elif "improving" in signal_values:
+        trend = "improving"
+    else:
+        trend = "steady"
+
+    daily: list[dict[str, Any]] = []
+    for offset in range(history_days):
+        day = history_start_date + timedelta(days=offset)
+        day_start = int(
+            datetime.combine(
+                day,
+                datetime.min.time(),
+                tzinfo=local_now.tzinfo,
+            ).timestamp()
+        )
+        day_end = int(
+            datetime.combine(
+                day + timedelta(days=1),
+                datetime.min.time(),
+                tzinfo=local_now.tzinfo,
+            ).timestamp()
+        )
+        metrics = window_metrics(day_start, min(day_end, now_ts + 1))
+        daily.append({"date": day.isoformat(), **metrics})
+
+    active_days = sum(day["decisive_runs"] > 0 for day in daily)
+    baseline_status = (
+        "ready"
+        if active_days >= min(7, history_days) and sufficient_comparison
+        else "partial"
+    )
+    return {
+        "schema": "agency-health/v1",
+        "generated_at": now_ts,
+        "window_hours": window_hours,
+        "trend": trend,
+        "signals": signals,
+        "current": current,
+        "previous": previous,
+        "daily": daily,
+        "coverage": {
+            "status": baseline_status,
+            "active_days": active_days,
+            "requested_days": history_days,
+            "first_receipt_at": earliest_receipt,
+            "boards": sorted(board_sources),
+            "controller_profiles": sorted(
+                {record["profile"] for record in controller_records}
+            ),
+            "manual_intervention_definition": (
+                "Exact promoted_manual events and reclaimed events with "
+                "manual=true. Code-only repairs without a board receipt are "
+                "not backfilled."
+            ),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +1208,28 @@ def get_agency_overview():
         "controllers": _agency_controller_roster(),
         "now": int(time.time()),
     }
+
+
+@router.get("/agency-health")
+def get_agency_health(
+    history_days: int = Query(
+        7,
+        ge=3,
+        le=30,
+        description="Calendar days returned for the local trend series.",
+    ),
+    window_hours: int = Query(
+        24,
+        ge=6,
+        le=168,
+        description="Rolling comparison window; current versus preceding.",
+    ),
+):
+    """Return normalized reliability and intervention trends for the agency."""
+    return _agency_health_report(
+        history_days=history_days,
+        window_hours=window_hours,
+    )
 
 
 # ---------------------------------------------------------------------------

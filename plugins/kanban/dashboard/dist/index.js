@@ -1328,6 +1328,221 @@
     );
   }
 
+  function agencyHealthSignalLabel(signal) {
+    if (signal === "improving") return "improving";
+    if (signal === "regressing") return "worsening";
+    if (signal === "steady") return "flat";
+    return "baseline";
+  }
+
+  function agencyHealthValue(value, unit) {
+    if (value == null) return "—";
+    if (unit === "%") return `${value}%`;
+    if (unit === "m") return `${value}m`;
+    return String(value);
+  }
+
+  function AgencyHealthMetric(props) {
+    const direction = agencyHealthSignalLabel(props.signal);
+    return h("div", {
+      className: cn(
+        "hermes-agency-health-metric",
+        `hermes-agency-health-metric--${props.signal || "insufficient"}`,
+      ),
+      title: props.title || "",
+    },
+      h("div", { className: "hermes-agency-health-metric-label" }, props.label),
+      h("div", { className: "hermes-agency-health-metric-reading" },
+        h("strong", null, agencyHealthValue(props.value, props.unit)),
+        h("span", null, direction),
+      ),
+      h("div", { className: "hermes-agency-health-metric-compare" },
+        `prior ${agencyHealthValue(props.previous, props.unit)}`,
+      ),
+    );
+  }
+
+  function agencyHealthVerdict(health) {
+    if (!health) return "Loading durable agency receipts…";
+    const signals = health.signals || {};
+    if (signals.failure_rate === "improving" &&
+        signals.intervention_rate === "regressing") {
+      return "Execution faults are falling, but intervention load is rising.";
+    }
+    if (signals.failure_rate === "regressing" &&
+        signals.intervention_rate === "improving") {
+      return "Manual load is falling, but execution reliability has regressed.";
+    }
+    if (health.trend === "improving") {
+      return "The agency is getting more reliable at its current throughput.";
+    }
+    if (health.trend === "regressing") {
+      return "The agency needs more rescue work than in the preceding window.";
+    }
+    if (health.trend === "mixed") {
+      return "Some reliability signals improved while others regressed.";
+    }
+    if (health.trend === "steady") {
+      return "Reliability is flat; no learning trend is proven yet.";
+    }
+    return "Collecting enough comparable runs to establish a baseline.";
+  }
+
+  function AgencyHealthPanel(props) {
+    const health = props.health;
+    if (!health) {
+      return h("section", {
+        className: "hermes-agency-health hermes-agency-health--loading",
+        "aria-label": "Agency reliability trend loading",
+      }, "Reading the agency incident ledger…");
+    }
+    const current = health.current || {};
+    const previous = health.previous || {};
+    const signals = health.signals || {};
+    const daily = health.daily || [];
+    const dailyMax = Math.max(1, ...daily.map(function (day) {
+      return Math.max(
+        day.failure_rate_per_10 || 0,
+        day.interventions_per_10 || 0,
+      );
+    }));
+    const recoverySignal = (
+      current.median_recovery_minutes == null ||
+      previous.median_recovery_minutes == null
+    ) ? "insufficient" : (
+      current.median_recovery_minutes < previous.median_recovery_minutes - 5
+        ? "improving"
+        : current.median_recovery_minutes > previous.median_recovery_minutes + 5
+          ? "regressing"
+          : "steady"
+    );
+    const coverage = health.coverage || {};
+    const windowLabel = `rolling ${health.window_hours || 24}h`;
+
+    return h("section", {
+      className: cn(
+        "hermes-agency-health",
+        `hermes-agency-health--${health.trend || "collecting_baseline"}`,
+      ),
+      "aria-labelledby": "agency-health-title",
+    },
+      h("div", { className: "hermes-agency-health-head" },
+        h("div", null,
+          h("div", { className: "hermes-agency-health-kicker" },
+            "SELF-IMPROVEMENT · ", windowLabel.toUpperCase(),
+          ),
+          h("h3", { id: "agency-health-title" }, agencyHealthVerdict(health)),
+        ),
+        h("span", {
+          className: cn(
+            "hermes-agency-health-verdict",
+            `is-${health.trend || "collecting_baseline"}`,
+          ),
+        }, String(health.trend || "collecting baseline").replaceAll("_", " ")),
+      ),
+      h("div", { className: "hermes-agency-health-grid" },
+        h(AgencyHealthMetric, {
+          label: "execution faults / 10",
+          value: current.failure_rate_per_10,
+          previous: previous.failure_rate_per_10,
+          signal: signals.failure_rate,
+          title: "Failed worker attempts divided by completed plus failed attempts. Review handoffs are excluded.",
+        }),
+        h(AgencyHealthMetric, {
+          label: "interventions / 10",
+          value: current.interventions_per_10,
+          previous: previous.interventions_per_10,
+          signal: signals.intervention_rate,
+          title: coverage.manual_intervention_definition,
+        }),
+        h(AgencyHealthMetric, {
+          label: "repeat faults",
+          value: current.repeat_failure_rate,
+          previous: previous.repeat_failure_rate,
+          signal: signals.repeat_failure_rate,
+          unit: "%",
+          title: "Share of failed attempts that repeated inside the same unresolved incident episode.",
+        }),
+        h(AgencyHealthMetric, {
+          label: "median recovery",
+          value: current.median_recovery_minutes,
+          previous: previous.median_recovery_minutes,
+          signal: recoverySignal,
+          unit: "m",
+          title: "Median time from the first failed attempt in an episode to the next completed run.",
+        }),
+      ),
+      h("div", { className: "hermes-agency-health-lower" },
+        h("div", {
+          className: "hermes-agency-health-chart",
+          role: "img",
+          "aria-label": "Daily execution faults and explicit interventions per ten decisive runs",
+        },
+          daily.map(function (day) {
+            const faultHeight = Math.round(
+              ((day.failure_rate_per_10 || 0) / dailyMax) * 100,
+            );
+            const interventionHeight = Math.round(
+              ((day.interventions_per_10 || 0) / dailyMax) * 100,
+            );
+            return h("div", {
+              className: "hermes-agency-health-day",
+              key: day.date,
+              title: `${day.date}: ${day.failure_rate_per_10 == null ? "—" : day.failure_rate_per_10} faults and ${day.interventions_per_10 == null ? "—" : day.interventions_per_10} interventions per 10`,
+            },
+              h("div", { className: "hermes-agency-health-bars" },
+                h("i", {
+                  className: "is-fault",
+                  style: { height: `${faultHeight}%` },
+                }),
+                h("i", {
+                  className: "is-intervention",
+                  style: { height: `${interventionHeight}%` },
+                }),
+              ),
+              h("span", null, day.date.slice(5)),
+            );
+          }),
+        ),
+        h("div", { className: "hermes-agency-health-details" },
+          h("div", null,
+            h("strong", null, `${current.completed_runs || 0} completed`),
+            h("span", null, `${current.failed_runs || 0} failed attempts`),
+          ),
+          h("div", null,
+            h("strong", null, `${current.explicit_interventions || 0} explicit interventions`),
+            h("span", null, `${current.block_loops || 0} block loops · ${current.controller_failures || 0} controller faults`),
+          ),
+          h("div", null,
+            h("strong", null,
+              current.autonomous_recovery_rate == null
+                ? "Recovery baseline pending"
+                : `${current.autonomous_recovery_rate}% autonomous recovery`,
+            ),
+            h("span", null,
+              `${current.unrecovered_episodes || 0} unresolved incident episodes`,
+            ),
+          ),
+          h("div", null,
+            h("strong", null,
+              coverage.status === "ready"
+                ? `${coverage.active_days} active days captured`
+                : `Partial baseline · ${coverage.active_days || 0}/${coverage.requested_days || 7} active days`,
+            ),
+            h("span", {
+              title: coverage.manual_intervention_definition || "",
+            }, "Exact board receipts only; code-only repairs are not backfilled."),
+          ),
+        ),
+      ),
+      h("div", { className: "hermes-agency-health-legend" },
+        h("span", null, h("i", { className: "is-fault" }), "Execution faults / 10"),
+        h("span", null, h("i", { className: "is-intervention" }), "Explicit interventions / 10"),
+        h("strong", null, "Lower is better. Review-required handoffs are not errors."),
+      ),
+    );
+  }
+
   function yardMissionTitle(task) {
     const raw = String((task && task.title) || "Untitled mission");
     return raw
@@ -2562,6 +2777,7 @@
   function AgencyYard(props) {
     const [profiles, setProfiles] = useState([]);
     const [overviewBoard, setOverviewBoard] = useState(null);
+    const [agencyHealth, setAgencyHealth] = useState(null);
 
     useEffect(function () {
       let cancelled = false;
@@ -2589,15 +2805,39 @@
         });
     }, []);
 
-    useEffect(function () {
-      loadOverview();
-      const interval = setInterval(loadOverview, 15000);
-      return function () { clearInterval(interval); };
-    }, [loadOverview]);
+    const loadAgencyHealth = useCallback(function () {
+      return SDK.fetchJSON(`${API}/agency-health?history_days=7&window_hours=24`)
+        .then(function (data) {
+          setAgencyHealth(data);
+          return data;
+        })
+        .catch(function () {
+          // Preserve the last durable report. A temporarily unavailable health
+          // endpoint must not replace known receipts with invented zeroes.
+          return null;
+        });
+    }, []);
 
     useEffect(function () {
-      if (props.board && props.board.latest_event_id != null) loadOverview();
-    }, [props.board && props.board.latest_event_id, loadOverview]);
+      loadOverview();
+      loadAgencyHealth();
+      const interval = setInterval(function () {
+        loadOverview();
+        loadAgencyHealth();
+      }, 15000);
+      return function () { clearInterval(interval); };
+    }, [loadOverview, loadAgencyHealth]);
+
+    useEffect(function () {
+      if (props.board && props.board.latest_event_id != null) {
+        loadOverview();
+        loadAgencyHealth();
+      }
+    }, [
+      props.board && props.board.latest_event_id,
+      loadOverview,
+      loadAgencyHealth,
+    ]);
 
     const scene = useMemo(function () {
       return buildYardScene(overviewBoard || props.board, profiles);
@@ -2631,6 +2871,7 @@
             className: "hermes-yard-action",
             onClick: function () {
               loadOverview();
+              loadAgencyHealth();
               if (props.onRefresh) props.onRefresh();
             },
           }, "Refresh"),
@@ -2643,6 +2884,7 @@
         h(YardMetric, { value: taskCounts.review, label: "waiting for review", tone: "review" }),
         h(YardMetric, { value: taskCounts.blocked, label: "need action", tone: "blocked" }),
       ),
+      h(AgencyHealthPanel, { health: agencyHealth }),
       scene.roster.rows.length === 0
         ? h("div", { className: "hermes-yard-empty" },
             "No installed profiles or assigned open tasks were found on this board.")

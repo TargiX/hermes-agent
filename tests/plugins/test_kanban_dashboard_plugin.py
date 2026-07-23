@@ -244,6 +244,107 @@ def test_agency_overview_exposes_active_controller_cron_runs(
     ]
 
 
+def test_agency_health_normalizes_failures_and_exact_interventions(client):
+    """More throughput cannot hide whether failure and intervention rates fall."""
+    now = int(time.time())
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Measure agency learning",
+            assignee="agencyoperator",
+        )
+
+        def add_run(*, timestamp, outcome):
+            status = "done" if outcome == "completed" else outcome
+            conn.execute(
+                """
+                INSERT INTO task_runs (
+                    task_id, status, started_at, ended_at, outcome
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (task_id, status, timestamp - 30, timestamp, outcome),
+            )
+
+        for index in range(10):
+            add_run(timestamp=now - 30 * 60 * 60 + index, outcome="completed")
+        for index in range(4):
+            add_run(timestamp=now - 29 * 60 * 60 + index, outcome="crashed")
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'promoted_manual', ?, ?)
+            """,
+            (task_id, json.dumps({"actor": "operator"}), now - 28 * 60 * 60),
+        )
+
+        for index in range(10):
+            add_run(timestamp=now - 3 * 60 * 60 + index, outcome="completed")
+        add_run(timestamp=now - 2 * 60 * 60, outcome="timed_out")
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'reclaimed', ?, ?)
+            """,
+            (
+                task_id,
+                json.dumps({"manual": False}),
+                now - 90 * 60,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'blocked', ?, ?)
+            """,
+            (
+                task_id,
+                json.dumps({"kind": "review_required"}),
+                now - 80 * 60,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'blocked', ?, ?)
+            """,
+            (
+                task_id,
+                json.dumps({"kind": "capability"}),
+                now - 70 * 60,
+            ),
+        )
+        conn.commit()
+
+    response = client.get(
+        "/api/plugins/kanban/agency-health"
+        "?history_days=7&window_hours=24"
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["schema"] == "agency-health/v1"
+    assert data["trend"] == "improving"
+    assert data["current"]["completed_runs"] == 10
+    assert data["current"]["failed_runs"] == 1
+    assert data["current"]["failure_rate_per_10"] == 0.91
+    assert data["current"]["explicit_interventions"] == 0
+    assert data["current"]["actionable_block_events"] == 1
+    assert data["current"]["block_kinds"] == {
+        "capability": 1,
+        "review_required": 1,
+    }
+    assert data["previous"]["completed_runs"] == 10
+    assert data["previous"]["failed_runs"] == 4
+    assert data["previous"]["failure_rate_per_10"] == 2.86
+    assert data["previous"]["explicit_interventions"] == 1
+    assert data["signals"]["failure_rate"] == "improving"
+    assert data["signals"]["intervention_rate"] == "improving"
+    assert data["coverage"]["status"] == "partial"
+    assert "Code-only repairs" in data["coverage"][
+        "manual_intervention_definition"
+    ]
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
