@@ -406,6 +406,299 @@
     });
   }
 
+  function descriptionValueTone(key, value) {
+    const normalizedKey = String(key || "").toLowerCase();
+    const normalizedValue = String(value || "").trim();
+    if (/^(true|false)$/i.test(normalizedValue)) return "flag";
+    if (normalizedKey === "effort") return "effort";
+    if (
+      normalizedKey.endsWith("_id") ||
+      normalizedKey === "run_id" ||
+      normalizedKey.includes("signature") ||
+      normalizedKey.includes("receipt") ||
+      normalizedKey.includes("version") ||
+      normalizedKey === "selection_signature" ||
+      /^[a-f0-9]{12,}$/i.test(normalizedValue)
+    ) return "identity";
+    if (/^[A-Z][A-Z0-9_]*(?:\s*\|\s*[A-Z][A-Z0-9_]*)*$/.test(normalizedValue)) {
+      return "outcome";
+    }
+    if (/^-?\d+(?:\.\d+)?$/.test(normalizedValue)) return "number";
+    return "text";
+  }
+
+  function isStructuredTaskDescription(source) {
+    const lines = String(source || "").split(/\r?\n/);
+    const machineFields = lines.filter(function (line) {
+      return /^\s*(?:[-*]\s+)?[A-Za-z][A-Za-z0-9_.-]*:\s*\S+/.test(line);
+    }).length;
+    return machineFields >= 3 ||
+      lines.some(function (line) {
+        return /^\s*WORKER_CARD_CLOSEOUT_V1\s*:/.test(line);
+      });
+  }
+
+  function DescriptionFieldGroup(props) {
+    const rows = props.rows || [];
+    if (rows.length === 0) return null;
+    const evidence = rows.some(function (row) {
+      return row.key === "task_id";
+    });
+    return h("dl", {
+      className: cn(
+        "hermes-kanban-description-fields",
+        evidence && "is-evidence",
+      ),
+      "aria-label": evidence ? "Evidence receipt" : "Task contract fields",
+    },
+      rows.map(function (row, index) {
+        const tone = descriptionValueTone(row.key, row.value);
+        return h("div", {
+          className: "hermes-kanban-description-field",
+          key: `${row.key}:${index}`,
+        },
+          h("dt", null, row.key),
+          h("dd", null,
+            h("span", {
+              className: cn(
+                "hermes-kanban-description-value",
+                `is-${tone}`,
+              ),
+              "data-value": String(row.value || "").trim().toLowerCase(),
+            }, row.value),
+          ),
+        );
+      }),
+    );
+  }
+
+  function DescriptionCallout(props) {
+    const icons = {
+      question: "?",
+      authority: "§",
+      receipt: "✓",
+      deadline: "◷",
+    };
+    return h("section", {
+      className: cn(
+        "hermes-kanban-description-callout",
+        `is-${props.kind}`,
+      ),
+      "aria-label": props.label,
+    },
+      h("span", {
+        className: "hermes-kanban-description-callout-icon",
+        "aria-hidden": "true",
+      }, icons[props.kind] || "•"),
+      h("div", { className: "hermes-kanban-description-callout-copy" },
+        h("strong", null, props.label),
+        props.body
+          ? h(MarkdownBlock, { source: props.body, enabled: true })
+          : null,
+        props.options && props.options.length
+          ? h("ul", {
+              className: "hermes-kanban-description-options",
+              "aria-label": "Allowed recommendations",
+            },
+              props.options.map(function (option) {
+                return h("li", { key: option },
+                  h("code", null, option),
+                );
+              }),
+            )
+          : null,
+        props.rows && props.rows.length
+          ? h(DescriptionFieldGroup, { rows: props.rows })
+          : null,
+      ),
+    );
+  }
+
+  function StructuredTaskDescription(props) {
+    const lines = String(props.source || "").split(/\r?\n/);
+    const nodes = [];
+    let fields = [];
+    let prose = [];
+    let nodeIndex = 0;
+
+    const pushFields = function () {
+      if (fields.length === 0) return;
+      nodes.push(h(DescriptionFieldGroup, {
+        rows: fields,
+        key: `fields:${nodeIndex}`,
+      }));
+      nodeIndex += 1;
+      fields = [];
+    };
+    const pushProse = function () {
+      const text = prose.join("\n").trim();
+      if (!text) {
+        prose = [];
+        return;
+      }
+      nodes.push(h(MarkdownBlock, {
+        source: text,
+        enabled: props.enabled,
+        key: `prose:${nodeIndex}`,
+      }));
+      nodeIndex += 1;
+      prose = [];
+    };
+    const pushCallout = function (kind, label, body, options, rows) {
+      pushFields();
+      pushProse();
+      nodes.push(h(DescriptionCallout, {
+        kind,
+        label,
+        body,
+        options,
+        rows,
+        key: `callout:${nodeIndex}`,
+      }));
+      nodeIndex += 1;
+    };
+
+    lines.forEach(function (rawLine) {
+      const line = rawLine.trim();
+      if (!line) {
+        pushFields();
+        pushProse();
+        return;
+      }
+
+      const question = /^Question:\s*(.*)$/i.exec(line);
+      if (question) {
+        pushCallout(
+          "question",
+          "Directional question",
+          question[1],
+        );
+        return;
+      }
+      const allowedPrefix = "Allowed terminal recommendations are exactly:";
+      if (line.startsWith(allowedPrefix)) {
+        const options = line.slice(allowedPrefix.length)
+          .split("|")
+          .map(function (option) {
+            return option.trim().replace(/[.,;]+$/, "");
+          })
+          .filter(Boolean);
+        pushCallout(
+          "receipt",
+          "Allowed terminal recommendations",
+          "",
+          options,
+        );
+        return;
+      }
+      if (/^This is advisory only\./i.test(line)) {
+        pushCallout(
+          "authority",
+          "Advisory boundary",
+          line,
+        );
+        return;
+      }
+      const closeout = /^WORKER_CARD_CLOSEOUT_V1:\s*(.*)$/i.exec(line);
+      if (closeout) {
+        pushCallout(
+          "deadline",
+          "Required worker closeout",
+          closeout[1],
+        );
+        return;
+      }
+      const requiredMetadata = /^Required terminal metadata:\s*(.*)$/i.exec(line);
+      if (requiredMetadata) {
+        const receiptRows = [];
+        const receiptProse = [];
+        requiredMetadata[1].split(";").forEach(function (part) {
+          const metadataField = /^\s*([A-Za-z][A-Za-z0-9_.-]*):\s*(.+?)\s*$/.exec(part);
+          if (metadataField) {
+            receiptRows.push({
+              key: metadataField[1],
+              value: metadataField[2].replace(/[.;]+$/, ""),
+            });
+          } else if (/^\s*[A-Za-z][A-Za-z0-9_.-]*\s*$/.test(part)) {
+            receiptRows.push({
+              key: part.trim(),
+              value: "required",
+            });
+          } else if (part.trim()) {
+            receiptProse.push(part.trim());
+          }
+        });
+        pushCallout(
+          "receipt",
+          "Required terminal receipt",
+          receiptProse.join("; "),
+          null,
+          receiptRows,
+        );
+        return;
+      }
+      const prepared = /^Prepared request(?:\s*\((.*?)\))?:\s*(.*)$/i.exec(line);
+      if (prepared) {
+        pushFields();
+        pushProse();
+        nodes.push(h("header", {
+          className: "hermes-kanban-description-subhead",
+          key: `subhead:${nodeIndex}`,
+        },
+          h("strong", null, "Prepared request"),
+          prepared[1] ? h("span", null, prepared[1]) : null,
+          prepared[2] ? h("small", null, prepared[2]) : null,
+        ));
+        nodeIndex += 1;
+        return;
+      }
+
+      const field = /^(?:[-*]\s+)?([A-Za-z][A-Za-z0-9_.-]*):\s*(.*)$/.exec(line);
+      if (field) {
+        pushProse();
+        if (!field[2]) {
+          pushFields();
+          nodes.push(h("h4", {
+            className: "hermes-kanban-description-section-title",
+            key: `section:${nodeIndex}`,
+          }, field[1]));
+          nodeIndex += 1;
+        } else {
+          fields.push({ key: field[1], value: field[2] });
+        }
+        return;
+      }
+      pushFields();
+      prose.push(rawLine);
+    });
+    pushFields();
+    pushProse();
+
+    return h("div", {
+      className: "hermes-kanban-description-ledger",
+      "aria-label": "Structured task description",
+    },
+      h("div", { className: "hermes-kanban-description-ledger-head" },
+        h("span", { "aria-hidden": "true" }, "▦"),
+        h("div", null,
+          h("strong", null, "Task contract"),
+          h("small", null, "Machine fields, evidence, and authority boundaries"),
+        ),
+      ),
+      nodes,
+    );
+  }
+
+  function TaskDescriptionBlock(props) {
+    if (props.enabled === false) {
+      return h("pre", { className: "hermes-kanban-pre" }, props.source || "");
+    }
+    if (!isStructuredTaskDescription(props.source)) {
+      return h(MarkdownBlock, props);
+    }
+    return h(StructuredTaskDescription, props);
+  }
+
   // -------------------------------------------------------------------------
   // Touch drag-drop helper.
   //
@@ -6728,7 +7021,10 @@
             onChange: function (e) { setV(e.target.value); },
           })
         : props.task.body
-          ? h(MarkdownBlock, { source: props.task.body, enabled: props.renderMarkdown })
+          ? h(TaskDescriptionBlock, {
+              source: props.task.body,
+              enabled: props.renderMarkdown,
+            })
           : h("div", { className: "text-xs text-muted-foreground italic" },
               tx(t, "noDescription", "— no description —")),
     );
