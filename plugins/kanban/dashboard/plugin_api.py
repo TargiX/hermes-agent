@@ -125,17 +125,80 @@ def _agency_controller_specs() -> list[dict[str, Any]]:
     return specs
 
 
-def _agency_controller_roster() -> list[dict[str, Any]]:
-    """Return machine-configured supervisors that do not own Kanban cards.
+def _profile_cron_activity_specs() -> list[dict[str, Any]]:
+    """Return enabled jobs owned by named profiles.
 
-    Product workers are visible through task claims. Lead/operator cron runs
-    live in separate execution ledgers, so treating the board as the entire
-    runtime made an active supervisor look idle. The optional runtime manifest
-    joins those ledgers without guessing roles from prompt text or profile
-    names.
+    Profile cron runs are already isolated beneath ``profiles/<name>``. That
+    directory is authoritative enough to identify the agent without guessing
+    from prompt text or duplicating every job in the controller manifest.
+    These specs are used only for live activity discovery; historical agency
+    health continues to use the explicit controller manifest.
+    """
+    hermes_home = Path(
+        os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
+    ).expanduser()
+    profiles_root = hermes_home / "profiles"
+    try:
+        profile_homes = sorted(
+            path for path in profiles_root.iterdir() if path.is_dir()
+        )
+    except OSError:
+        return []
+
+    specs: list[dict[str, Any]] = []
+    for profile_home in profile_homes:
+        jobs_path = profile_home / "cron/jobs.json"
+        try:
+            manifest = json.loads(jobs_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        raw_jobs = manifest.get("jobs")
+        if not isinstance(raw_jobs, list):
+            continue
+        for raw in raw_jobs[:32]:
+            if not isinstance(raw, dict) or raw.get("enabled") is False:
+                continue
+            job_id = str(raw.get("id") or "").strip()
+            role = str(raw.get("name") or "").strip()
+            if not job_id or not role:
+                continue
+            specs.append(
+                {
+                    "profile": profile_home.name,
+                    "role": role,
+                    "job_id": job_id,
+                    "cron_profile": profile_home.name,
+                    "executions_database": profile_home / "cron/executions.db",
+                    "active_only": True,
+                }
+            )
+            if len(specs) >= 64:
+                return specs
+    return specs
+
+
+def _agency_controller_roster() -> list[dict[str, Any]]:
+    """Return live non-Kanban activity for named agency profiles.
+
+    Product workers are visible through task claims. Explicit root-profile
+    controllers come from the runtime manifest; profile-owned cron jobs are
+    discovered from their isolated ledgers. Treating the board as the entire
+    runtime would otherwise make active planning, review, and recovery look
+    idle.
     """
     controllers: list[dict[str, Any]] = []
-    for spec in _agency_controller_specs():
+    explicit_specs = _agency_controller_specs()
+    explicit_keys = {
+        (str(spec["cron_profile"]), str(spec["job_id"]))
+        for spec in explicit_specs
+    }
+    discovered_specs = [
+        spec
+        for spec in _profile_cron_activity_specs()
+        if (str(spec["cron_profile"]), str(spec["job_id"]))
+        not in explicit_keys
+    ]
+    for spec in [*explicit_specs, *discovered_specs]:
         profile = str(spec["profile"])
         role = str(spec["role"])
         job_id = str(spec["job_id"])
@@ -174,17 +237,20 @@ def _agency_controller_roster() -> list[dict[str, Any]]:
             latest = None
 
         execution_status = str((latest or {}).get("status") or "")
+        state = (
+            "running"
+            if execution_status in {"claimed", "running"}
+            else "idle"
+        )
+        if spec.get("active_only") and state != "running":
+            continue
         controllers.append(
             {
                 "profile": profile,
                 "role": role,
                 "job_id": job_id,
                 "cron_profile": cron_profile,
-                "state": (
-                    "running"
-                    if execution_status in {"claimed", "running"}
-                    else "idle"
-                ),
+                "state": state,
                 "latest_execution": latest,
             }
         )

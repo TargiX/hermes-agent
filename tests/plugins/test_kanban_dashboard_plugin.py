@@ -244,6 +244,82 @@ def test_agency_overview_exposes_active_controller_cron_runs(
     ]
 
 
+def test_agency_overview_discovers_active_profile_cron_runs(
+    client,
+    kanban_home,
+):
+    """Profile-owned agency work is visible without a hand-maintained manifest."""
+    cron = kanban_home / "profiles/growthlead/cron"
+    cron.mkdir(parents=True)
+    (cron / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "growth-planning-job",
+                        "name": "Growth Lead — campaign planning",
+                        "enabled": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    connection = sqlite3.connect(cron / "executions.db")
+    try:
+        connection.execute(
+            """
+            CREATE TABLE executions (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                error TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO executions (
+                id, job_id, status, claimed_at, started_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "growth-execution-1",
+                "growth-planning-job",
+                "running",
+                "2026-07-24T00:40:00+07:00",
+                "2026-07-24T00:40:01+07:00",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    response = client.get("/api/plugins/kanban/agency-overview")
+
+    assert response.status_code == 200
+    assert response.json()["controllers"] == [
+        {
+            "profile": "growthlead",
+            "role": "Growth Lead — campaign planning",
+            "job_id": "growth-planning-job",
+            "cron_profile": "growthlead",
+            "state": "running",
+            "latest_execution": {
+                "execution_id": "growth-execution-1",
+                "status": "running",
+                "claimed_at": "2026-07-24T00:40:00+07:00",
+                "started_at": "2026-07-24T00:40:01+07:00",
+                "finished_at": None,
+                "error": "",
+            },
+        }
+    ]
+
+
 def test_agency_health_normalizes_failures_and_exact_interventions(client):
     """More throughput cannot hide whether failure and intervention rates fall."""
     now = int(time.time())

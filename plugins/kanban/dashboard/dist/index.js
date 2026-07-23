@@ -1201,7 +1201,7 @@
   }
 
   function yardPlacementForState(state) {
-    if (state === "supervising") return "control";
+    if (state === "supervising") return "mission";
     if (state === "running") return "mission";
     return "base";
   }
@@ -1268,7 +1268,7 @@
     }
 
     const profileByName = {};
-    const controllerByName = {};
+    const controllersByName = {};
     const names = new Set();
     for (const profile of profiles || []) {
       profileByName[profile.name] = profile;
@@ -1276,7 +1276,8 @@
     }
     for (const controller of (board && board.controllers) || []) {
       if (!controller || !controller.profile) continue;
-      controllerByName[controller.profile] = controller;
+      (controllersByName[controller.profile] =
+        controllersByName[controller.profile] || []).push(controller);
       names.add(controller.profile);
     }
 
@@ -1292,8 +1293,12 @@
       const focus = tasks.find(function (task) {
         return task.status === "running";
       }) || null;
-      const controller = controllerByName[name] || null;
-      const state = controller && controller.state === "running"
+      const controllers = controllersByName[name] || [];
+      const activeControllers = controllers.filter(function (controller) {
+        return controller.state === "running";
+      });
+      const controller = activeControllers[0] || controllers[0] || null;
+      const state = activeControllers.length > 0
         ? "supervising"
         : focus
           ? "running"
@@ -1302,6 +1307,8 @@
         name,
         profile: profileByName[name] || null,
         controller,
+        controllers,
+        activeControllers,
         agency: yardAgency(profileByName[name] || null),
         focus,
         state,
@@ -1572,6 +1579,26 @@
     return task.board_slug ? `${task.board_slug}:${task.id}` : task.id;
   }
 
+  function yardControllerActivityKind(controller) {
+    const role = String((controller && controller.role) || "").toLowerCase();
+    if (/(review|audit|janitor|quality|verification)/.test(role)) return "review";
+    if (/(operator|recovery|repair|steward|sensor|incident)/.test(role)) return "operations";
+    if (/(lead|director|strategy|planning|research|radar|selector)/.test(role)) return "planning";
+    if (/(builder|implement|engineer|publisher|delivery)/.test(role)) return "delivery";
+    return "coordination";
+  }
+
+  function yardActivityLabel(kind) {
+    const labels = {
+      planning: "Planning",
+      review: "Review",
+      operations: "Operations",
+      delivery: "Delivery",
+      coordination: "Coordination",
+    };
+    return labels[kind] || "Active work";
+  }
+
   function buildYardScene(board, profiles) {
     const roster = buildYardRoster(board, profiles);
     const allTasks = [];
@@ -1636,7 +1663,7 @@
 
     const rosterByName = {};
     for (const row of roster.rows) rosterByName[row.name] = row;
-    const missions = Object.values(missionByKey).map(function (mission) {
+    const taskMissions = Object.values(missionByKey).map(function (mission) {
       const sortedTasks = mission.tasks.slice().sort(yardTaskSort);
       const anchor = sortedTasks[0];
       const agencyKeys = Array.from(new Set(mission.tasks.map(function (task) {
@@ -1650,7 +1677,28 @@
         priority: anchor ? (anchor.priority || 0) : 0,
         agencyKeys,
       });
-    }).sort(function (a, b) {
+    });
+    const controllerMissions = roster.rows.flatMap(function (row) {
+      const activeControllers = row.activeControllers || [];
+      if (activeControllers.length === 0) return [];
+      const primary = activeControllers[0];
+      const activityKind = yardControllerActivityKind(primary);
+      return [{
+        id: `activity:${row.name}`,
+        title: activeControllers.length === 1
+          ? primary.role
+          : `${primary.role} + ${activeControllers.length - 1} more`,
+        status: "supervising",
+        priority: 100,
+        tasks: [],
+        agents: [row],
+        anchor: null,
+        controllers: activeControllers,
+        activityKind,
+        agencyKeys: [row.agency.key],
+      }];
+    });
+    const missions = taskMissions.concat(controllerMissions).sort(function (a, b) {
       const withPeopleA = a.agents.length > 0 ? 0 : 1;
       const withPeopleB = b.agents.length > 0 ? 0 : 1;
       if (withPeopleA !== withPeopleB) return withPeopleA - withPeopleB;
@@ -1716,7 +1764,7 @@
         residentAgents: [],
       };
       base.rows.push(row);
-      if (!row.focus) base.idleAgents.push(row);
+      if (row.placement === "base") base.idleAgents.push(row);
       if (row.placement === "base") base.residentAgents.push(row);
       basesByKey[row.agency.key] = base;
     }
@@ -1726,31 +1774,25 @@
         (baseOrder[b.agency.key] == null ? 99 : baseOrder[b.agency.key]);
     });
 
-    const docks = [
-      {
-        key: "control",
-        kind: "control",
-        label: "Control Room",
-        shortLabel: "SUPERVISING",
-        state: "supervising",
-        note: "Lead and Operator coordinating the agency control plane",
-        tasks: [],
-        agents: roster.rows.filter(function (row) {
-          return row.placement === "control";
-        }),
-        causeCounts: {},
-      },
-    ].filter(function (dock) {
-      return dock.tasks.length > 0 || dock.agents.length > 0;
-    });
+    const controllerRunCount = roster.rows.reduce(function (count, row) {
+      return count + (row.activeControllers || []).length;
+    }, 0);
+
+    const docks = [];
 
     return {
       roster,
       missions: visibleMissions,
-      idleAgents: roster.rows.filter(function (row) { return !row.focus; }),
+      idleAgents: roster.rows.filter(function (row) {
+        return row.placement === "base";
+      }),
       bases,
       docks,
       runningTaskCount: floorTasks.length,
+      controllerRunCount,
+      activeAgentCount: roster.rows.filter(function (row) {
+        return row.state === "running" || row.state === "supervising";
+      }).length,
       fieldMissionCount: fieldMissions.length,
       totalMissionCount: missions.length,
     };
@@ -1986,10 +2028,10 @@
     ctx.fillText(yardInitials(agent.name), x, drawY + 12);
     ctx.fillStyle = YARD_CANVAS_COLORS.fog;
     ctx.font = "600 9px ui-monospace, monospace";
-    const shortName = agent.name.length > 16 ? agent.name.slice(0, 14) + "…" : agent.name;
+    const shortName = agent.name.length > 18 ? agent.name.slice(0, 16) + "…" : agent.name;
     if (labelMode === "list") {
       ctx.textAlign = "left";
-      ctx.fillText("@" + shortName, x + 18, drawY + 5);
+      ctx.fillText("@" + agent.name, x + 18, drawY + 5);
     } else if (labelMode === "above") {
       ctx.fillText("@" + shortName, x, drawY - 22);
     } else if (labelMode !== "compact") {
@@ -2000,7 +2042,8 @@
 
   function yardDrawMission(ctx, mission, x, y, keyboardSelected, phase) {
     const color = yardStateColor(mission.status);
-    const pulse = mission.status === "running" ? 5 + Math.sin(phase * 2.5) * 3 : 3;
+    const active = mission.status === "running" || mission.status === "supervising";
+    const pulse = active ? 5 + Math.sin(phase * 2.5) * 3 : 3;
     ctx.save();
     ctx.shadowColor = color;
     ctx.shadowBlur = keyboardSelected ? 18 : pulse;
@@ -2025,7 +2068,11 @@
     ctx.textAlign = "center";
     ctx.font = "700 8px ui-monospace, monospace";
     ctx.fillText(
-      mission.overflowCount ? "BACKLOG HUB" : `${mission.tasks.length} TASK${mission.tasks.length === 1 ? "" : "S"}`,
+      mission.activityKind
+        ? `${yardActivityLabel(mission.activityKind).toUpperCase()} · LIVE`
+        : mission.overflowCount
+          ? "LIVE WORK HUB"
+          : `${mission.tasks.length} TASK${mission.tasks.length === 1 ? "" : "S"}`,
       x,
       y - 49,
     );
@@ -2038,9 +2085,13 @@
     ctx.restore();
   }
 
-  function yardBaseStackHeight(bases) {
+  function yardBaseStackHeight(bases, compact) {
     return (bases || []).reduce(function (height, base) {
-      const agentRows = Math.max(1, Math.ceil(base.residentAgents.length / 5));
+      const columns = compact ? 1 : 2;
+      const agentRows = Math.max(
+        1,
+        Math.ceil(base.residentAgents.length / columns),
+      );
       return height + 126 + agentRows * 34;
     }, 22);
   }
@@ -2057,13 +2108,13 @@
   function yardCanvasLayout(width, missionCount, bases, docks) {
     const compact = width < 760;
     const columns = compact ? 1 : (width < 1080 ? 2 : 3);
-    const fieldLeft = compact ? 26 : 238;
-    const fieldRight = compact ? 26 : 222;
+    const fieldLeft = compact ? 26 : 340;
+    const fieldRight = compact ? 26 : 34;
     const usable = Math.max(240, width - fieldLeft - fieldRight);
     const columnWidth = usable / columns;
     const rows = Math.max(1, Math.ceil(missionCount / columns));
     const rowHeight = compact ? 210 : 218;
-    const baseStackHeight = yardBaseStackHeight(bases);
+    const baseStackHeight = yardBaseStackHeight(bases, compact);
     const dockStackHeight = yardDockStackHeight(docks);
     const top = compact ? baseStackHeight + 94 : 150;
     const dockTop = compact
@@ -2154,8 +2205,10 @@
             yardInitials(agent.name)),
           h("div", { className: "hermes-canvas-tooltip-heading" },
             h("span", { className: "hermes-canvas-tooltip-kicker" },
-              agent.controller && agent.state === "supervising"
-                ? "CONTROL ROOM · " + agent.controller.role.toUpperCase()
+              agent.activeControllers && agent.activeControllers.length > 0
+                ? yardActivityLabel(
+                    yardControllerActivityKind(agent.activeControllers[0]),
+                  ).toUpperCase() + " · ACTIVE AGENT"
                 : agent.agency.label.toUpperCase() + " · AGENT"),
             h("strong", null, "@" + agent.name),
           ),
@@ -2171,7 +2224,10 @@
         h("div", { className: "hermes-canvas-tooltip-facts" },
           h("span", null,
             h("small", null, "ACTIVE RUN"),
-            h("strong", null, agent.state === "running" ? "1" : "0"),
+            h("strong", null,
+              agent.state === "running"
+                ? "1"
+                : String((agent.activeControllers || []).length)),
           ),
           h("span", null,
             h("small", null, "HOME BASE"),
@@ -2182,15 +2238,25 @@
             h("strong", null, String(profile.skill_count || 0)),
           ),
         ),
-        agent.controller && agent.state === "supervising"
+        agent.activeControllers && agent.activeControllers.length > 0
           ? h("div", { className: "hermes-canvas-tooltip-current" },
               h("span", { className: "hermes-canvas-tooltip-section-label" },
-                "CURRENT CONTROL DUTY"),
-              h("strong", null, agent.controller.role),
-              h("code", null,
-                `${agent.controller.job_id} · ${agent.controller.latest_execution && agent.controller.latest_execution.started_at
-                  ? agent.controller.latest_execution.started_at
-                  : "claimed"}`),
+                "CURRENT LIVE WORK"),
+              agent.activeControllers.map(function (controller) {
+                return h("div", {
+                  className: "hermes-canvas-tooltip-task",
+                  key: `${controller.cron_profile}:${controller.job_id}`,
+                },
+                  h("i", { style: { "--task-tone": yardStateColor("supervising") } }),
+                  h("span", null,
+                    h("strong", null, controller.role),
+                    h("code", null,
+                      `${yardActivityLabel(yardControllerActivityKind(controller))} · ${controller.latest_execution && controller.latest_execution.started_at
+                        ? controller.latest_execution.started_at
+                        : "claimed"}`),
+                  ),
+                );
+              }),
             )
           : focus
           ? h("div", { className: "hermes-canvas-tooltip-current" },
@@ -2280,7 +2346,9 @@
     const mission = hover.mission;
     const tasks = (mission.tasks || []).slice().sort(yardTaskSort);
     const agents = mission.agents || [];
-    const missionIdentity = mission.id.startsWith("pr:")
+    const missionIdentity = mission.activityKind
+      ? `${yardActivityLabel(mission.activityKind)} · live agent run`
+      : mission.id.startsWith("pr:")
       ? `PR #${mission.id.slice(3)}`
       : mission.id.startsWith("mission:")
         ? mission.id.slice(8)
@@ -2302,16 +2370,22 @@
       ),
       h("div", { className: "hermes-canvas-tooltip-facts" },
         h("span", null,
-          h("small", null, "CARDS"),
-          h("strong", null, String(tasks.length)),
+          h("small", null, mission.activityKind ? "ACTIVITY" : "CARDS"),
+          h("strong", null,
+            mission.activityKind
+              ? yardActivityLabel(mission.activityKind)
+              : String(tasks.length)),
         ),
         h("span", null,
           h("small", null, "AGENTS"),
           h("strong", null, String(agents.length)),
         ),
         h("span", null,
-          h("small", null, "LEAD PRIORITY"),
-          h("strong", null, "P" + String(mission.priority || 0)),
+          h("small", null, mission.activityKind ? "LIVE RUNS" : "LEAD PRIORITY"),
+          h("strong", null,
+            mission.activityKind
+              ? String((mission.controllers || []).length)
+              : "P" + String(mission.priority || 0)),
         ),
       ),
       agents.length
@@ -2325,26 +2399,30 @@
           )
         : h("p", { className: "hermes-canvas-tooltip-description is-muted" },
             "No agent currently owns an open card in this mission."),
-      h("div", { className: "hermes-canvas-tooltip-task-list" },
-        h("span", { className: "hermes-canvas-tooltip-section-label" },
-          "RELATED CARDS"),
-        tasks.slice(0, 4).map(function (task) {
-          const taskState = yardOperationalState(task);
-          return h("div", { className: "hermes-canvas-tooltip-task", key: task.id },
-            h("i", { style: { "--task-tone": yardStateColor(taskState) } }),
-            h("span", null,
-              h("strong", null, task.title || "Untitled task"),
-              h("code", null, `${task.id} · ${yardStatusLabel(taskState)}`),
-            ),
-          );
-        }),
-        tasks.length > 4
-          ? h("small", { className: "hermes-canvas-tooltip-more" },
-              `+${tasks.length - 4} more related card${tasks.length - 4 === 1 ? "" : "s"}`)
-          : null,
-      ),
+      tasks.length > 0
+        ? h("div", { className: "hermes-canvas-tooltip-task-list" },
+            h("span", { className: "hermes-canvas-tooltip-section-label" },
+              "RELATED CARDS"),
+            tasks.slice(0, 4).map(function (task) {
+              const taskState = yardOperationalState(task);
+              return h("div", { className: "hermes-canvas-tooltip-task", key: task.id },
+                h("i", { style: { "--task-tone": yardStateColor(taskState) } }),
+                h("span", null,
+                  h("strong", null, task.title || "Untitled task"),
+                  h("code", null, `${task.id} · ${yardStatusLabel(taskState)}`),
+                ),
+              );
+            }),
+            tasks.length > 4
+              ? h("small", { className: "hermes-canvas-tooltip-more" },
+                  `+${tasks.length - 4} more related card${tasks.length - 4 === 1 ? "" : "s"}`)
+              : null,
+          )
+        : null,
       h("div", { className: "hermes-canvas-tooltip-foot" },
-        "Click the mission to open its leading card."),
+        mission.activityKind
+          ? "This agent is actively working outside a Kanban implementation claim."
+          : "Click the mission to open its leading card."),
     );
   }
 
@@ -2453,29 +2531,31 @@
           ctx.fillStyle = "rgba(234,240,236,0.48)";
           ctx.font = "720 8px ui-monospace, monospace";
           ctx.textAlign = "center";
-          ctx.fillText("AGENT BASES", 108, 28);
+          ctx.fillText("AGENT BASES", 150, 28);
           ctx.fillText(
-            "LIVE TASK FLOOR",
+            "ACTIVE WORK · BUILD · PLAN · REVIEW · RECOVER",
             layout.fieldLeft + (width - layout.fieldLeft - layout.fieldRight) / 2,
             28,
           );
-          ctx.fillText("LIVE CONTROL", width - 108, 28);
         }
 
         const hits = [];
         let baseCursorY = 62;
         const baseLayouts = [];
         props.scene.bases.forEach(function (base) {
-          const x = layout.compact ? width / 2 : 108;
+          const x = layout.compact ? width / 2 : 150;
           const y = baseCursorY;
           const idleStartY = y + 112;
           const placedBase = { base, x, y };
           baseLayouts.push(placedBase);
           yardDrawBase(ctx, x, y, base);
           base.residentAgents.forEach(function (agent, index) {
-            const column = index % 5;
-            const row = Math.floor(index / 5);
-            const agentX = x - 56 + column * 28;
+            const columns = layout.compact ? 1 : 2;
+            const column = index % columns;
+            const row = Math.floor(index / columns);
+            const agentX = layout.compact
+              ? x - 100
+              : x - 112 + column * 156;
             const agentY = idleStartY + row * 34;
             yardDrawAgent(
               ctx,
@@ -2484,13 +2564,22 @@
               agentY,
               selectedAgents.has(agent.name),
               phase,
-              "compact",
+              "list",
             );
-            hits.push({ type: "agent", x: agentX, y: agentY, radius: 21, agent });
+            hits.push({
+              type: "agent",
+              x: agentX - 16,
+              y: agentY - 20,
+              width: layout.compact ? 236 : 148,
+              height: 34,
+              agent,
+            });
           });
           baseCursorY += 126 + Math.max(
             1,
-            Math.ceil(base.residentAgents.length / 5),
+            Math.ceil(
+              base.residentAgents.length / (layout.compact ? 1 : 2),
+            ),
           ) * 34;
         });
 
@@ -2543,7 +2632,7 @@
         ctx.lineCap = "round";
         missionLayouts.forEach(function (item) {
           const agents = (item.mission.agents || []).filter(function (agent) {
-            return agent.state === "running";
+            return agent.state === "running" || agent.state === "supervising";
           });
           agents.forEach(function (agent, index) {
             const angleStart = -Math.PI + 0.3;
@@ -2763,6 +2852,7 @@
     const supervisingRows = props.scene.roster.rows.filter(function (row) {
       return row.state === "supervising";
     });
+    const workingRows = runningRows.concat(supervisingRows);
     const baseRows = props.scene.roster.rows.filter(function (row) {
       return row.state === "idle";
     });
@@ -2788,8 +2878,19 @@
           return row.state === "supervising";
         }).length,
         "data-running-tasks": props.scene.runningTaskCount,
+        "data-controller-runs": props.scene.controllerRunCount,
+        "data-active-agents": workingRows.length,
+        "data-active-agent-names": workingRows.map(function (row) {
+          return row.name;
+        }).join(","),
         "data-agents-at-base": baseRows.length,
-        "aria-label": `${runningRows.length} agents executing across ${props.scene.runningTaskCount} live task runs, ${supervisingRows.length} supervisors active, and ${baseRows.length} agents at base. Queued and historical cards are excluded from this live scene.`,
+        "data-base-agent-names": baseRows.map(function (row) {
+          return row.name;
+        }).join(","),
+        "data-visible-activity-kinds": props.scene.missions.map(function (mission) {
+          return mission.activityKind || "delivery";
+        }).join(","),
+        "aria-label": `${workingRows.length} agents working now: ${runningRows.length} building across ${props.scene.runningTaskCount} product task runs and ${supervisingRows.length} planning, review, or control agents across ${props.scene.controllerRunCount} live runs. ${baseRows.length} agents are at base. Queued cards without a live agent run are excluded.`,
         onClick: handleClick,
         onPointerMove: handlePointerMove,
         onPointerLeave: function () {
@@ -2799,14 +2900,14 @@
         onMouseLeave: function () { setHovered(null); },
         onKeyDown: handleKeyDown,
       }),
-      runningRows.length === 0
+      workingRows.length === 0
         ? h("div", {
             className: "hermes-canvas-idle-truth",
             "data-testid": "agency-idle-truth",
           },
-            h("span", null, "LIVE EXECUTION"),
-            h("strong", null, "No product work is running right now"),
-            h("small", null, "Agents remain at base. A task appears here only when its run starts."),
+            h("span", null, "LIVE AGENCY"),
+            h("strong", null, "No agent work is running right now"),
+            h("small", null, "Building, planning, review, and recovery appear here when an agent run starts."),
           )
         : null,
       h(AgencyHoverInspector, { hover: hovered }),
@@ -2824,8 +2925,8 @@
             }, "Clear"),
           )
         : h("div", { className: "hermes-canvas-hint" },
-            runningRows.length > 0
-              ? "Click a live task to open it. Click agents to inspect selection; Shift-click selects several."
+            workingRows.length > 0
+              ? "Hover active work or agents for details. Click a product task to open it."
               : "Hover or click an agent to inspect it. Live task runs will appear in the center."),
     );
   }
@@ -2900,13 +3001,9 @@
     }, [overviewBoard, props.board, profiles]);
 
     const taskCounts = {
-      supervising: scene.roster.rows.filter(function (row) {
-        return row.state === "supervising";
-      }).length,
-      running: scene.roster.rows.filter(function (row) {
-        return row.state === "running";
-      }).length,
+      active: scene.activeAgentCount,
       taskRuns: scene.runningTaskCount,
+      controllerRuns: scene.controllerRunCount,
       atBase: scene.roster.rows.filter(function (row) {
         return row.state === "idle";
       }).length,
@@ -2921,7 +3018,7 @@
           ),
           h("h2", { id: "agency-yard-title" }, "The agencies, on one floor"),
           h("p", null,
-            "This is the live shift, not the backlog. Agents and tasks move onto the floor only while work is actually running.",
+            "Building, planning, review, and recovery all count as work—but only while a real agent run is live.",
           ),
         ),
         h("div", { className: "hermes-yard-actions" },
@@ -2937,10 +3034,28 @@
         ),
       ),
       h("div", { className: "hermes-yard-metrics", "aria-label": "Live task totals" },
-        h(YardMetric, { value: taskCounts.supervising, label: "supervisors active", tone: "supervising" }),
-        h(YardMetric, { value: taskCounts.running, label: "agents executing", tone: "running" }),
-        h(YardMetric, { value: taskCounts.taskRuns, label: "live task runs", tone: "running" }),
-        h(YardMetric, { value: taskCounts.atBase, label: "agents at base", tone: "idle" }),
+        h(YardMetric, {
+          value: taskCounts.active,
+          label: taskCounts.active === 1 ? "agent working now" : "agents working now",
+          tone: "running",
+        }),
+        h(YardMetric, {
+          value: taskCounts.taskRuns,
+          label: taskCounts.taskRuns === 1 ? "product task run" : "product task runs",
+          tone: "running",
+        }),
+        h(YardMetric, {
+          value: taskCounts.controllerRuns,
+          label: taskCounts.controllerRuns === 1
+            ? "planning / review / control run"
+            : "planning / review / control runs",
+          tone: "supervising",
+        }),
+        h(YardMetric, {
+          value: taskCounts.atBase,
+          label: taskCounts.atBase === 1 ? "agent at base" : "agents at base",
+          tone: "idle",
+        }),
       ),
       h(AgencyHealthPanel, { health: agencyHealth }),
       scene.roster.rows.length === 0
@@ -2951,10 +3066,10 @@
             onOpen: props.onOpen,
           }),
       h("div", { className: "hermes-yard-legend", "aria-label": "Map legend" },
-        h("span", null, h("i", { className: "is-supervising" }), "Control-plane supervisor"),
+        h("span", null, h("i", { className: "is-supervising" }), "Planning, review, or control work"),
         h("span", null, h("i", { className: "is-idle" }), "Agent at home base"),
-        h("span", null, h("i", { className: "is-running" }), "Agent executing beside a task"),
-        h("strong", null, "Backlog and historical cards stay on the Board tab."),
+        h("span", null, h("i", { className: "is-running" }), "Product implementation"),
+        h("strong", null, "A named agent beside active work means a live run exists."),
       ),
     );
   }
