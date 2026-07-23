@@ -970,6 +970,7 @@ BOARD_COLUMNS: list[str] = [
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 _FACTORY_FLOW_WINDOW_SECONDS = 2 * 60 * 60
+_FACTORY_OUTCOME_GRACE_SECONDS = 10 * 60
 _FACTORY_FLOW_MAX_OBJECTS = 8
 _FACTORY_FLOW_TEXT_CHARS = 1200
 _FACTORY_FLOW_EVENT_KINDS = frozenset(
@@ -977,12 +978,21 @@ _FACTORY_FLOW_EVENT_KINDS = frozenset(
         "created",
         "claimed",
         "spawned",
-        "commented",
         "blocked",
         "unblocked",
         "completed",
     }
 )
+_FACTORY_LIFECYCLE_RELATIONS = frozenset(
+    {
+        "continues",
+        "implements",
+        "publishes",
+        "recovers",
+        "reviews",
+    }
+)
+_FACTORY_ACTIVE_STATUSES = frozenset({"ready", "running"})
 _GITHUB_PR_URL_PATTERN = re.compile(
     r"^https://github\.com/[^/\s]+/[^/\s]+/pull/(?P<number>\d+)$"
 )
@@ -1122,13 +1132,175 @@ def _factory_workbench_receipt(
     }
 
 
+def _factory_lifecycle_task(task: kanban_db.Task) -> dict[str, Any]:
+    return {
+        "id": task.id,
+        "title": task.title,
+        "assignee": task.assignee,
+        "status": task.status,
+        "block_kind": task.block_kind,
+        "created_at": task.created_at,
+        "started_at": task.started_at,
+        "completed_at": task.completed_at,
+    }
+
+
+def _factory_review_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> tuple[bool | None, str | None]:
+    row = conn.execute(
+        """
+        SELECT outcome, metadata
+        FROM task_runs
+        WHERE task_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None, None
+    metadata = _json_object(row["metadata"])
+    approved = metadata.get("approved")
+    if not isinstance(approved, bool):
+        approved = None
+    outcome = str(metadata.get("outcome") or row["outcome"] or "").strip()
+    return approved, outcome or None
+
+
+def _factory_lifecycle_projection(
+    conn: sqlite3.Connection,
+    *,
+    tasks: list[kanban_db.Task],
+    review_ids: set[str],
+    publication_ids: set[str],
+) -> tuple[kanban_db.Task, dict[str, Any], bool]:
+    """Choose one current stage for a connected task lifecycle."""
+    by_id = {task.id: task for task in tasks}
+
+    def stage_rank(task: kanban_db.Task) -> int:
+        if task.id in publication_ids:
+            return 3
+        if task.id in review_ids:
+            return 2
+        return 1
+
+    implementation_tasks = [
+        task
+        for task in tasks
+        if task.id not in review_ids and task.id not in publication_ids
+    ]
+    if not implementation_tasks:
+        implementation_tasks = list(tasks)
+    implementation = max(
+        implementation_tasks,
+        key=lambda task: (task.created_at, task.id),
+    )
+
+    active = [
+        task for task in tasks if task.status in _FACTORY_ACTIVE_STATUSES
+    ]
+    if active:
+        current = max(
+            active,
+            key=lambda task: (
+                1 if task.status == "running" else 0,
+                stage_rank(task),
+                task.created_at,
+                task.id,
+            ),
+        )
+    else:
+        current = max(
+            tasks,
+            key=lambda task: (
+                stage_rank(task),
+                task.completed_at or task.started_at or task.created_at,
+                task.id,
+            ),
+        )
+
+    if current.id in publication_ids:
+        stage = "publication"
+        labels = {
+            "ready": "Publication ready",
+            "running": "Publication in progress",
+            "blocked": "Publication blocked",
+            "done": "Published",
+            "todo": "Publication waiting",
+            "triage": "Publication needs shaping",
+            "scheduled": "Publication scheduled",
+        }
+        status = current.status
+        label = labels.get(status, "Publication")
+    elif current.id in review_ids:
+        stage = "review"
+        status = current.status
+        if current.status == "done":
+            approved, outcome = _factory_review_verdict(conn, current.id)
+            if approved is True or str(outcome or "").upper() == "APPROVE":
+                label = "Review approved"
+            elif approved is False or str(outcome or "").upper() == "REQUEST_CHANGES":
+                label = "Changes requested"
+                status = "blocked"
+            else:
+                label = "Review completed"
+        else:
+            labels = {
+                "ready": "Review ready",
+                "running": "Review in progress",
+                "blocked": "Review blocked",
+                "todo": "Review waiting",
+                "triage": "Review needs shaping",
+                "scheduled": "Review scheduled",
+            }
+            label = labels.get(status, "Review")
+    else:
+        stage = "workbench"
+        status = current.status
+        if current.status == "blocked" and current.block_kind == "review_required":
+            stage = "review"
+            label = "Awaiting review task"
+        else:
+            label = {
+                "ready": "Ready to build",
+                "running": "Implementation in progress",
+                "blocked": "Implementation blocked",
+                "done": "Completed",
+                "todo": "Waiting for promotion",
+                "triage": "Needs shaping",
+                "scheduled": "Scheduled",
+            }.get(current.status, "Implementation")
+
+    publication_done = any(
+        by_id[task_id].status == "done"
+        for task_id in publication_ids
+        if task_id in by_id
+    )
+    has_downstream = bool(review_ids or publication_ids)
+    resolved = not active and (
+        publication_done
+        or (not has_downstream and implementation.status == "done")
+    )
+    lifecycle = {
+        "stage": stage,
+        "status": status,
+        "label": label,
+        "resolved": resolved,
+        "visibility": "live" if active else "waiting",
+        "task": _factory_lifecycle_task(current),
+    }
+    return implementation, lifecycle, resolved
+
+
 def _recent_factory_objects(
     conn: sqlite3.Connection,
     *,
     board_slug: str,
     board_name: str,
     now: int,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int]:
     """Build a bounded task → work → artifact lifecycle for the live floor."""
     cutoff = now - _FACTORY_FLOW_WINDOW_SECONDS
     placeholders = ",".join("?" for _ in _FACTORY_FLOW_EVENT_KINDS)
@@ -1144,34 +1316,133 @@ def _recent_factory_objects(
         (cutoff, *sorted(_FACTORY_FLOW_EVENT_KINDS)),
     ).fetchall()
 
-    grouped: dict[str, list[sqlite3.Row]] = {}
+    grouped_events: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
-        grouped.setdefault(str(row["task_id"]), []).append(row)
+        grouped_events.setdefault(str(row["task_id"]), []).append(row)
+
+    relation_placeholders = ",".join(
+        "?" for _ in _FACTORY_LIFECYCLE_RELATIONS
+    )
+    relation_rows = conn.execute(
+        f"""
+        SELECT source_task_id, target_task_id, relation, created_at
+        FROM task_relations
+        WHERE relation IN ({relation_placeholders})
+        ORDER BY created_at, source_task_id, target_task_id
+        """,
+        tuple(sorted(_FACTORY_LIFECYCLE_RELATIONS)),
+    ).fetchall()
+
+    parents: dict[str, str] = {}
+
+    def find(task_id: str) -> str:
+        parents.setdefault(task_id, task_id)
+        cursor = task_id
+        while parents[cursor] != cursor:
+            parents[cursor] = parents[parents[cursor]]
+            cursor = parents[cursor]
+        return cursor
+
+    def union(source_id: str, target_id: str) -> None:
+        source_root = find(source_id)
+        target_root = find(target_id)
+        if source_root != target_root:
+            parents[target_root] = source_root
+
+    for relation in relation_rows:
+        union(
+            str(relation["source_task_id"]),
+            str(relation["target_task_id"]),
+        )
+
+    recent_task_ids = set(grouped_events)
+    for task_id in recent_task_ids:
+        find(task_id)
+    component_members: dict[str, set[str]] = {}
+    for task_id in parents:
+        root = find(task_id)
+        component_members.setdefault(root, set()).add(task_id)
+    recent_roots = {find(task_id) for task_id in recent_task_ids}
+    component_relations: dict[str, list[sqlite3.Row]] = {
+        root: [] for root in recent_roots
+    }
+    for relation in relation_rows:
+        root = find(str(relation["source_task_id"]))
+        if root in component_relations:
+            component_relations[root].append(relation)
 
     objects: list[dict[str, Any]] = []
-    for task_id, task_rows in grouped.items():
-        task = kanban_db.get_task(conn, task_id)
-        if task is None:
+    hidden_resolved_count = 0
+    for root in recent_roots:
+        tasks = [
+            task
+            for task_id in component_members.get(root, {root})
+            if (task := kanban_db.get_task(conn, task_id)) is not None
+        ]
+        if not tasks:
             continue
+        task_by_id = {task.id: task for task in tasks}
+        task_rows = sorted(
+            (
+                row
+                for task_id in task_by_id
+                for row in grouped_events.get(task_id, [])
+            ),
+            key=lambda row: (int(row["created_at"]), int(row["id"])),
+            reverse=True,
+        )
+        if not task_rows:
+            continue
+        relations = component_relations.get(root, [])
+        review_ids = {
+            str(row["target_task_id"])
+            for row in relations
+            if row["relation"] == "reviews"
+        }
+        publication_ids = {
+            str(row["target_task_id"])
+            for row in relations
+            if row["relation"] == "publishes"
+        }
+        task, lifecycle, resolved = _factory_lifecycle_projection(
+            conn,
+            tasks=tasks,
+            review_ids=review_ids,
+            publication_ids=publication_ids,
+        )
+        latest_event_at = max(int(row["created_at"]) for row in task_rows)
+        active = any(
+            member.status in _FACTORY_ACTIVE_STATUSES for member in tasks
+        )
+        if resolved and latest_event_at < now - _FACTORY_OUTCOME_GRACE_SECONDS:
+            hidden_resolved_count += 1
+            continue
+        lifecycle["visibility"] = (
+            "live"
+            if active
+            else "recent_outcome"
+            if resolved
+            else "waiting"
+        )
+
         events: list[dict[str, Any]] = []
         for row in reversed(task_rows[:12]):
             payload = _json_object(row["payload"])
+            event_task = task_by_id.get(str(row["task_id"]), task)
             actor = ""
             if row["kind"] == "created":
                 actor = str(
                     payload.get("by")
-                    or task.created_by
+                    or event_task.created_by
                     or ""
                 ).strip()
-            elif row["kind"] == "commented":
-                actor = str(payload.get("author") or "").strip()
             elif row["kind"] in {
                 "claimed",
                 "spawned",
                 "blocked",
                 "completed",
             }:
-                actor = str(task.assignee or "").strip()
+                actor = str(event_task.assignee or "").strip()
             events.append(
                 {
                     "id": int(row["id"]),
@@ -1181,22 +1452,47 @@ def _recent_factory_objects(
                 }
             )
         newest = task_rows[0]
-        artifact = _factory_artifact_from_runs(conn, task)
+        artifact_candidates = [
+            artifact
+            for member in tasks
+            if (artifact := _factory_artifact_from_runs(conn, member))
+            is not None
+        ]
+        artifact = (
+            max(
+                artifact_candidates,
+                key=lambda candidate: (
+                    {
+                        "pull_request": 3,
+                        "patch": 2,
+                        "result": 1,
+                    }.get(str(candidate.get("kind")), 0),
+                    int(candidate.get("run_id") or 0),
+                ),
+            )
+            if artifact_candidates
+            else None
+        )
         workbench_receipt = _factory_workbench_receipt(conn, task)
+        lifecycle_task = lifecycle["task"]
         blocker = (
             {
-                "kind": str(task.block_kind or "unclassified"),
-                "label": str(task.block_kind or "unclassified").replace(
+                "kind": str(
+                    lifecycle_task.get("block_kind") or "unclassified"
+                ),
+                "label": str(
+                    lifecycle_task.get("block_kind") or "unclassified"
+                ).replace(
                     "_",
                     " ",
                 ),
             }
-            if task.status == "blocked"
+            if lifecycle["status"] == "blocked"
             else None
         )
         objects.append(
             {
-                "id": f"{board_slug}:{task.id}",
+                "id": f"{board_slug}:{root}",
                 "board_slug": board_slug,
                 "board_name": board_name,
                 "task": {
@@ -1224,13 +1520,14 @@ def _recent_factory_objects(
                 "workbench_receipt": workbench_receipt,
                 "artifact": artifact,
                 "blocker": blocker,
+                "lifecycle": lifecycle,
             }
         )
     objects.sort(
         key=lambda item: (item["last_event_at"], item["id"]),
         reverse=True,
     )
-    return objects[:_FACTORY_FLOW_MAX_OBJECTS]
+    return objects[:_FACTORY_FLOW_MAX_OBJECTS], hidden_resolved_count
 
 
 def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
@@ -1617,6 +1914,7 @@ def get_agency_overview():
     sources: list[dict[str, Any]] = []
     now = int(time.time())
     factory_objects: list[dict[str, Any]] = []
+    hidden_resolved_count = 0
 
     for board_meta in kanban_db.list_boards(include_archived=False):
         slug = str(board_meta.get("slug") or "default")
@@ -1675,7 +1973,7 @@ def get_agency_overview():
                             "relation": row["relation"],
                         }
                     )
-            factory_objects.extend(
+            board_factory_objects, board_hidden_resolved = (
                 _recent_factory_objects(
                     conn,
                     board_slug=slug,
@@ -1683,6 +1981,8 @@ def get_agency_overview():
                     now=now,
                 )
             )
+            factory_objects.extend(board_factory_objects)
+            hidden_resolved_count += board_hidden_resolved
             sources.append(
                 {
                     "slug": slug,
@@ -1711,6 +2011,8 @@ def get_agency_overview():
         "factory_flow": {
             "schema": "agency-factory-flow/v1",
             "window_seconds": _FACTORY_FLOW_WINDOW_SECONDS,
+            "outcome_grace_seconds": _FACTORY_OUTCOME_GRACE_SECONDS,
+            "hidden_resolved_count": hidden_resolved_count,
             "objects": factory_objects,
         },
         "now": now,

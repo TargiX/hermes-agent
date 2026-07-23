@@ -2206,6 +2206,12 @@
       totalMissionCount: missions.length,
       factoryObjects,
       factoryWindowSeconds: Number(factoryFlow.window_seconds || 0),
+      factoryOutcomeGraceSeconds: Number(
+        factoryFlow.outcome_grace_seconds || 0,
+      ),
+      factoryHiddenResolvedCount: Number(
+        factoryFlow.hidden_resolved_count || 0,
+      ),
     };
   }
 
@@ -2620,6 +2626,21 @@
     return labels[kind] || String(kind || "Updated").replace(/_/g, " ");
   }
 
+  function yardFactoryLifecycle(object) {
+    if (object && object.lifecycle) return object.lifecycle;
+    const task = (object && object.task) || {};
+    return {
+      stage: task.status === "done" ? "complete" : "workbench",
+      status: task.status || "todo",
+      label: task.status === "done"
+        ? "Completed"
+        : yardStatusLabel(task.status),
+      resolved: task.status === "done",
+      visibility: task.status === "done" ? "recent_outcome" : "waiting",
+      task,
+    };
+  }
+
   function yardDrawFlowArrow(ctx, fromX, toX, y, reached, color) {
     const start = fromX + 42;
     const end = toX - 42;
@@ -2682,6 +2703,8 @@
 
   function yardDrawFactoryWorkbench(ctx, object, x, y, reached) {
     const task = object.task || {};
+    const receipt = object.workbench_receipt || {};
+    const handler = receipt.profile || task.assignee;
     const color = reached ? YARD_CANVAS_COLORS.mint : YARD_CANVAS_COLORS.muted;
     ctx.save();
     ctx.globalAlpha = reached ? 1 : 0.68;
@@ -2711,7 +2734,7 @@
       : "rgba(234,240,236,0.45)";
     ctx.font = "650 7px ui-monospace, monospace";
     ctx.fillText(
-      task.assignee ? "@" + task.assignee : "UNASSIGNED",
+      handler ? "@" + handler : "UNASSIGNED",
       x,
       y + 13,
     );
@@ -2795,17 +2818,17 @@
   }
 
   function yardDrawFactoryGate(ctx, object, x, y) {
-    const task = object.task || {};
+    const lifecycle = yardFactoryLifecycle(object);
     const isBlocked = Boolean(object.blocker);
-    const isReview = isBlocked && object.blocker.kind === "review_required";
-    const isDone = task.status === "done";
-    const color = isReview
+    const isReview = lifecycle.stage === "review";
+    const isDone = lifecycle.resolved;
+    const color = isReview && !isBlocked
       ? YARD_CANVAS_COLORS.review
       : isBlocked
       ? YARD_CANVAS_COLORS.coral
       : isDone
         ? YARD_CANVAS_COLORS.mint
-        : yardStateColor(task.status);
+        : yardStateColor(lifecycle.status);
     ctx.save();
     ctx.strokeStyle = color;
     ctx.fillStyle = "rgba(10,29,37,0.94)";
@@ -2830,17 +2853,23 @@
       ctx.fillStyle = color;
       ctx.font = "900 16px ui-monospace, monospace";
       ctx.textAlign = "center";
-      ctx.fillText(isDone ? "✓" : "→", x, y + 7);
+      ctx.fillText(
+        isDone ? "✓" : lifecycle.status === "running" ? "●" : "→",
+        x,
+        y + 7,
+      );
     }
     ctx.fillStyle = color;
-    ctx.font = "800 7px ui-monospace, monospace";
+    ctx.font = "800 6px ui-monospace, monospace";
     ctx.textAlign = "center";
-    ctx.fillText(
-      isBlocked
-        ? yardBlockCauseLabel(object.blocker.kind).toUpperCase()
-        : yardStatusLabel(task.status).toUpperCase(),
+    yardDrawWrapped(
+      ctx,
+      String(lifecycle.label || yardStatusLabel(lifecycle.status)).toUpperCase(),
       x,
       y + 42,
+      96,
+      8,
+      2,
     );
     ctx.restore();
   }
@@ -2853,9 +2882,17 @@
       object.task && object.task.started_at
     ) || eventKinds.has("claimed") || eventKinds.has("spawned") ||
       eventKinds.has("completed") || eventKinds.has("blocked");
+    const lifecycle = yardFactoryLifecycle(object);
     const outputReached = Boolean(object.artifact) || Boolean(object.blocker);
-    const gateReached = outputReached || eventKinds.has("completed");
-    const pathColor = object.blocker
+    const gateReached = outputReached ||
+      lifecycle.stage === "review" ||
+      lifecycle.stage === "publication" ||
+      lifecycle.stage === "complete" ||
+      lifecycle.resolved ||
+      eventKinds.has("completed");
+    const pathColor = lifecycle.stage === "review" && !object.blocker
+      ? YARD_CANVAS_COLORS.review
+      : object.blocker
       ? object.blocker.kind === "review_required"
         ? YARD_CANVAS_COLORS.review
         : YARD_CANVAS_COLORS.coral
@@ -3028,6 +3065,7 @@
   }
 
   function yardFactoryStageTone(object, stage) {
+    const lifecycle = yardFactoryLifecycle(object);
     if (stage === "task") return YARD_CANVAS_COLORS.amber;
     if (stage === "workbench") {
       return object.workbench_receipt
@@ -3047,7 +3085,9 @@
         ? YARD_CANVAS_COLORS.review
         : YARD_CANVAS_COLORS.coral;
     }
-    return yardStateColor(object.task && object.task.status);
+    if (lifecycle.stage === "review") return YARD_CANVAS_COLORS.review;
+    if (lifecycle.resolved) return YARD_CANVAS_COLORS.mint;
+    return yardStateColor(lifecycle.status);
   }
 
   function yardFactoryStageLabel(stage) {
@@ -3106,6 +3146,7 @@
       const task = object.task || {};
       const artifact = object.artifact;
       const receipt = object.workbench_receipt;
+      const lifecycle = yardFactoryLifecycle(object);
       const stage = hover.stage || "task";
       let heading = task.title || "Untitled task";
       let description = "";
@@ -3201,53 +3242,64 @@
           ? "PR identity comes from the exact publication receipt, never from text mentions."
           : "Only machine-readable output receipts become objects here.";
       } else {
-        heading = task.status === "done"
-          ? "Completed result"
-          : object.blocker
-            ? yardBlockCauseLabel(object.blocker.kind)
-            : yardStatusLabel(task.status);
-        description = task.status === "done"
-          ? "The final result that left the factory."
-          : object.blocker
-            ? "The exact condition preventing this object from passing the gate."
-            : "The task has not reached a terminal gate yet.";
-        focusLabel = task.status === "done"
-          ? "Final result"
-          : object.blocker
-            ? "Why it stopped"
-            : "Current gate";
-        focusText = task.status === "done"
-          ? task.result || task.latest_summary ||
-            "Completed without a written final result."
-          : object.blocker
-            ? yardBlockCauseLabel(object.blocker.kind)
-            : yardStatusLabel(task.status);
-        focusMuted = task.status === "done" &&
-          !task.result && !task.latest_summary;
+        const lifecycleTask = lifecycle.task || {};
+        heading = lifecycle.label || yardStatusLabel(lifecycle.status);
+        description = lifecycle.resolved
+          ? "The most recent downstream stage completed this lifecycle."
+          : lifecycle.stage === "review"
+            ? "The implementation handoff has advanced to independent review."
+            : lifecycle.stage === "publication"
+              ? "The approved artifact has advanced to publication."
+              : object.blocker
+                ? "The exact condition preventing this lifecycle from advancing."
+                : "The current downstream owner of this lifecycle.";
+        focusLabel = lifecycle.resolved
+          ? "Final lifecycle result"
+          : "Current lifecycle owner";
+        focusText = lifecycle.resolved
+          ? lifecycleTask.result ||
+            (artifact
+              ? `${lifecycle.label}${artifact.label ? ` · ${artifact.label}` : ""}`
+              : "") ||
+            task.result || task.latest_summary ||
+            `${lifecycleTask.title || task.title || "Task"} completed.`
+          : [
+              lifecycleTask.title || task.title,
+              lifecycleTask.assignee
+                ? `Owned by @${lifecycleTask.assignee}`
+                : "",
+            ].filter(Boolean).join("\n");
+        focusMuted = !focusText;
         facts = [
-          { label: "STATUS", value: yardStatusLabel(task.status) },
           {
-            label: "FINISHED",
-            value: task.completed_at
-              ? new Date(task.completed_at * 1000).toLocaleTimeString(
+            label: "STAGE",
+            value: String(lifecycle.stage || "workbench").replace(/_/g, " "),
+          },
+          { label: "STATUS", value: yardStatusLabel(lifecycle.status) },
+          {
+            label: lifecycle.resolved ? "FINISHED" : "OWNER",
+            value: lifecycle.resolved && lifecycleTask.completed_at
+              ? new Date(lifecycleTask.completed_at * 1000).toLocaleTimeString(
                   [],
                   { hour: "2-digit", minute: "2-digit" },
                 )
-              : "Not yet",
-          },
-          {
-            label: "OUTPUT",
-            value: artifact
-              ? artifact.label
-              : object.blocker
-                ? "Blocked"
-                : "None",
+              : lifecycleTask.assignee
+                ? `@${lifecycleTask.assignee}`
+                : "Unassigned",
           },
         ];
-        foot = task.status === "done"
-          ? "This view intentionally leads with the result, not the earlier event history."
-          : "Resolve the gate condition before treating this task as complete.";
+        foot = lifecycle.resolved
+          ? "Completed outcomes leave the live floor after the short handoff grace."
+          : "This gate follows the linked review/publication task, not the historical implementation status.";
       }
+
+      const tooltipStatus = stage === "gate"
+        ? lifecycle.status
+        : stage === "workbench" && receipt
+          ? receipt.status || task.status
+          : stage === "output" && artifact
+            ? "done"
+            : task.status;
 
       return h("aside", {
         className: "hermes-canvas-tooltip hermes-canvas-tooltip--mission",
@@ -3261,7 +3313,7 @@
               String(object.board_name || object.board_slug || "BOARD").toUpperCase()),
             h("strong", null, heading),
           ),
-          h(YardTooltipStatus, { status: task.status }),
+          h(YardTooltipStatus, { status: tooltipStatus }),
         ),
         h("p", { className: "hermes-canvas-tooltip-description" },
           description),
@@ -3838,9 +3890,12 @@
           ctx.font = "800 8px ui-monospace, monospace";
           ctx.textAlign = "left";
           ctx.fillText(
-            `RECENT FACTORY FLOW · LAST ${Math.round(
-              (props.scene.factoryWindowSeconds || 7200) / 3600,
-            )}H`,
+            `LIVE FACTORY · ACTIVE + LAST ${Math.max(
+              1,
+              Math.round(
+                (props.scene.factoryOutcomeGraceSeconds || 600) / 60,
+              ),
+            )} MIN OUTCOMES`,
             layout.fieldLeft,
             headerY,
           );
@@ -3874,7 +3929,7 @@
             ctx.font = "650 8px ui-monospace, monospace";
             ctx.textAlign = "right";
             ctx.fillText(
-              `+${props.scene.factoryObjects.length - layout.visibleFactoryCount} EARLIER OBJECTS ON BOARD`,
+              `+${props.scene.factoryObjects.length - layout.visibleFactoryCount} MORE CURRENT OBJECTS · OPEN BOARD`,
               width - layout.fieldRight,
               layout.factoryTop +
                 layout.visibleFactoryCount * layout.factoryRowHeight - 4,
@@ -3887,7 +3942,7 @@
         ctx.font = "600 9px ui-monospace, monospace";
         ctx.textAlign = "left";
         ctx.fillText(
-          "FACTORY FLOOR · PEOPLE ARE LIVE · OBJECTS PRESERVE RECENT TRANSFORMATIONS",
+          "LIVE FLOOR · CURRENT HANDOFFS · COMPLETED OUTCOMES LEAVE AFTER 10 MIN",
           18,
           height - 20,
         );
@@ -4078,14 +4133,12 @@
           return mission.activityKind || "delivery";
         }).join(","),
         "data-factory-objects": props.scene.factoryObjects.length,
+        "data-hidden-resolved-lineages": props.scene.factoryHiddenResolvedCount,
         "data-factory-transformations": props.scene.factoryObjects.map(function (object) {
-          return `${object.task && object.task.id}:${object.latest_event_kind}->${object.artifact
-            ? object.artifact.kind
-            : object.blocker
-              ? "blocker"
-              : "pending"}`;
+          const lifecycle = yardFactoryLifecycle(object);
+          return `${object.task && object.task.id}:${lifecycle.stage}:${lifecycle.status}:${lifecycle.visibility}`;
         }).join(" | "),
-        "aria-label": `${workingRows.length} agents working now: ${runningRows.length} building across ${props.scene.runningTaskCount} product task runs and ${supervisingRows.length} planning, review, or control agents across ${props.scene.controllerRunCount} live runs. ${baseRows.length} agents are at base. The factory conveyor shows ${props.scene.factoryObjects.length} recent task objects and what they became.`,
+        "aria-label": `${workingRows.length} agents working now: ${runningRows.length} building across ${props.scene.runningTaskCount} product task runs and ${supervisingRows.length} planning, review, or control agents across ${props.scene.controllerRunCount} live runs. ${baseRows.length} agents are at base. The live factory shows ${props.scene.factoryObjects.length} current handoffs or recently completed outcomes. ${props.scene.factoryHiddenResolvedCount} older resolved lineages are hidden from this live view.`,
         onClick: handleClick,
         onPointerMove: handlePointerMove,
         onPointerLeave: function () {
@@ -4107,8 +4160,10 @@
             h("strong", null, "No agent work is running right now"),
             h("small", null,
               props.scene.factoryObjects.length > 0
-                ? "Workbench names below are past receipts; live agents would leave their base."
-                : "Building, planning, review, and recovery appear here when an agent run starts."),
+                ? "Rows below are current handoffs or outcomes from the last 10 minutes; a live agent would leave its base."
+                : props.scene.factoryHiddenResolvedCount > 0
+                  ? "Older completed lineages left this live floor. Their full history remains on the Board."
+                  : "Building, planning, review, and recovery appear here when an agent run starts."),
           )
         : null,
       h(AgencyHoverInspector, { hover: hovered }),
@@ -4129,7 +4184,7 @@
             workingRows.length > 0
               ? "Hover active work or agents for details. Click a product task to open it."
               : props.scene.factoryObjects.length > 0
-                ? "No one is running now. Hover a factory row to inspect its recorded transformations."
+                ? "No one is running now. Hover a current handoff or recent outcome to inspect its lifecycle."
                 : "Hover or click an agent to inspect it. Live task runs will appear in the center."),
     );
   }
@@ -4219,7 +4274,7 @@
           ),
           h("h2", { id: "agency-yard-title" }, "The agencies, on one floor"),
           h("p", null,
-            "Agents show who is working now. The factory floor shows what each recent task became.",
+            "Agents show who is working now. The factory shows current handoffs and keeps completed outcomes for ten minutes—historical comments never revive them.",
           ),
         ),
         h("div", { className: "hermes-yard-actions" },
@@ -4255,8 +4310,8 @@
         h(YardMetric, {
           value: taskCounts.factoryObjects,
           label: taskCounts.factoryObjects === 1
-            ? "recent factory object"
-            : "recent factory objects",
+            ? "object on live factory floor"
+            : "objects on live factory floor",
           tone: "ready",
         }),
       ),
@@ -4276,7 +4331,7 @@
         h("span", null, h("i", { className: "is-review" }), "PR, patch, or result"),
         h("span", null, h("i", { className: "is-blocked" }), "Blocked transformation"),
         h("strong", null,
-          "Workbench names are past handlers or next owners. Only agents outside a base are live."),
+          "Only agents outside a base are live. Factory rows are current handoffs or outcomes within the ten-minute grace window."),
       ),
     );
   }

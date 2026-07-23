@@ -316,6 +316,165 @@ def test_agency_overview_exposes_recent_factory_objects(client):
     )
 
 
+def test_agency_overview_collapses_review_and_publication_into_one_factory_lineage(
+    client,
+):
+    """A reviewer run advances the implementation row instead of duplicating it."""
+    now = int(time.time())
+    kb.create_board("engineering", name="Engineering Agency")
+    with kb.connect(board="engineering") as conn:
+        implementation_id = kb.create_task(
+            conn,
+            title="Implement retry-safe first creation",
+            body="Preserve the creator's first successful result.",
+            assignee="terra-frontend",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Review retry-safe first creation",
+            assignee="agencyreviewer",
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'blocked', started_at = ?,
+                block_kind = 'review_required'
+            WHERE id = ?
+            """,
+            (now - 90, implementation_id),
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'running', started_at = ?
+            WHERE id = ?
+            """,
+            (now - 20, review_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_relations (
+                source_task_id, target_task_id, relation, created_by, created_at
+            ) VALUES (?, ?, 'reviews', 'worker', ?)
+            """,
+            (implementation_id, review_id, now - 25),
+        )
+        for task_id, kind, timestamp in (
+            (implementation_id, "claimed", now - 80),
+            (implementation_id, "blocked", now - 30),
+            (review_id, "claimed", now - 20),
+            (review_id, "spawned", now - 15),
+        ):
+            conn.execute(
+                """
+                INSERT INTO task_events (task_id, kind, payload, created_at)
+                VALUES (?, ?, '{}', ?)
+                """,
+                (task_id, kind, timestamp),
+            )
+        conn.commit()
+
+    response = client.get("/api/plugins/kanban/agency-overview")
+
+    assert response.status_code == 200
+    objects = response.json()["factory_flow"]["objects"]
+    assert [item["task"]["id"] for item in objects] == [implementation_id]
+    assert objects[0]["lifecycle"] == {
+        "stage": "review",
+        "status": "running",
+        "label": "Review in progress",
+        "resolved": False,
+        "visibility": "live",
+        "task": {
+            "id": review_id,
+            "title": "Review retry-safe first creation",
+            "assignee": "agencyreviewer",
+            "status": "running",
+            "block_kind": None,
+            "created_at": objects[0]["lifecycle"]["task"]["created_at"],
+            "started_at": now - 20,
+            "completed_at": None,
+        },
+    }
+    assert objects[0]["blocker"] is None
+
+
+def test_agency_overview_does_not_revive_resolved_lineage_from_comments(client):
+    """Control-plane comments cannot put reviewed/published work back on the live floor."""
+    now = int(time.time())
+    kb.create_board("engineering", name="Engineering Agency")
+    with kb.connect(board="engineering") as conn:
+        implementation_id = kb.create_task(
+            conn,
+            title="Phosphene correction: PR #945 retry marker",
+            assignee="terra-frontend",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Review PR #945 retry marker",
+            assignee="agencyreviewer",
+        )
+        publication_id = kb.create_task(
+            conn,
+            title="Publish PR #945 retry marker",
+            assignee="agency-publisher",
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'blocked', started_at = ?,
+                block_kind = 'review_required'
+            WHERE id = ?
+            """,
+            (now - 7_200, implementation_id),
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'done', started_at = ?, completed_at = ?
+            WHERE id IN (?, ?)
+            """,
+            (now - 7_100, now - 7_000, review_id, publication_id),
+        )
+        conn.executemany(
+            """
+            INSERT INTO task_relations (
+                source_task_id, target_task_id, relation, created_by, created_at
+            ) VALUES (?, ?, ?, 'worker', ?)
+            """,
+            (
+                (implementation_id, review_id, "reviews", now - 7_100),
+                (implementation_id, publication_id, "publishes", now - 7_050),
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE task_events
+            SET created_at = ?
+            WHERE task_id IN (?, ?, ?)
+            """,
+            (now - 7_000, implementation_id, review_id, publication_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'commented', '{"author":"worker"}', ?)
+            """,
+            (implementation_id, now - 1),
+        )
+        conn.commit()
+
+    response = client.get("/api/plugins/kanban/agency-overview")
+
+    assert response.status_code == 200
+    flow = response.json()["factory_flow"]
+    assert flow["outcome_grace_seconds"] == 10 * 60
+    assert flow["hidden_resolved_count"] == 1
+    assert implementation_id not in {
+        item["task"]["id"] for item in flow["objects"]
+    }
+
+
 def test_agency_overview_exposes_latest_meaningful_worker_heartbeat(client):
     """The live canvas gets explicit progress without exposing hidden reasoning."""
     kb.create_board("engineering", name="Engineering Agency")
