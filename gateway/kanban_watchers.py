@@ -952,6 +952,20 @@ class GatewayKanbanWatchersMixin:
                 raw_worktree_shared_path_overlays,
             )
             worktree_shared_path_overlays = {}
+        raw_worktree_shared_path_source_overrides = kanban_cfg.get(
+            "worktree_shared_path_source_overrides", {}
+        )
+        if isinstance(raw_worktree_shared_path_source_overrides, dict):
+            worktree_shared_path_source_overrides = dict(
+                raw_worktree_shared_path_source_overrides
+            )
+        else:
+            logger.warning(
+                "kanban dispatcher: invalid "
+                "kanban.worktree_shared_path_source_overrides=%r; ignoring",
+                raw_worktree_shared_path_source_overrides,
+            )
+            worktree_shared_path_source_overrides = {}
 
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
@@ -1048,6 +1062,9 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     worktree_shared_paths=worktree_shared_paths,
                     worktree_shared_path_overlays=worktree_shared_path_overlays,
+                    worktree_shared_path_source_overrides=(
+                        worktree_shared_path_source_overrides
+                    ),
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

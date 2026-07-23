@@ -476,6 +476,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Human-readable reason (recorded on the reclaimed event)",
     )
 
+    p_skills = sub.add_parser(
+        "skills",
+        help="Replace force-loaded skills on a non-running task",
+    )
+    p_skills.add_argument("task_id")
+    p_skills.add_argument(
+        "--skill",
+        dest="skills",
+        action="append",
+        default=[],
+        help="Skill name to force-load (repeatable). Omit to clear all extras.",
+    )
+
     # --- diagnostics (board-wide health) ---
     p_diag = sub.add_parser(
         "diagnostics",
@@ -987,6 +1000,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "assign":   _cmd_assign,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
+            "skills":   _cmd_skills,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
             "link":     _cmd_link,
@@ -1710,6 +1724,21 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_skills(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_task_skills(conn, args.task_id, args.skills or [])
+    except (RuntimeError, ValueError) as exc:
+        print(f"cannot update skills for {args.task_id}: {exc}", file=sys.stderr)
+        return 1
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    rendered = ", ".join(args.skills) if args.skills else "(none)"
+    print(f"Updated {args.task_id} force-loaded skills: {rendered}")
+    return 0
+
+
 def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board. Wraps the same rule engine
     the dashboard uses, so CLI output matches what the UI shows.
@@ -2346,6 +2375,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             if isinstance(raw_worktree_shared_path_overlays, dict)
             else {}
         )
+        raw_worktree_shared_path_source_overrides = _kanban_cfg.get(
+            "worktree_shared_path_source_overrides", {}
+        )
+        worktree_shared_path_source_overrides = (
+            dict(raw_worktree_shared_path_source_overrides)
+            if isinstance(raw_worktree_shared_path_source_overrides, dict)
+            else {}
+        )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
@@ -2358,6 +2395,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         worktree_shared_paths = []
         worktree_shared_path_overlays = {}
+        worktree_shared_path_source_overrides = {}
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
@@ -2371,6 +2409,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_in_progress_per_profile=max_in_progress_per_profile,
             worktree_shared_paths=worktree_shared_paths,
             worktree_shared_path_overlays=worktree_shared_path_overlays,
+            worktree_shared_path_source_overrides=(
+                worktree_shared_path_source_overrides
+            ),
         )
     if getattr(args, "json", False):
         print(json.dumps({

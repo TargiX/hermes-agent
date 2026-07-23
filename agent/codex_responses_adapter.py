@@ -179,6 +179,9 @@ def _summarize_user_message_for_log(content: Any, *, sep: str = " ") -> str:
 # ID helpers
 # ---------------------------------------------------------------------------
 
+_MAX_RESPONSES_CALL_ID_LENGTH = 64
+
+
 def _deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
     """Generate a deterministic call_id from tool call content.
 
@@ -189,6 +192,24 @@ def _deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
     seed = f"{fn_name}:{arguments}:{index}"
     digest = hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[:12]
     return f"call_{digest}"
+
+
+def _normalize_responses_call_id(raw_call_id: str) -> str:
+    """Keep replayed Responses ``call_id`` values within the API limit.
+
+    MCP-backed tool IDs can include the server, tool, execution marker, and a
+    UUID, which makes otherwise valid persisted history exceed the Responses
+    API's 64-character input limit. Preserve short IDs exactly for prompt-cache
+    stability; shorten oversized IDs deterministically so the matching
+    ``function_call`` and ``function_call_output`` retain the same identity.
+    """
+    call_id = raw_call_id.strip()
+    if len(call_id) <= _MAX_RESPONSES_CALL_ID_LENGTH:
+        return call_id
+
+    digest = hashlib.sha256(call_id.encode("utf-8", errors="replace")).hexdigest()[:16]
+    prefix_length = _MAX_RESPONSES_CALL_ID_LENGTH - len(digest) - 1
+    return f"{call_id[:prefix_length]}_{digest}"
 
 
 def _split_responses_tool_id(raw_id: Any) -> tuple[Optional[str], Optional[str]]:
@@ -535,7 +556,7 @@ def _chat_messages_to_responses_input(
                             else:
                                 _raw_args = str(fn.get("arguments", "{}"))
                                 call_id = _deterministic_call_id(fn_name, _raw_args, len(items))
-                        call_id = call_id.strip()
+                        call_id = _normalize_responses_call_id(call_id)
 
                         arguments = fn.get("arguments", "{}")
                         if isinstance(arguments, dict):
@@ -568,6 +589,7 @@ def _chat_messages_to_responses_input(
                     call_id = raw_tool_call_id.strip()
             if not isinstance(call_id, str) or not call_id.strip():
                 continue
+            call_id = _normalize_responses_call_id(call_id)
 
             # Multimodal tool result: convert OpenAI-style content list into
             # Responses ``function_call_output.output`` array. The Responses
@@ -633,7 +655,7 @@ def _preflight_codex_input_items(
             normalized.append(
                 {
                     "type": "function_call",
-                    "call_id": call_id.strip(),
+                    "call_id": _normalize_responses_call_id(call_id),
                     "name": name.strip(),
                     "arguments": arguments,
                 }
@@ -674,7 +696,7 @@ def _preflight_codex_input_items(
                 normalized.append(
                     {
                         "type": "function_call_output",
-                        "call_id": call_id.strip(),
+                        "call_id": _normalize_responses_call_id(call_id),
                         "output": cleaned if cleaned else "",
                     }
                 )
@@ -685,7 +707,7 @@ def _preflight_codex_input_items(
             normalized.append(
                 {
                     "type": "function_call_output",
-                    "call_id": call_id.strip(),
+                    "call_id": _normalize_responses_call_id(call_id),
                     "output": output,
                 }
             )

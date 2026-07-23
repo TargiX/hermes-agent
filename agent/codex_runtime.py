@@ -587,6 +587,23 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(note, dict):
             return
         method = note.get("method") or ""
+        if method:
+            # The native Hermes tool loop calls _touch_activity around every
+            # provider/tool transition. Codex app-server owns that inner loop,
+            # so without this bridge a busy Kanban worker can look heartbeat-
+            # silent for its entire turn. _touch_activity already performs the
+            # trusted, rate-limited (60s), best-effort Kanban heartbeat bridge
+            # when HERMES_KANBAN_TASK is present.
+            touch = getattr(agent, "_touch_activity", None)
+            if touch is not None:
+                try:
+                    touch(f"codex app-server event: {method}")
+                except Exception:
+                    logger.debug(
+                        "_touch_activity raised for codex app-server event %s",
+                        method,
+                        exc_info=True,
+                    )
         params = note.get("params") or {}
         if not isinstance(params, dict):
             params = {}

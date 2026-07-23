@@ -271,11 +271,12 @@ def _resolve_crash_grace_seconds() -> int:
 def _resolve_rate_limit_cooldown_seconds() -> int:
     """Return the rate-limit requeue cooldown in seconds.
 
-    Reads ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` from the environment;
-    falls back to ``DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS`` when absent, empty,
-    non-integer, or negative. A value of 0 disables the cooldown (re-spawn on
-    the next tick) — useful for tests that want to assert the task becomes
-    spawnable again immediately.
+    ``kanban.rate_limit_cooldown_seconds`` in ``config.yaml`` is the canonical
+    operator setting. The existing
+    ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` environment variable keeps
+    explicit override precedence for deployments that already use it. Invalid
+    values fall through to config, then ``DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS``.
+    A value of 0 disables the cooldown (re-spawn on the next tick).
     """
     raw = os.environ.get(
         "HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", ""
@@ -287,6 +288,22 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
             parsed = -1
         if parsed >= 0:
             return parsed
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        kanban_config = config.get("kanban") if isinstance(config, dict) else None
+        configured = (
+            kanban_config.get("rate_limit_cooldown_seconds")
+            if isinstance(kanban_config, dict)
+            else None
+        )
+        if configured is not None and not isinstance(configured, bool):
+            parsed = int(configured)
+            if parsed >= 0:
+                return parsed
+    except (OSError, TypeError, ValueError):
+        pass
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
 
 
@@ -2852,6 +2869,19 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    external_signal_issue = validate_external_signal_identity(body)
+    if external_signal_issue:
+        raise ValueError(
+            "external review signal admission blocked: " + external_signal_issue
+        )
+    implementation_admission_issue = validate_phosphene_implementation_admission(
+        body
+    )
+    if implementation_admission_issue:
+        raise ValueError(
+            "phosphene implementation admission blocked: "
+            + implementation_admission_issue
+        )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -3255,6 +3285,57 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         return True
 
 
+def set_task_skills(
+    conn: sqlite3.Connection, task_id: str, skills: Iterable[str]
+) -> bool:
+    """Replace force-loaded worker skills on a non-running task.
+
+    This is an operator recovery surface for cards that fail before reading
+    their body because an orchestrator attached a skill unavailable on the
+    assignee profile. The task id, body, lineage, and workspace stay intact.
+    """
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in skills:
+        name = str(raw).strip()
+        if not name:
+            continue
+        if "," in name:
+            raise ValueError(f"skill name cannot contain comma: {name!r}")
+        if name.casefold() in KNOWN_TOOLSET_NAMES:
+            raise ValueError(f"{name!r} is a toolset name, not a skill")
+        if name not in seen:
+            seen.add(name)
+            cleaned.append(name)
+    encoded = json.dumps(cleaned) if cleaned else None
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, skills FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] == "running" or row["claim_lock"] is not None:
+            raise RuntimeError(
+                f"cannot change skills for {task_id}: task is currently running"
+            )
+        changed = row["skills"] != encoded
+        conn.execute(
+            "UPDATE tasks SET skills = ?, consecutive_failures = 0, "
+            "last_failure_error = NULL WHERE id = ?",
+            (encoded, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "skills_updated",
+            {"skills": cleaned, "changed": changed},
+        )
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Links
 # ---------------------------------------------------------------------------
@@ -3452,18 +3533,48 @@ def add_comment(
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    clean_author = author.strip()
+    clean_body = body.strip()
     now = int(time.time())
     with write_txn(conn):
         if not conn.execute(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
+        # Tool retries and model closeout loops can repeat the exact same
+        # comment several times within seconds. Treat only the consecutive,
+        # byte-identical same-author case as idempotent so the board thread
+        # and the next worker's injected context do not accumulate noise.
+        # A different intervening comment, author, body, or a later repeat is
+        # still recorded normally.
+        previous = conn.execute(
+            """
+            SELECT id, author, body, created_at
+              FROM task_comments
+             WHERE task_id = ?
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if (
+            previous is not None
+            and previous["author"] == clean_author
+            and previous["body"] == clean_body
+            and int(previous["created_at"]) >= now - 300
+        ):
+            return int(previous["id"])
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
+            (task_id, clean_author, clean_body, now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {"author": clean_author, "len": len(clean_body)},
+        )
         return int(cur.lastrowid or 0)
 
 
@@ -4771,6 +4882,143 @@ def _declared_contract_value(body: Optional[str], key: str) -> Optional[str]:
     return None
 
 
+def validate_external_signal_identity(body: Optional[str]) -> Optional[str]:
+    """Fail closed for current-source cards seeded by an external PR thread.
+
+    A non-PR-owned review comment may seed a separate current-source evidence
+    card, but it cannot safely do so when the selector guesses or repairs the
+    immutable thread identity after task creation.  The boundary is deliberately
+    narrow: ordinary cards are untouched, while cards that declare both
+    ``pr_correction_authority:false`` and a GitHub discussion URL must carry one
+    exact machine-readable identity tuple.
+    """
+
+    raw = body or ""
+    if not (
+        re.search(r"(?mi)^\s*-?\s*pr_correction_authority\s*:\s*false\s*$", raw)
+        and "#discussion_r" in raw
+    ):
+        return None
+
+    encoded = _declared_contract_value(raw, "external_signal_identity_json")
+    if not encoded:
+        return "external_signal_identity_json is required"
+    try:
+        identity = json.loads(encoded)
+    except (TypeError, json.JSONDecodeError):
+        return "external_signal_identity_json must be valid JSON"
+    if not isinstance(identity, dict):
+        return "external_signal_identity_json must be an object"
+
+    required = {
+        "schema": str,
+        "repo": str,
+        "pr_number": int,
+        "thread_id": str,
+        "comment_id": int,
+        "path": str,
+        "url": str,
+        "head_ref_oid": str,
+        "classification": str,
+        "pr_correction_authority": bool,
+    }
+    missing = [
+        key
+        for key, value_type in required.items()
+        if key not in identity or not isinstance(identity[key], value_type)
+    ]
+    if missing:
+        return "identity tuple missing/invalid fields: " + ", ".join(missing)
+    if identity["schema"] != "phosphene-external-signal/v1":
+        return "identity schema must equal phosphene-external-signal/v1"
+    if identity["classification"] != "non_pr_owned_base_signal":
+        return "identity classification must equal non_pr_owned_base_signal"
+    if identity["pr_correction_authority"] is not False:
+        return "identity pr_correction_authority must be false"
+    if not re.fullmatch(r"PRRT_[A-Za-z0-9_-]+", identity["thread_id"]):
+        return "identity thread_id is invalid"
+    if identity["pr_number"] <= 0 or identity["comment_id"] <= 0:
+        return "identity PR/comment numbers must be positive"
+    if not identity["path"].strip():
+        return "identity path is required"
+    if not re.fullmatch(r"[0-9a-f]{40}", identity["head_ref_oid"]):
+        return "identity head_ref_oid must be a 40-character lowercase SHA"
+
+    url_match = re.fullmatch(
+        r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)#discussion_r(\d+)",
+        identity["url"],
+    )
+    if url_match is None:
+        return "identity URL must be an exact GitHub pull discussion URL"
+    if (
+        url_match.group(1) != identity["repo"]
+        or int(url_match.group(2)) != identity["pr_number"]
+        or int(url_match.group(3)) != identity["comment_id"]
+    ):
+        return "identity URL disagrees with repo, PR, or comment id"
+
+    observed_threads = set(re.findall(r"\bPRRT_[A-Za-z0-9_-]+\b", raw))
+    if observed_threads != {identity["thread_id"]}:
+        return "task body contains a missing or conflicting review thread id"
+    observed_discussions = {
+        int(value) for value in re.findall(r"#discussion_r(\d+)", raw)
+    }
+    if observed_discussions != {identity["comment_id"]}:
+        return "task body contains a missing or conflicting discussion comment id"
+    return None
+
+
+def validate_phosphene_implementation_admission(
+    body: Optional[str],
+) -> Optional[str]:
+    """Require current-base open-PR path authority before implementation.
+
+    GitHub's PR-files endpoint can describe the opening base long after the
+    live default branch moves.  Making the Lead copy its verified three-dot
+    clearance into the immutable card prevents workers from reconstructing
+    path ownership from that historical cache.
+    """
+
+    task_class = _declared_contract_value(body, "task_class")
+    receipt = _declared_contract_value(body, "required_receipt")
+    expected_remote = _declared_contract_value(body, "expected_remote")
+    if not (
+        task_class == "implementation"
+        and receipt == "phosphene-implementation/v1"
+        and isinstance(expected_remote, str)
+        and "github.com/" in expected_remote
+    ):
+        return None
+    raw = str(body or "")
+    match = re.search(
+        r"(?mi)^\s*-?\s*open_pr_path_clearance_json\s*:\s*(\[.*\])\s*$",
+        raw,
+    )
+    if match is None:
+        return "open_pr_path_clearance_json is required"
+    try:
+        clearance = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return "open_pr_path_clearance_json must be valid JSON"
+    if not isinstance(clearance, list):
+        return "open_pr_path_clearance_json must be a list"
+    for index, entry in enumerate(clearance):
+        if not isinstance(entry, dict):
+            return f"open_pr_path_clearance_json[{index}] must be an object"
+        if not isinstance(entry.get("pr_number"), int) or entry["pr_number"] <= 0:
+            return f"open_pr_path_clearance_json[{index}].pr_number is invalid"
+        if not re.fullmatch(r"[0-9a-f]{40}", str(entry.get("head_sha") or "")):
+            return f"open_pr_path_clearance_json[{index}].head_sha is invalid"
+        if entry.get("pr_owned_manifest_verified") is not True:
+            return (
+                f"open_pr_path_clearance_json[{index}]."
+                "pr_owned_manifest_verified must be true"
+            )
+        if not isinstance(entry.get("pr_owned_files"), list):
+            return f"open_pr_path_clearance_json[{index}].pr_owned_files must be a list"
+    return None
+
+
 def validate_declared_handoff(
     *,
     body: Optional[str],
@@ -4803,16 +5051,23 @@ def validate_declared_handoff(
             and approved is not (outcome == "APPROVE")
         ):
             issues.append("metadata.approved must be a boolean matching metadata.outcome")
-        target = (
+        reviewed_implementation = _declared_contract_value(
+            body, "implementation_task_id"
+        )
+        authorization_target = (
             _declared_contract_value(body, "recovery_target")
-            or _declared_contract_value(body, "implementation_task_id")
+            or reviewed_implementation
         )
         implementation_task_id = payload.get("implementation_task_id")
         if not isinstance(implementation_task_id, str) or not implementation_task_id:
             issues.append("metadata.implementation_task_id is required")
-        elif target and implementation_task_id != target:
+        elif (
+            reviewed_implementation
+            and implementation_task_id != reviewed_implementation
+        ):
             issues.append(
-                f"metadata.implementation_task_id must equal declared target {target!r}"
+                "metadata.implementation_task_id must equal declared reviewed "
+                f"implementation {reviewed_implementation!r}"
             )
         reviewed_fingerprint = payload.get("reviewed_fingerprint")
         if not isinstance(reviewed_fingerprint, str) or not reviewed_fingerprint:
@@ -4822,9 +5077,10 @@ def validate_declared_handoff(
         authorized = payload.get("authorized_next_task_ids")
         if not isinstance(authorized, list) or not authorized:
             issues.append("metadata.authorized_next_task_ids must be a non-empty list")
-        elif target and target not in authorized:
+        elif authorization_target and authorization_target not in authorized:
             issues.append(
-                f"metadata.authorized_next_task_ids must contain declared target {target!r}"
+                "metadata.authorized_next_task_ids must contain declared "
+                f"authorization target {authorization_target!r}"
             )
         if issues:
             return "declared review receipt is incomplete: " + "; ".join(issues)
@@ -4837,6 +5093,14 @@ def validate_declared_handoff(
         issues = []
         if payload.get("handoff_version") != receipt:
             issues.append(f"metadata.handoff_version must equal {receipt!r}")
+        if str(payload.get("outcome") or "").upper() in {
+            "COLLISION",
+            "SCOPE_FALSIFIED",
+        }:
+            issues.append(
+                "metadata.outcome is non-reviewable and cannot use "
+                "block_kind='review_required'"
+            )
         diff_sha256 = payload.get("diff_sha256")
         diff_fingerprint = payload.get("diff_fingerprint")
         if not isinstance(diff_sha256, str) or not diff_sha256:
@@ -4851,13 +5115,128 @@ def validate_declared_handoff(
             and diff_sha256 != diff_fingerprint
         ):
             issues.append("metadata.diff_sha256 must equal metadata.diff_fingerprint")
+        empty_diff_sha256 = hashlib.sha256(b"").hexdigest()
+        if diff_sha256 == empty_diff_sha256 or diff_fingerprint == empty_diff_sha256:
+            issues.append("metadata diff fingerprint must not represent an empty patch")
         changed_files = payload.get("changed_files")
         if not isinstance(changed_files, list) or not changed_files:
             issues.append("metadata.changed_files must be a non-empty list")
+        singular_fingerprint_detail = payload.get("diff_fingerprint_detail")
+        plural_fingerprint_detail = payload.get("diff_fingerprint_details")
+        if (
+            isinstance(singular_fingerprint_detail, dict)
+            and isinstance(plural_fingerprint_detail, dict)
+            and singular_fingerprint_detail != plural_fingerprint_detail
+        ):
+            issues.append(
+                "metadata.diff_fingerprint_detail and "
+                "metadata.diff_fingerprint_details must not conflict"
+            )
+        fingerprint_detail = (
+            singular_fingerprint_detail
+            if isinstance(singular_fingerprint_detail, dict)
+            else plural_fingerprint_detail
+            if isinstance(plural_fingerprint_detail, dict)
+            else None
+        )
+        if not isinstance(fingerprint_detail, dict):
+            issues.append(
+                "metadata.diff_fingerprint_detail or "
+                "metadata.diff_fingerprint_details is required"
+            )
+        else:
+            detail_files = fingerprint_detail.get("changed_files")
+            if detail_files != changed_files:
+                issues.append(
+                    "metadata fingerprint detail changed_files must equal "
+                    "metadata.changed_files"
+                )
+            patch_bytes = fingerprint_detail.get("patch_bytes")
+            if not isinstance(patch_bytes, int) or patch_bytes <= 0:
+                issues.append(
+                    "metadata fingerprint detail patch_bytes must be positive"
+                )
         if payload.get("next_owner") != "agencyreviewer":
             issues.append("metadata.next_owner must equal 'agencyreviewer'")
         if issues:
             return "declared implementation receipt is incomplete: " + "; ".join(issues)
+
+    if (
+        receipt == "phosphene-implementation/v1"
+        and action == "block"
+        and block_kind != "review_required"
+    ):
+        issues = []
+        if payload.get("handoff_version") != receipt:
+            issues.append(f"metadata.handoff_version must equal {receipt!r}")
+        outcome = str(payload.get("outcome") or "").upper()
+        if outcome not in {"COLLISION", "SCOPE_FALSIFIED"}:
+            issues.append(
+                "metadata.outcome must be COLLISION or SCOPE_FALSIFIED for a "
+                "non-review implementation block"
+            )
+        collision_kind = str(payload.get("collision_kind") or "")
+        if outcome == "COLLISION" and "open_pr" in collision_kind:
+            proof = payload.get("current_base_manifest_verification")
+            if not isinstance(proof, dict):
+                issues.append(
+                    "metadata.current_base_manifest_verification is required "
+                    "for open-PR collision"
+                )
+            else:
+                if proof.get("verified") is not True:
+                    issues.append(
+                        "metadata.current_base_manifest_verification.verified "
+                        "must be true"
+                    )
+                if proof.get("measurement") != "git_current_base_three_dot":
+                    issues.append(
+                        "metadata.current_base_manifest_verification.measurement "
+                        "must equal 'git_current_base_three_dot'"
+                    )
+                overlap = proof.get("overlapping_files")
+                if not isinstance(overlap, list) or not overlap:
+                    issues.append(
+                        "metadata.current_base_manifest_verification."
+                        "overlapping_files must be a non-empty list"
+                    )
+        if issues:
+            return "declared implementation block receipt is incomplete: " + "; ".join(
+                issues
+            )
+
+    if receipt == "phosphene-evidence/v1" and action == "complete":
+        # Current-source evidence is only useful to the selector when its
+        # source authority is available at the receipt's top level.  Models
+        # occasionally bury these fields in ``evidence`` (or emit near-name
+        # aliases), which turns a truthful reproduction into a later manual
+        # receipt-recovery card.  Reject that shape while the original worker
+        # is still alive so it can correct metadata without repeating work.
+        declared_expected_sha = _declared_contract_value(
+            body, "expected_source_sha"
+        )
+        if declared_expected_sha:
+            issues = []
+            if payload.get("handoff_version") != receipt:
+                issues.append(f"metadata.handoff_version must equal {receipt!r}")
+            expected_sha = payload.get("expected_source_sha")
+            observed_sha = payload.get("observed_source_sha")
+            if expected_sha != declared_expected_sha:
+                issues.append(
+                    "metadata.expected_source_sha must equal declared "
+                    f"source {declared_expected_sha!r}"
+                )
+            if not isinstance(observed_sha, str) or not re.fullmatch(
+                r"[0-9a-f]{40}", observed_sha
+            ):
+                issues.append(
+                    "metadata.observed_source_sha must be a top-level "
+                    "40-character lowercase SHA"
+                )
+            if issues:
+                return "declared evidence receipt is incomplete: " + "; ".join(
+                    issues
+                )
 
     return None
 
@@ -6729,6 +7108,100 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
+_READ_ONLY_SOURCE_REFRESH_TASK_CLASSES = {
+    "evidence",
+    "reproduction",
+    "scout",
+    "capability-scout",
+    "correction_evidence",
+}
+
+
+def _task_allows_read_only_source_refresh(task: Task) -> bool:
+    body = task.body or ""
+    task_class_match = re.search(
+        r"(?mi)^\s*task_class\s*:\s*([a-z0-9_-]+)\s*$",
+        body,
+    )
+    task_class = task_class_match.group(1).lower() if task_class_match else ""
+    return (
+        task_class in _READ_ONLY_SOURCE_REFRESH_TASK_CLASSES
+        and "READ_ONLY_EVIDENCE_SOURCE_REFRESH_V1" in body
+    )
+
+
+def _refresh_existing_read_only_worktree(task: Task, workspace: Path) -> None:
+    """Fast-forward a clean, explicitly refreshable evidence worktree.
+
+    Existing worktrees normally preserve their exact artifact bytes. That is
+    mandatory for implementation/review/publication, but it made a recovered
+    read-only evidence card collide forever after the dispatcher refreshed the
+    shared remote ref without advancing the task checkout. The card contract is
+    the authority here: only declared read-only task classes carrying
+    ``READ_ONLY_EVIDENCE_SOURCE_REFRESH_V1`` are eligible, and only a clean
+    ancestor checkout may move. Dirty or diverged checkouts remain untouched so
+    the worker can report a truthful collision.
+    """
+    if not _task_allows_read_only_source_refresh(task):
+        return
+
+    def _git(args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", str(workspace), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    status = _git(["status", "--porcelain", "--untracked-files=all"])
+    if status.returncode != 0 or (status.stdout or "").strip():
+        _log.info(
+            "kanban dispatcher: read-only source refresh left task %s "
+            "untouched because its worktree is dirty or unreadable",
+            task.id,
+        )
+        return
+
+    base_ref = _resolve_dispatch_worktree_base(workspace)
+    if base_ref == "HEAD":
+        return
+    head = _git(["rev-parse", "HEAD"])
+    base = _git(["rev-parse", base_ref])
+    if head.returncode != 0 or base.returncode != 0:
+        return
+    head_sha = (head.stdout or "").strip()
+    base_sha = (base.stdout or "").strip()
+    if not head_sha or not base_sha or head_sha == base_sha:
+        return
+
+    ancestor = _git(["merge-base", "--is-ancestor", head_sha, base_sha])
+    if ancestor.returncode != 0:
+        _log.info(
+            "kanban dispatcher: read-only source refresh left task %s "
+            "untouched because %s is not an ancestor of %s",
+            task.id,
+            head_sha,
+            base_sha,
+        )
+        return
+
+    refreshed = _git(["merge", "--ff-only", base_ref], timeout=60)
+    if refreshed.returncode != 0:
+        detail = (refreshed.stderr or refreshed.stdout or "").strip()
+        raise RuntimeError(
+            f"read-only source refresh failed for task {task.id} at {workspace}"
+            + (f": {detail}" if detail else "")
+        )
+    _log.info(
+        "kanban dispatcher: refreshed read-only task %s worktree %s from %s to %s",
+        task.id,
+        workspace,
+        head_sha,
+        base_sha,
+    )
+
+
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
 ) -> tuple[Path, str]:
@@ -6769,7 +7242,10 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
+        target_existed = target.exists()
         _ensure_git_worktree(repo_root, target, branch_name)
+        if target_existed:
+            _refresh_existing_read_only_worktree(task, target)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -6781,13 +7257,17 @@ def _resolve_worktree_workspace(
     requested_resolved = requested.resolve(strict=False)
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
+        _refresh_existing_read_only_worktree(task, requested)
         actual_branch = _git_current_branch(requested)
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
+        target_existed = target.exists()
         _ensure_git_worktree(repo_root, target, branch_name)
+        if target_existed:
+            _refresh_existing_read_only_worktree(task, target)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -6796,7 +7276,10 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
+    requested_existed = requested.exists()
     _ensure_git_worktree(repo_root, requested, branch_name)
+    if requested_existed:
+        _refresh_existing_read_only_worktree(task, requested)
     return requested, branch_name
 
 
@@ -6804,6 +7287,7 @@ def _prepare_worktree_shared_paths(
     workspace: Path,
     shared_paths: Optional[list[str]],
     shared_path_overlays: Optional[dict[str, list[str]]] = None,
+    shared_path_source_overrides: Optional[dict[str, dict[str, str]]] = None,
 ) -> None:
     """Expose explicitly configured primary-checkout paths before spawn.
 
@@ -6839,6 +7323,21 @@ def _prepare_worktree_shared_paths(
         raise ValueError(
             "worktree shared path overlay keys must also appear in "
             f"worktree_shared_paths: {sorted(unknown_overlay_paths)!r}"
+        )
+
+    source_overrides = shared_path_source_overrides or {}
+    if not isinstance(source_overrides, dict):
+        raise ValueError("worktree shared path source overrides must be a mapping")
+    repo_source_overrides = source_overrides.get(str(source_root), {})
+    if not isinstance(repo_source_overrides, dict):
+        raise ValueError(
+            "worktree shared path source override for a repository must be a mapping"
+        )
+    unknown_source_paths = set(repo_source_overrides) - configured_paths
+    if unknown_source_paths:
+        raise ValueError(
+            "worktree shared path source override keys must also appear in "
+            f"worktree_shared_paths: {sorted(unknown_source_paths)!r}"
         )
 
     marker_name = ".hermes-worktree-overlay.json"
@@ -6896,8 +7395,29 @@ def _prepare_worktree_shared_paths(
                     f"invalid worktree shared path overlay marker: {marker}"
                 ) from exc
             if actual_marker != expected_marker:
-                raise RuntimeError(
-                    f"worktree shared path overlay marker mismatch: {marker}"
+                can_migrate_source = (
+                    isinstance(actual_marker, dict)
+                    and actual_marker.get("version") == 1
+                    and actual_marker.get("local_children")
+                    == list(local_children)
+                    and isinstance(actual_marker.get("source"), str)
+                )
+                if not can_migrate_source:
+                    raise RuntimeError(
+                        f"worktree shared path overlay marker mismatch: {marker}"
+                    )
+                for existing in root.iterdir():
+                    if existing.name in set(local_children) | {marker_name}:
+                        continue
+                    if not existing.is_symlink():
+                        raise RuntimeError(
+                            "worktree shared path source migration found an "
+                            f"unmanaged entry: {existing}"
+                        )
+                    existing.unlink()
+                marker.write_text(
+                    json.dumps(expected_marker, sort_keys=True) + "\n",
+                    encoding="utf-8",
                 )
         else:
             root.mkdir(parents=True)
@@ -6960,7 +7480,21 @@ def _prepare_worktree_shared_paths(
                 f"unsafe worktree shared path {raw_path!r}; use a relative path without '..'"
             )
 
-        source = source_root / relative
+        override = repo_source_overrides.get(relative_text)
+        if override is not None:
+            if not isinstance(override, str) or not override.strip():
+                raise ValueError(
+                    f"invalid worktree shared path source override for {relative_text!r}"
+                )
+            override_path = Path(override.strip()).expanduser()
+            if not override_path.is_absolute():
+                raise ValueError(
+                    "worktree shared path source overrides must be absolute: "
+                    f"{override!r}"
+                )
+            source = override_path.resolve(strict=True)
+        else:
+            source = source_root / relative
         if not source.exists():
             continue
         destination = workspace_root / relative
@@ -7177,13 +7711,22 @@ _RESPAWN_BLOCKER_RE = re.compile(
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
+# A worker killed by its wall-clock budget without a durable checkpoint must
+# not immediately repeat the same full scope inside the dispatcher tick that
+# enforced the timeout. This short window gives the Lead/wake sensor time to
+# add a machine-readable narrowing checkpoint; after it expires the ordinary
+# retry budget still provides autonomous recovery.
+_RESPAWN_TIMEOUT_COOLDOWN_SECONDS = 120  # 2 minutes
+
 # Cooldown after a rate-limited (quota-wall) requeue before the dispatcher
 # re-spawns the worker. Without this, a task released by the rate-limit path
 # would be re-spawned on the very next tick and immediately bounce off the
 # same quota wall, burning a worker slot every tick for hours. The cooldown
 # spaces retries out so the board keeps cheaply probing whether quota is back
-# without thrashing. Overridable via ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``
-# for operators who want a tighter/looser probe cadence.
+# without thrashing. This is the base interval; consecutive rate-limit runs
+# from the same profile back off to 2x, 4x, then 8x. Configure
+# ``kanban.rate_limit_cooldown_seconds``; the legacy
+# ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` override remains valid.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
@@ -7241,6 +7784,7 @@ class DispatchResult:
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
+    ``"timeout_cooldown"`` (timed-out run has no recovery checkpoint yet),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
     rate_limited: list[str] = field(default_factory=list)
@@ -7302,6 +7846,46 @@ def _has_forced_evidence_recovery_after(
         ):
             return True
     return False
+
+
+def _has_explicit_requeue_after_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    comment_created_at: int,
+) -> bool:
+    """Whether an operator explicitly re-queued after a PR-bearing comment.
+
+    Comment and unblock writes commonly share one-second timestamps. Use the
+    append-only event id to preserve their real order instead of treating the
+    whole second as simultaneous. If a legacy/direct comment has no matching
+    event, fail closed for that second and require a strictly later requeue.
+    """
+    boundary = conn.execute(
+        "SELECT MAX(id) AS id FROM task_events "
+        "WHERE task_id = ? AND kind = 'commented' AND created_at = ?",
+        (task_id, comment_created_at),
+    ).fetchone()
+    boundary_id = (
+        int(boundary["id"])
+        if boundary is not None and boundary["id"] is not None
+        else None
+    )
+    if boundary_id is None:
+        row = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind IN ('status', 'promoted', 'promoted_manual', "
+            "'unblocked', 'reclaimed') AND created_at > ? LIMIT 1",
+            (task_id, comment_created_at),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind IN ('status', 'promoted', 'promoted_manual', "
+            "'unblocked', 'reclaimed') "
+            "AND (created_at > ? OR (created_at = ? AND id > ?)) LIMIT 1",
+            (task_id, comment_created_at, comment_created_at, boundary_id),
+        ).fetchone()
+    return row is not None
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -8503,13 +9087,24 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         The task's most recent run ended with the ``rate_limited`` outcome
         (a worker bailed on a provider quota wall via the EX_TEMPFAIL
         sentinel) within ``_resolve_rate_limit_cooldown_seconds()``. The
-        quota almost certainly hasn't reset yet, so defer the respawn until
-        the cooldown elapses — then allow a cheap probe. This is checked
+        quota almost certainly hasn't reset yet, so defer the same profile
+        until the cooldown elapses — then allow a cheap probe. An explicit
+        reassignment to a different profile bypasses the old profile's
+        cooldown while preserving the other respawn guards. This is checked
         BEFORE ``blocker_auth`` because the rate-limit requeue stamps a
         quota-flavored ``last_failure_error`` that would otherwise match the
         auth-blocker regex and park the task forever (the rate-limit path
         never increments ``consecutive_failures``, so the breaker can't free
         it). Once the cooldown elapses the task falls through and respawns.
+
+    ``"timeout_cooldown"``
+        The task's most recent run timed out without leaving a durable worker
+        summary, and Lead has not yet attached a
+        ``TIMEOUT_RECOVERY_CHECKPOINT_V1`` comment. Briefly defer the retry so
+        the same full scope is not immediately repeated in the dispatcher tick
+        that enforced the timeout. A worker summary or Lead checkpoint allows
+        an immediate narrowed retry; the ordinary retry resumes after the
+        short cooldown even without either checkpoint.
 
     ``"blocker_auth"``
         The task's last failure error matches a quota / authentication
@@ -8539,7 +9134,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -8549,7 +9144,10 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
     #    (quota wall) — defer while inside the cooldown window, then allow a
-    #    cheap probe. Must run BEFORE the blocker_auth regex check, because a
+    #    cheap probe. Consecutive quota-wall probes from the same profile use
+    #    bounded exponential spacing (1x, 2x, 4x, 8x); a successful or
+    #    otherwise terminal run resets the streak. Must run BEFORE the
+    #    blocker_auth regex check, because a
     #    rate-limit requeue stamps a quota-flavored last_failure_error that
     #    the regex would otherwise match → defer forever (no failure counter
     #    increment on this path means the breaker can never free it).
@@ -8559,36 +9157,106 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    no longer applies and the normal paths take over.
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at FROM task_runs "
+        "SELECT outcome, ended_at, profile, summary FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
+    rate_limit_from_previous_profile = False
     if (
         latest_run is not None
         and latest_run["outcome"] == "rate_limited"
     ):
-        if rl_cooldown <= 0:
+        latest_profile = str(latest_run["profile"] or "").strip()
+        current_assignee = str(row["assignee"] or "").strip()
+        rate_limit_from_previous_profile = bool(
+            latest_profile
+            and current_assignee
+            and latest_profile != current_assignee
+        )
+        if rate_limit_from_previous_profile:
+            # The operator/Lead deliberately selected a different runtime.
+            # Keep recent-success and active-PR protections below, but neither
+            # the old cooldown nor its quota-flavoured error may trap the new
+            # owner before it gets one attempt.
+            pass
+        elif rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, and skip the
             # blocker_auth regex so the stamped rate-limit text doesn't
             # re-trap the task.
             return None
-        ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
-            return "rate_limit_cooldown"
-        # Cooldown elapsed — allow the respawn. Return early so the
-        # blocker_auth check below doesn't catch the rate-limit text we
-        # stamped on the task; this path intentionally retries forever
-        # (cheaply, spaced by the cooldown) until quota returns or a real
-        # crash/completion supersedes it.
-        return None
+        else:
+            ended_at = latest_run["ended_at"]
+            streak = 0
+            streak_rows = conn.execute(
+                "SELECT outcome, profile FROM task_runs "
+                "WHERE task_id = ? AND ended_at IS NOT NULL "
+                "ORDER BY ended_at DESC LIMIT 8",
+                (task_id,),
+            ).fetchall()
+            for streak_row in streak_rows:
+                if streak_row["outcome"] != "rate_limited":
+                    break
+                streak_profile = str(streak_row["profile"] or "").strip()
+                if (
+                    streak_profile
+                    and current_assignee
+                    and streak_profile != current_assignee
+                ):
+                    break
+                streak += 1
+            multiplier = 1 << min(max(streak - 1, 0), 3)
+            effective_cooldown = rl_cooldown * multiplier
+            if (
+                ended_at is not None
+                and (now - int(ended_at)) < effective_cooldown
+            ):
+                return "rate_limit_cooldown"
+            # Cooldown elapsed — allow the respawn. Return early so the
+            # blocker_auth check below doesn't catch the rate-limit text we
+            # stamped on the task; this path intentionally retries forever
+            # (cheaply, spaced by the cooldown) until quota returns or a real
+            # crash/completion supersedes it.
+            return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
+    # 2. A wall-clock timeout without a durable checkpoint must not launch the
+    #    same broad scope again in the very same dispatcher cycle. Give Lead a
+    #    short window to inspect the bounded log and attach an exact recovery
+    #    checkpoint. A worker heartbeat copied into ``summary`` by ``_end_run``
+    #    or a Lead checkpoint means the next attempt is already resumable and
+    #    can proceed immediately. This is deliberately a cooldown, not a hard
+    #    block: autonomous recovery continues after the window even when Lead
+    #    is unavailable.
+    if latest_run is not None and latest_run["outcome"] == "timed_out":
+        ended_at = int(latest_run["ended_at"] or 0)
+        has_worker_checkpoint = bool(str(latest_run["summary"] or "").strip())
+        has_lead_checkpoint = (
+            conn.execute(
+                "SELECT 1 FROM task_comments "
+                "WHERE task_id = ? AND created_at >= ? "
+                "AND body LIKE 'TIMEOUT_RECOVERY_CHECKPOINT_V1:%' LIMIT 1",
+                (task_id, ended_at),
+            ).fetchone()
+            is not None
+        )
+        if (
+            not has_worker_checkpoint
+            and not has_lead_checkpoint
+            and ended_at
+            and (now - ended_at) < _RESPAWN_TIMEOUT_COOLDOWN_SECONDS
+        ):
+            return "timeout_cooldown"
+
+    # 3. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
-    if err and _RESPAWN_BLOCKER_RE.search(err):
+    if (
+        err
+        and not rate_limit_from_previous_profile
+        and _RESPAWN_BLOCKER_RE.search(err)
+    ):
         return "blocker_auth"
 
-    # 3. Completed run within guard window — proof of recent success.
+    # 4. Completed run within guard window — proof of recent success.
     #    Exception: an explicit re-queue AFTER that success (an operator
     #    dragging done→ready, a dependency re-promotion, an unblock, a
     #    reclaim) is a deliberate "run it again" — honor it instead of
@@ -8613,7 +9281,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 5. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
@@ -8622,6 +9290,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
             if _has_forced_evidence_recovery_after(
+                conn,
+                task_id,
+                int(c["created_at"] or 0),
+            ):
+                continue
+            if _has_explicit_requeue_after_comment(
                 conn,
                 task_id,
                 int(c["created_at"] or 0),
@@ -8707,6 +9381,9 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     worktree_shared_paths: Optional[list[str]] = None,
     worktree_shared_path_overlays: Optional[dict[str, list[str]]] = None,
+    worktree_shared_path_source_overrides: Optional[
+        dict[str, dict[str, str]]
+    ] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8743,6 +9420,9 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             worktree_shared_paths=worktree_shared_paths,
             worktree_shared_path_overlays=worktree_shared_path_overlays,
+            worktree_shared_path_source_overrides=(
+                worktree_shared_path_source_overrides
+            ),
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8761,6 +9441,9 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             worktree_shared_paths=worktree_shared_paths,
             worktree_shared_path_overlays=worktree_shared_path_overlays,
+            worktree_shared_path_source_overrides=(
+                worktree_shared_path_source_overrides
+            ),
         )
 
 
@@ -8779,6 +9462,9 @@ def _dispatch_once_locked(
     max_in_progress_per_profile: Optional[int] = None,
     worktree_shared_paths: Optional[list[str]] = None,
     worktree_shared_path_overlays: Optional[dict[str, list[str]]] = None,
+    worktree_shared_path_source_overrides: Optional[
+        dict[str, dict[str, str]]
+    ] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9028,6 +9714,7 @@ def _dispatch_once_locked(
                     workspace,
                     worktree_shared_paths,
                     worktree_shared_path_overlays,
+                    worktree_shared_path_source_overrides,
                 )
             else:
                 workspace = resolve_workspace(claimed, board=board)

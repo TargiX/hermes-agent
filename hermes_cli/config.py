@@ -2860,6 +2860,10 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Seconds to wait before probing a task again after its worker exits
+        # with the provider rate-limit sentinel. This does not count as a task
+        # failure and does not trip the failure circuit breaker.
+        "rate_limit_cooldown_seconds": 300,
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
@@ -2908,6 +2912,11 @@ DEFAULT_CONFIG = {
         # must remain writable under a sandboxed worker.
         # Example: {"node_modules": [".cache"]}.
         "worktree_shared_path_overlays": {},
+        # Optional repo-scoped source replacement for a configured shared path.
+        # This keeps a canonical dependency host separate from a dirty primary
+        # checkout while retaining the same destination inside each worktree.
+        # Example: {"/repo": {"node_modules": "/runtime/deps/node_modules"}}.
+        "worktree_shared_path_source_overrides": {},
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or

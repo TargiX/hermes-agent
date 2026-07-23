@@ -15859,6 +15859,15 @@ def main(
     
     # Handle single query mode
     if query or image:
+        # ``hermes chat -q`` / ``-Q`` returns one response and exits; unlike the
+        # interactive CLI it never reaches ``process_loop`` again to drain a
+        # detached completion.  Declare that delivery boundary before the agent
+        # turn so top-level ``delegate_task`` runs inline and its result is
+        # available to this response (including dispatcher-spawned Kanban
+        # workers, which use ``chat -q ... -Q``).
+        from gateway.session_context import declare_stateless_channel
+
+        declare_stateless_channel()
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
         try:

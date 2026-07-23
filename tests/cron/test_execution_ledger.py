@@ -297,6 +297,42 @@ def test_builtin_tick_does_not_overlap_live_direct_execution(monkeypatch):
     assert "single-lead" not in scheduler.get_running_job_ids()
 
 
+def test_builtin_tick_recovers_stale_in_memory_guard_from_terminal_ledger(monkeypatch):
+    """A leaked process-local marker must not outlive the durable execution."""
+
+    import concurrent.futures
+    import cron.scheduler as scheduler
+
+    class ImmediatePool:
+        def submit(self, callable_):
+            future = concurrent.futures.Future()
+            try:
+                future.set_result(callable_())
+            except BaseException as error:
+                future.set_exception(error)
+            return future
+
+    job = {"id": "stale-lead", "name": "stale lead"}
+    claims = []
+    monkeypatch.setattr(
+        scheduler,
+        "claim_execution",
+        lambda job_id, **_kwargs: claims.append(job_id) or {"id": "exec-recovered"},
+    )
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [job])
+    monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: ImmediatePool())
+    monkeypatch.setattr(scheduler, "run_one_job", lambda *_args, **_kwargs: True)
+    scheduler._running_job_ids.add(job["id"])
+
+    try:
+        assert scheduler.tick(verbose=False, sync=True) == 1
+        assert claims == [job["id"]]
+        assert job["id"] not in scheduler.get_running_job_ids()
+    finally:
+        scheduler._running_job_ids.discard(job["id"])
+
+
 def test_direct_run_does_not_overlap_live_execution(monkeypatch):
     import cron.scheduler as scheduler
 

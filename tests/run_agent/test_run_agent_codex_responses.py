@@ -1673,6 +1673,57 @@ def test_chat_messages_to_responses_input_accepts_call_pipe_fc_ids(monkeypatch):
     assert function_output["call_id"] == "call_pair123"
 
 
+def test_chat_messages_to_responses_input_normalizes_oversized_call_ids_consistently(monkeypatch):
+    _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+    oversized_call_id = (
+        "codex_mcp__hermes-tools__kanban_complete_exec-"
+        "ef94ea1a-fbf0-4ad7-9c63-bba92d44c7ed"
+    )
+    sibling_call_id = (
+        "codex_mcp__hermes-tools__kanban_complete_exec-"
+        "ef94ea1a-fbf0-4ad7-9c63-bba92d44c7ee"
+    )
+
+    def convert(call_id):
+        return _chat_messages_to_responses_input(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": "kanban_complete", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": call_id, "content": '{"ok":true}'},
+            ]
+        )
+
+    first_items = convert(oversized_call_id)
+    repeated_items = convert(oversized_call_id)
+    sibling_items = convert(sibling_call_id)
+    function_call = next(item for item in first_items if item.get("type") == "function_call")
+    function_output = next(
+        item for item in first_items if item.get("type") == "function_call_output"
+    )
+    repeated_call = next(
+        item for item in repeated_items if item.get("type") == "function_call"
+    )
+    sibling_call = next(
+        item for item in sibling_items if item.get("type") == "function_call"
+    )
+
+    assert len(function_call["call_id"]) <= 64
+    assert function_call["call_id"] == function_output["call_id"]
+    assert function_call["call_id"] == repeated_call["call_id"]
+    assert function_call["call_id"] != sibling_call["call_id"]
+
+
 def test_preflight_codex_api_kwargs_strips_optional_function_call_id(monkeypatch):
     agent = _build_agent(monkeypatch)
     from agent.codex_responses_adapter import _preflight_codex_api_kwargs

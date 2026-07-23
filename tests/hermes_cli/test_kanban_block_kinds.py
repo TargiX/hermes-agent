@@ -19,6 +19,7 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -226,7 +227,185 @@ def test_review_required_cannot_bypass_declared_receipt_through_db(
                 "diff_sha256": "a" * 64,
                 "diff_fingerprint": "a" * 64,
                 "changed_files": ["feature.ts"],
+                "diff_fingerprint_details": {
+                    "changed_files": ["feature.ts"],
+                    "patch_bytes": 42,
+                },
                 "next_owner": "agencyreviewer",
+            },
+        )
+
+
+def test_review_required_accepts_singular_fingerprint_detail_alias(
+    kanban_home: Path,
+) -> None:
+    """Older singular receipts retain one validated compatibility path."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (
+                    "task_class: implementation\n"
+                    "required_receipt: phosphene-implementation/v1\n",
+                    tid,
+                ),
+            )
+
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="review-required with singular fingerprint detail",
+            kind="review_required",
+            metadata={
+                "handoff_version": "phosphene-implementation/v1",
+                "diff_sha256": "b" * 64,
+                "diff_fingerprint": "b" * 64,
+                "changed_files": ["feature.ts"],
+                "diff_fingerprint_detail": {
+                    "changed_files": ["feature.ts"],
+                    "patch_bytes": 42,
+                },
+                "next_owner": "agencyreviewer",
+            },
+        )
+
+
+def test_review_required_rejects_missing_or_conflicting_fingerprint_detail(
+    kanban_home: Path,
+) -> None:
+    """Alias spelling cannot bypass the positive patch/manifest proof."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (
+                    "task_class: implementation\n"
+                    "required_receipt: phosphene-implementation/v1\n",
+                    tid,
+                ),
+            )
+        common = {
+            "handoff_version": "phosphene-implementation/v1",
+            "diff_sha256": "c" * 64,
+            "diff_fingerprint": "c" * 64,
+            "changed_files": ["feature.ts"],
+            "next_owner": "agencyreviewer",
+        }
+
+        with pytest.raises(ValueError, match="fingerprint_details is required"):
+            kb.block_task(
+                conn,
+                tid,
+                reason="missing fingerprint detail",
+                kind="review_required",
+                metadata=common,
+            )
+
+        with pytest.raises(ValueError, match="must not conflict"):
+            kb.block_task(
+                conn,
+                tid,
+                reason="conflicting fingerprint aliases",
+                kind="review_required",
+                metadata={
+                    **common,
+                    "diff_fingerprint_detail": {
+                        "changed_files": ["feature.ts"],
+                        "patch_bytes": 42,
+                    },
+                    "diff_fingerprint_details": {
+                        "changed_files": ["feature.ts"],
+                        "patch_bytes": 43,
+                    },
+                },
+            )
+
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_review_required_rejects_collision_disguised_as_empty_diff(
+    kanban_home: Path,
+) -> None:
+    """A no-byte collision is not an implementation artifact for Sol review."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (
+                    "task_class: implementation\n"
+                    "required_receipt: phosphene-implementation/v1\n",
+                    tid,
+                ),
+            )
+
+        with pytest.raises(ValueError, match="non-reviewable"):
+            kb.block_task(
+                conn,
+                tid,
+                reason="historical REST file list collision",
+                kind="review_required",
+                metadata={
+                    "handoff_version": "phosphene-implementation/v1",
+                    "outcome": "COLLISION",
+                    "diff_sha256": hashlib.sha256(b"").hexdigest(),
+                    "diff_fingerprint": hashlib.sha256(b"").hexdigest(),
+                    "changed_files": ["feature.ts"],
+                    "diff_fingerprint_detail": {
+                        "changed_files": [],
+                        "patch_bytes": 0,
+                    },
+                    "next_owner": "agencyreviewer",
+                },
+            )
+
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_open_pr_collision_requires_current_base_three_dot_proof(
+    kanban_home: Path,
+) -> None:
+    """REST PR-files alone cannot terminally block an implementation."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (
+                    "task_class: implementation\n"
+                    "required_receipt: phosphene-implementation/v1\n",
+                    tid,
+                ),
+            )
+
+        with pytest.raises(ValueError, match="current_base_manifest_verification"):
+            kb.block_task(
+                conn,
+                tid,
+                reason="REST says overlap",
+                metadata={
+                    "handoff_version": "phosphene-implementation/v1",
+                    "outcome": "COLLISION",
+                    "collision_kind": "open_pr_manifest_overlap",
+                },
+            )
+
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="verified current-base overlap",
+            metadata={
+                "handoff_version": "phosphene-implementation/v1",
+                "outcome": "COLLISION",
+                "collision_kind": "open_pr_manifest_overlap",
+                "current_base_manifest_verification": {
+                    "verified": True,
+                    "measurement": "git_current_base_three_dot",
+                    "overlapping_files": ["feature.ts"],
+                },
             },
         )
 
@@ -268,6 +447,45 @@ def test_review_complete_cannot_bypass_declared_receipt_through_db(
         )
 
 
+def test_recovery_review_separates_reviewed_implementation_from_authorized_target(
+    kanban_home: Path,
+) -> None:
+    """Recovery reviews must identify both the artifact and the task they unblock.
+
+    ``implementation_task_id`` is the implementation whose bytes were reviewed;
+    ``recovery_target`` is the blocked downstream card authorized to continue.
+    Conflating the two makes an exact receipt impossible for publication recovery.
+    """
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (
+                    "task_class: review\n"
+                    "required_receipt: phosphene-review/v1\n"
+                    "implementation_task_id: t_impl1234\n"
+                    "recovery_target: t_publish5678\n",
+                    tid,
+                ),
+            )
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            result="APPROVE publication recovery",
+            metadata={
+                "handoff_version": "phosphene-review/v1",
+                "outcome": "APPROVE",
+                "approved": True,
+                "implementation_task_id": "t_impl1234",
+                "reviewed_fingerprint": "a" * 64,
+                "blocking_findings": [],
+                "authorized_next_task_ids": ["t_publish5678"],
+            },
+        )
+
+
 def test_independent_review_alias_cannot_bypass_declared_receipt_through_db(
     kanban_home: Path,
 ) -> None:
@@ -302,6 +520,71 @@ def test_independent_review_alias_cannot_bypass_declared_receipt_through_db(
             )
 
         assert kb.get_task(conn, tid).status == "running"
+
+
+def test_current_source_evidence_requires_top_level_source_authority(
+    kanban_home: Path,
+) -> None:
+    """Nested source SHAs must fail while the original worker can repair them."""
+    expected_sha = "a" * 40
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (
+                    "task_class: reproduction\n"
+                    "required_receipt: phosphene-evidence/v1\n"
+                    f"expected_source_sha: {expected_sha}\n",
+                    tid,
+                ),
+            )
+
+        with pytest.raises(ValueError, match="declared evidence receipt"):
+            kb.complete_task(
+                conn,
+                tid,
+                result="reproduced",
+                metadata={
+                    "handoff_version": "phosphene-evidence/v1",
+                    "evidence": {
+                        "expected_source_sha": expected_sha,
+                        "observed_source_sha": expected_sha,
+                    },
+                },
+            )
+
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_current_source_evidence_accepts_exact_top_level_source_authority(
+    kanban_home: Path,
+) -> None:
+    """The canonical evidence receipt closes without a recovery-only rerun."""
+    expected_sha = "b" * 40
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (
+                    "task_class: reproduction\n"
+                    "required_receipt: phosphene-evidence/v1\n"
+                    f"expected_source_sha: {expected_sha}\n",
+                    tid,
+                ),
+            )
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            result="reproduced",
+            metadata={
+                "handoff_version": "phosphene-evidence/v1",
+                "expected_source_sha": expected_sha,
+                "observed_source_sha": expected_sha,
+            },
+        )
 
 
 # ---------------------------------------------------------------------------

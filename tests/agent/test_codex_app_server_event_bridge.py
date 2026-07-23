@@ -34,6 +34,7 @@ def _make_stub_agent() -> SimpleNamespace:
     """Minimal stand-in for AIAgent that records every callback fire."""
     return SimpleNamespace(
         tool_progress_callback=MagicMock(name="tool_progress_callback"),
+        _touch_activity=MagicMock(name="_touch_activity"),
         _fire_stream_delta=MagicMock(name="_fire_stream_delta"),
         _fire_reasoning_delta=MagicMock(name="_fire_reasoning_delta"),
         _emit_interim_assistant_message=MagicMock(
@@ -482,6 +483,37 @@ class TestAgentMessageInterimDispatch:
 
 
 class TestBridgeRobustness:
+    def test_valid_events_touch_worker_activity_for_kanban_heartbeat(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge({
+            "method": "item/reasoning/delta",
+            "params": {"delta": "still working"},
+        })
+        bridge(_item_started({
+            "type": "commandExecution", "id": "exec-hb", "command": "true",
+        }))
+
+        assert agent._touch_activity.call_args_list[0].args == (
+            "codex app-server event: item/reasoning/delta",
+        )
+        assert agent._touch_activity.call_args_list[1].args == (
+            "codex app-server event: item/started",
+        )
+
+    def test_activity_callback_exception_does_not_break_event_dispatch(self):
+        agent = _make_stub_agent()
+        agent._touch_activity.side_effect = RuntimeError("heartbeat unavailable")
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge({
+            "method": "item/agentMessage/delta",
+            "params": {"delta": "hello"},
+        })
+
+        agent._fire_stream_delta.assert_called_once_with("hello")
+
     def test_non_dict_notification_is_ignored(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)

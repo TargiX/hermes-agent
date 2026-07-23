@@ -25,7 +25,11 @@ def isolated_kanban_home(monkeypatch):
     monkeypatch.setenv("HERMES_HOME", test_home)
     for mod in list(sys.modules.keys()):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+            # Let monkeypatch restore the original module graph after the
+            # test.  Deleting entries directly leaves later test modules
+            # holding references to a different kanban_db singleton than
+            # the one imported through sys.modules.
+            monkeypatch.delitem(sys.modules, mod, raising=False)
     yield test_home
 
 
@@ -45,6 +49,9 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
             "max_in_progress_per_profile": 2,
             "worktree_shared_paths": ["node_modules"],
             "worktree_shared_path_overlays": {"node_modules": [".cache"]},
+            "worktree_shared_path_source_overrides": {
+                "/repo": {"node_modules": "/dependency-host/node_modules"}
+            },
         }
     }
     monkeypatch.setattr(
@@ -74,6 +81,9 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     assert captured.get("worktree_shared_paths") == ["node_modules"]
     assert captured.get("worktree_shared_path_overlays") == {
         "node_modules": [".cache"]
+    }
+    assert captured.get("worktree_shared_path_source_overrides") == {
+        "/repo": {"node_modules": "/dependency-host/node_modules"}
     }
 
 

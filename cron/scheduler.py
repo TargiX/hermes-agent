@@ -3969,22 +3969,35 @@ def tick(
                     job.get("name", job_id),
                 )
                 return None
+            # The durable execution ledger is the authority for whether a run
+            # is actually alive.  ``_running_job_ids`` is only a fast local
+            # guard and can leak when an executor future finishes durably but
+            # its wrapper never reaches the final discard (for example during
+            # pool/runtime teardown).  Consult the ledger even when the local
+            # marker is present: a successful claim proves the old marker is
+            # stale, while a rejected claim preserves normal overlap blocking.
             with _running_lock:
-                if job_id in _running_job_ids:
-                    logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                    return None
-                _running_job_ids.add(job_id)
+                had_local_marker = job_id in _running_job_ids
+                if not had_local_marker:
+                    _running_job_ids.add(job_id)
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             execution = claim_execution(job_id, source="builtin")
             if execution is None:
-                with _running_lock:
-                    _running_job_ids.discard(job_id)
+                if not had_local_marker:
+                    with _running_lock:
+                        _running_job_ids.discard(job_id)
                 logger.info(
                     "Job '%s' already has a live execution — skipping duplicate tick",
                     job.get("name", job_id),
                 )
                 return None
+            if had_local_marker:
+                logger.warning(
+                    "Job '%s' had a stale in-memory running marker; "
+                    "durable execution ledger was terminal, recovering dispatch",
+                    job.get("name", job_id),
+                )
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 

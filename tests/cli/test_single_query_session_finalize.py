@@ -268,3 +268,70 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")
+
+
+def test_kanban_quiet_single_query_disables_async_delivery_before_agent_turn(
+    monkeypatch,
+):
+    """A dispatcher worker cannot receive a detached result after ``-Q`` exits."""
+    import cli as cli_mod
+    from gateway.session_context import (
+        async_delivery_supported,
+        reset_session_vars,
+    )
+
+    observed = []
+
+    def run_conversation(*, user_message, conversation_history):
+        observed.append(async_delivery_supported())
+        return {"final_response": "done", "failed": False}
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.provider = "test-provider"
+            self.model = "test-model"
+            self.session_id = "kanban-quiet-session"
+            self.conversation_history = []
+            self._active_agent_route_signature = "same-route"
+            self.agent = SimpleNamespace(
+                session_id="kanban-quiet-session",
+                platform="cli",
+                quiet_mode=False,
+                suppress_status_output=False,
+                stream_delta_callback=object(),
+                tool_gen_callback=object(),
+                run_conversation=run_conversation,
+            )
+
+        def _claim_active_session(self, _surface, *, stderr=False):
+            return True
+
+        def _ensure_runtime_credentials(self):
+            return True
+
+        def _resolve_turn_agent_config(self, _effective_query):
+            return {
+                "signature": "same-route",
+                "model": None,
+                "runtime": None,
+                "request_overrides": None,
+            }
+
+        def _init_agent(self, **_kwargs):
+            return True
+
+    reset_session_vars()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_delegate_join")
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_mod, "_finalize_single_query", lambda _cli: None)
+
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            cli_mod.main(query="work kanban task t_delegate_join", quiet=True)
+    finally:
+        reset_session_vars()
+
+    assert exc_info.value.code == 0
+    assert observed == [False]

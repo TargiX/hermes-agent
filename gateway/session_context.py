@@ -358,9 +358,10 @@ def async_delivery_supported() -> bool:
     Returns ``False`` when the active session was bound by a stateless channel:
     an adapter that cannot route a notification back after the turn ends (the
     API server), or a one-shot runner that exits after its final response
-    (``hermes -z``, cron — see :func:`declare_stateless_channel`). The real
-    gateway platforms, the interactive CLI, and any path that never bound the
-    contextvar return ``True``.
+    (``hermes -z``, ``hermes chat -q``, cron — see
+    :func:`declare_stateless_channel`). The real gateway platforms, the
+    interactive CLI, and any path that never bound the contextvar return
+    ``True``.
 
     Tools that promise async delivery (``terminal`` notify_on_complete /
     watch_patterns, ``delegate_task`` background=True) consult this before

@@ -243,6 +243,102 @@ def test_workspace_kind_validation(kanban_home):
         kb.create_task(conn, title="bad ws", workspace_kind="cloud")
 
 
+def test_external_review_signal_requires_exact_machine_identity(kanban_home):
+    body = """task_class: reproduction
+pr_correction_authority:false
+Source: https://github.com/TargiX/nuxt-flux/pull/927#discussion_r3634104255
+"""
+    with kb.connect() as conn, pytest.raises(
+        ValueError, match="external_signal_identity_json is required"
+    ):
+        kb.create_task(conn, title="unsafe inferred signal", body=body)
+
+
+def test_external_review_signal_rejects_conflicting_thread_identity(kanban_home):
+    identity = {
+        "schema": "phosphene-external-signal/v1",
+        "repo": "TargiX/nuxt-flux",
+        "pr_number": 927,
+        "thread_id": "PRRT_exact",
+        "comment_id": 3634104255,
+        "path": "server/api/mail/unsubscribe.post.ts",
+        "url": "https://github.com/TargiX/nuxt-flux/pull/927#discussion_r3634104255",
+        "head_ref_oid": "a" * 40,
+        "classification": "non_pr_owned_base_signal",
+        "pr_correction_authority": False,
+    }
+    body = (
+        "task_class: reproduction\n"
+        "pr_correction_authority:false\n"
+        f"external_signal_identity_json: {json.dumps(identity, separators=(',', ':'))}\n"
+        "Tentative wrong thread PRRT_guessed.\n"
+    )
+    with kb.connect() as conn, pytest.raises(ValueError, match="conflicting review"):
+        kb.create_task(conn, title="conflicting signal", body=body)
+
+
+def test_external_review_signal_accepts_one_exact_identity(kanban_home):
+    identity = {
+        "schema": "phosphene-external-signal/v1",
+        "repo": "TargiX/nuxt-flux",
+        "pr_number": 927,
+        "thread_id": "PRRT_exact",
+        "comment_id": 3634104255,
+        "path": "server/api/mail/unsubscribe.post.ts",
+        "url": "https://github.com/TargiX/nuxt-flux/pull/927#discussion_r3634104255",
+        "head_ref_oid": "a" * 40,
+        "classification": "non_pr_owned_base_signal",
+        "pr_correction_authority": False,
+    }
+    body = (
+        "task_class: reproduction\n"
+        "pr_correction_authority:false\n"
+        f"external_signal_identity_json: {json.dumps(identity, separators=(',', ':'))}\n"
+        "Inspect only thread PRRT_exact.\n"
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="exact signal", body=body)
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+
+
+def test_phosphene_implementation_requires_current_base_pr_clearance(kanban_home):
+    body = (
+        "task_class: implementation\n"
+        "required_receipt: phosphene-implementation/v1\n"
+        "expected_remote: https://github.com/TargiX/nuxt-flux.git\n"
+    )
+    with kb.connect() as conn, pytest.raises(
+        ValueError, match="open_pr_path_clearance_json is required"
+    ):
+        kb.create_task(conn, title="unsafe implementation", body=body)
+
+
+def test_phosphene_implementation_accepts_verified_current_base_pr_clearance(
+    kanban_home,
+):
+    clearance = [
+        {
+            "pr_number": 927,
+            "head_sha": "a" * 40,
+            "pr_owned_manifest_verified": True,
+            "pr_owned_files": ["feature.ts"],
+        }
+    ]
+    body = (
+        "task_class: implementation\n"
+        "required_receipt: phosphene-implementation/v1\n"
+        "expected_remote: https://github.com/TargiX/nuxt-flux.git\n"
+        f"open_pr_path_clearance_json: {json.dumps(clearance, separators=(',', ':'))}\n"
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="safe implementation", body=body)
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+
+
 def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     with kb.connect() as conn:
@@ -1022,6 +1118,53 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_backs_off_consecutive_same_profile_rate_limits(
+    kanban_home, monkeypatch,
+):
+    """A failed quota probe doubles the next wait instead of hammering again."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_500_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rl-backoff", assignee="glm-worker")
+        kb.claim_task(conn, tid)
+        first_run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET profile='glm-worker', outcome='rate_limited', "
+            "status='rate_limited', ended_at=? WHERE id=?",
+            (now - 1_000, first_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        kb.claim_task(conn, tid)
+        second_run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET profile='glm-worker', outcome='rate_limited', "
+            "status='rate_limited', ended_at=? WHERE id=?",
+            (now, second_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("glm-worker exited rate-limited (quota wall)", tid),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 601)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 def test_respawn_guard_rate_limit_cooldown_zero_allows_immediately(
     kanban_home, monkeypatch,
 ):
@@ -1052,6 +1195,36 @@ def test_respawn_guard_rate_limit_cooldown_zero_allows_immediately(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_rate_limit_cooldown_is_scoped_to_previous_profile(
+    kanban_home, monkeypatch,
+):
+    """A healthy fallback owner must not inherit another profile's cooldown."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 6_500_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rl-fallback", assignee="glm-worker")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET profile='glm-worker', outcome='rate_limited', "
+            "status='rate_limited', ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', assignee='terra-fullstack', "
+            "current_run_id=NULL, claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, last_failure_error=? WHERE id=?",
+            ("glm-worker exited rate-limited (quota wall)", tid),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 1)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 def test_resolve_rate_limit_cooldown_handles_bad_env(monkeypatch):
     import hermes_cli.kanban_db as _kb
 
@@ -1063,6 +1236,35 @@ def test_resolve_rate_limit_cooldown_handles_bad_env(monkeypatch):
             _kb._resolve_rate_limit_cooldown_seconds()
             == _kb.DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
         )
+
+
+def test_resolve_rate_limit_cooldown_reads_behavioral_config(monkeypatch):
+    """Operator cadence belongs in config.yaml; env remains an override."""
+    import hermes_cli.config as _config
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.delenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", raising=False)
+    monkeypatch.setattr(
+        _config,
+        "load_config",
+        lambda: {"kanban": {"rate_limit_cooldown_seconds": 1800}},
+    )
+
+    assert _kb._resolve_rate_limit_cooldown_seconds() == 1800
+
+
+def test_rate_limit_cooldown_env_keeps_explicit_override_precedence(monkeypatch):
+    import hermes_cli.config as _config
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "60")
+    monkeypatch.setattr(
+        _config,
+        "load_config",
+        lambda: {"kanban": {"rate_limit_cooldown_seconds": 1800}},
+    )
+
+    assert _kb._resolve_rate_limit_cooldown_seconds() == 60
 
 
 def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch):
@@ -1681,6 +1883,40 @@ def test_comments_recorded_in_order(kanban_home):
     assert [c.author for c in comments] == ["user", "researcher"]
 
 
+def test_consecutive_duplicate_comment_is_idempotent_for_retry_window(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setattr(kb.time, "time", lambda: 1_000)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x")
+        first_id = kb.add_comment(conn, task_id, "worker", "same closeout")
+        retry_id = kb.add_comment(conn, task_id, "worker", " same closeout ")
+        comments = kb.list_comments(conn, task_id)
+        commented_events = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "commented"
+        ]
+
+    assert retry_id == first_id
+    assert [comment.body for comment in comments] == ["same closeout"]
+    assert len(commented_events) == 1
+
+
+def test_duplicate_comment_after_intervening_comment_is_preserved(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x")
+        kb.add_comment(conn, task_id, "worker", "repeatable evidence")
+        kb.add_comment(conn, task_id, "reviewer", "new context")
+        kb.add_comment(conn, task_id, "worker", "repeatable evidence")
+        comments = kb.list_comments(conn, task_id)
+
+    assert [comment.body for comment in comments] == [
+        "repeatable evidence",
+        "new context",
+        "repeatable evidence",
+    ]
+
+
 def test_empty_comment_rejected(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x")
@@ -2028,6 +2264,54 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
     assert reason is None
 
 
+def test_respawn_guard_timeout_without_checkpoint_has_short_cooldown(kanban_home):
+    """A timed-out run must not repeat its whole scope in the same tick."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="timed-out", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'timed_out', 'timed_out', ?, ?)",
+            (t, now - 600, now),
+        )
+        assert kb.check_respawn_guard(conn, t) == "timeout_cooldown"
+
+
+def test_respawn_guard_timeout_checkpoint_allows_narrow_retry(kanban_home):
+    """A durable worker checkpoint is enough to resume without cooldown."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="resume-timeout", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, summary, started_at, ended_at) "
+            "VALUES (?, 'timed_out', 'timed_out', ?, ?, ?)",
+            (t, "Only the exact focused assertion remains.", now - 600, now),
+        )
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_timeout_lead_checkpoint_allows_narrow_retry(kanban_home):
+    """Lead can add a machine checkpoint when the killed worker could not."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="recover-timeout", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'timed_out', 'timed_out', ?, ?)",
+            (t, now - 600, now),
+        )
+        kb.add_comment(
+            conn,
+            t,
+            "lead",
+            "TIMEOUT_RECOVERY_CHECKPOINT_V1: rerun only the final assertion",
+        )
+        assert kb.check_respawn_guard(conn, t) is None
+
+
 def test_respawn_guard_active_pr_in_comment(kanban_home):
     """A GitHub PR URL in a recent comment triggers active_pr."""
     with kb.connect() as conn:
@@ -2070,6 +2354,42 @@ def test_respawn_guard_active_pr_bypassed_by_forced_evidence_recovery(kanban_hom
         )
 
         assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_active_pr_bypassed_by_explicit_unblock_after_comment(
+    kanban_home,
+):
+    """A deliberate same-card retry must not be trapped by its PR receipt."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="verify-existing-pr", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "Existing https://github.com/example/repo/pull/42 needs closeout",
+        )
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (t,))
+        assert kb.unblock_task(conn, t) is True
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_active_pr_not_bypassed_by_unblock_before_comment(
+    kanban_home,
+):
+    """Only a requeue after the PR comment is explicit recovery authority."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="still-protect-pr", assignee="alice")
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (t,))
+        assert kb.unblock_task(conn, t) is True
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "Opened https://github.com/example/repo/pull/42 after the requeue",
+        )
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
 
 
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
@@ -2426,6 +2746,158 @@ def test_worktree_workspace_branches_from_fetched_origin_tip(kanban_home, tmp_pa
     )
 
 
+def test_existing_read_only_evidence_worktree_fast_forwards_to_fetched_tip(
+    kanban_home, tmp_path,
+):
+    seed = tmp_path / "seed"
+    _init_git_repo(seed)
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(remote), "symbolic-ref", "HEAD", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(seed), "remote", "add", "origin", str(remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(seed), "push", "-u", "origin", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    primary = tmp_path / "primary"
+    subprocess.run(
+        ["git", "clone", str(remote), str(primary)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="refresh evidence",
+            body=(
+                "task_class: evidence\n"
+                "READ_ONLY_EVIDENCE_SOURCE_REFRESH_V1\n"
+            ),
+            workspace_kind="worktree",
+            workspace_path=str(primary),
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+    old_head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    (seed / "fresh.txt").write_text("fresh remote source\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(seed), "add", "fresh.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(seed), "commit", "-m", "fresh source"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(seed), "push", "origin", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    remote_head = subprocess.run(
+        ["git", "-C", str(seed), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    kb._resolve_worktree_workspace(task)
+
+    refreshed_head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert refreshed_head == remote_head
+    assert refreshed_head != old_head
+    assert (workspace / "fresh.txt").read_text(encoding="utf-8") == (
+        "fresh remote source\n"
+    )
+
+
+def test_existing_implementation_worktree_never_auto_refreshes(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="frozen implementation",
+            body=(
+                "task_class: implementation\n"
+                "READ_ONLY_EVIDENCE_SOURCE_REFRESH_V1\n"
+            ),
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+
+    old_head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "new.txt").write_text("new primary bytes\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "new.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "advance primary"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    kb._resolve_worktree_workspace(task)
+
+    observed_head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert observed_head == old_head
+    assert not (workspace / "new.txt").exists()
+
+
 def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path):
     """A worktree task created with no explicit path inherits the board's
     default_workdir as its anchor and materializes a per-task linked worktree
@@ -2653,6 +3125,89 @@ def test_dispatch_worktree_shared_path_overlay_keeps_declared_child_local(
         "bin_target": (shared_dependencies / ".bin").resolve(),
         "nuxt_target": (shared_dependencies / "nuxt").resolve(),
     }
+
+
+def test_dispatch_worktree_uses_repo_scoped_shared_path_source_override(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    stale_dependencies = repo / "node_modules"
+    stale_dependencies.mkdir()
+    (stale_dependencies / "stale").mkdir()
+    canonical_dependencies = tmp_path / "dependency-host" / "node_modules"
+    (canonical_dependencies / ".cache").mkdir(parents=True)
+    (canonical_dependencies / "nuxt").mkdir()
+    kb.create_board("worktree-shared-source-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    observed: dict[str, object] = {}
+
+    def fake_spawn(task, workspace, board=None):
+        destination = Path(workspace) / "node_modules"
+        observed["marker"] = json.loads(
+            (destination / ".hermes-worktree-overlay.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        observed["nuxt_target"] = (destination / "nuxt").resolve(strict=True)
+        observed["stale_visible"] = (destination / "stale").exists()
+        return None
+
+    with kb.connect(board="worktree-shared-source-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="worktree-shared-source-board",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            board="worktree-shared-source-board",
+            worktree_shared_paths=["node_modules"],
+            worktree_shared_path_overlays={"node_modules": [".cache"]},
+            worktree_shared_path_source_overrides={
+                str(repo.resolve()): {
+                    "node_modules": str(canonical_dependencies.resolve())
+                }
+            },
+        )
+
+    expected = repo / ".worktrees" / tid
+    assert result.spawned == [(tid, "sentinel", str(expected))]
+    assert observed == {
+        "marker": {
+            "version": 1,
+            "source": str(canonical_dependencies.resolve()),
+            "local_children": [".cache"],
+        },
+        "nuxt_target": (canonical_dependencies / "nuxt").resolve(),
+        "stale_visible": False,
+    }
+
+
+def test_set_task_skills_repairs_blocked_worker_without_replacing_card(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="repair worker context",
+            assignee="worker",
+            skills=["orchestrator-only"],
+        )
+        kb.block_task(conn, tid, reason="worker skill unavailable", kind="capability")
+
+        assert kb.set_task_skills(conn, tid, []) is True
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.id == tid
+    assert task.status == "blocked"
+    assert task.skills is None
 
 
 def test_worktree_shared_path_overlay_migrates_matching_legacy_link_and_reuses_it(
