@@ -164,6 +164,53 @@ def test_agency_overview_combines_open_work_across_active_boards(client):
     }["growth"] == 2
 
 
+def test_agency_overview_exposes_latest_meaningful_worker_heartbeat(client):
+    """The live canvas gets explicit progress without exposing hidden reasoning."""
+    kb.create_board("engineering", name="Engineering Agency")
+    with kb.connect(board="engineering") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Reconcile current PR state",
+            assignee="terra-fullstack",
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'running' WHERE id = ?",
+            (task_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'heartbeat', ?, ?)
+            """,
+            (
+                task_id,
+                json.dumps({"note": "Inspecting the two remaining conflicts."}),
+                int(time.time()) - 2,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, kind, payload, created_at)
+            VALUES (?, 'heartbeat', NULL, ?)
+            """,
+            (task_id, int(time.time()) - 1),
+        )
+        conn.commit()
+
+    response = client.get("/api/plugins/kanban/agency-overview")
+
+    assert response.status_code == 200
+    task = next(
+        task
+        for column in response.json()["columns"]
+        for task in column["tasks"]
+        if task["id"] == task_id
+    )
+    assert task["live_activity_note"] == (
+        "Inspecting the two remaining conflicts."
+    )
+
+
 def test_agency_overview_exposes_active_controller_cron_runs(
     client,
     kanban_home,

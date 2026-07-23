@@ -1599,6 +1599,51 @@
     return labels[kind] || "Active work";
   }
 
+  function yardCondenseActivity(raw, maxChars) {
+    const value = String(raw || "").replace(/\s+/g, " ").trim();
+    if (!value) return "";
+    if (value.length <= maxChars) return value;
+    const clipped = value.slice(0, Math.max(1, maxChars - 1));
+    const boundary = clipped.lastIndexOf(" ");
+    return (boundary > maxChars * 0.58 ? clipped.slice(0, boundary) : clipped) + "…";
+  }
+
+  function yardAgentActivity(agent) {
+    if (agent.focus) {
+      const heartbeat = yardCondenseActivity(
+        agent.focus.live_activity_note,
+        104,
+      );
+      if (heartbeat) {
+        return { label: "LIVE UPDATE", text: heartbeat, source: "heartbeat" };
+      }
+      return {
+        label: "ACTIVE TASK",
+        text: yardCondenseActivity(
+          agent.focus.title || "Assigned product work",
+          88,
+        ),
+        source: "assignment",
+      };
+    }
+    const controller = (agent.activeControllers || [])[0];
+    if (!controller) return null;
+    const kind = yardControllerActivityKind(controller);
+    const role = String(controller.role || yardActivityLabel(kind));
+    const roleParts = role.split(/\s+[—–]\s+/);
+    const detail = roleParts.length > 1
+      ? roleParts.slice(1).join(" — ")
+      : role;
+    return {
+      label: "LIVE RUN",
+      text: yardCondenseActivity(
+        `${yardActivityLabel(kind)} · ${detail}`,
+        88,
+      ),
+      source: "controller",
+    };
+  }
+
   function buildYardScene(board, profiles) {
     const roster = buildYardRoster(board, profiles);
     const allTasks = [];
@@ -2043,6 +2088,71 @@
     ctx.restore();
   }
 
+  function yardDrawActivityBubble(
+    ctx,
+    agent,
+    x,
+    y,
+    bubbleX,
+    bubbleWidth,
+    phase,
+  ) {
+    const activity = yardAgentActivity(agent);
+    if (!activity) return;
+    const color = yardStateColor(agent.state);
+    const bob = Math.sin(phase * 3 + x * 0.01) * 2;
+    const drawY = y + bob;
+    const centerY = drawY - 82;
+    const height = 50;
+    const left = bubbleX - bubbleWidth / 2;
+    const top = centerY - height / 2;
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,0.32)";
+    ctx.shadowBlur = 10;
+    yardRoundedRect(ctx, left, top, bubbleWidth, height, 11);
+    ctx.fillStyle = "rgba(234,240,236,0.96)";
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = 0.82;
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    const tailDirection = bubbleX >= x ? 1 : -1;
+    const tailPoints = [
+      { x: x + tailDirection * 8, y: drawY - 34, radius: 2.2 },
+      { x: x + tailDirection * 14, y: drawY - 44, radius: 3.2 },
+      { x: x + tailDirection * 20, y: drawY - 55, radius: 4.2 },
+    ];
+    ctx.fillStyle = "rgba(234,240,236,0.96)";
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    tailPoints.forEach(function (point) {
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, point.radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    });
+
+    ctx.textAlign = "center";
+    ctx.fillStyle = color;
+    ctx.font = "800 6px ui-monospace, monospace";
+    ctx.fillText(activity.label, bubbleX, centerY - 11);
+    ctx.fillStyle = YARD_CANVAS_COLORS.ink;
+    ctx.font = "650 8px ui-sans-serif, system-ui, sans-serif";
+    yardDrawWrapped(
+      ctx,
+      activity.text,
+      bubbleX,
+      centerY + 3,
+      bubbleWidth - 16,
+      10,
+      2,
+    );
+    ctx.restore();
+  }
+
   function yardDrawMission(ctx, mission, x, y, keyboardSelected, phase) {
     const color = yardStateColor(mission.status);
     const active = mission.status === "running" || mission.status === "supervising";
@@ -2267,6 +2377,10 @@
               h("span", { className: "hermes-canvas-tooltip-section-label" },
                 "ACTIVE TASK RUN"),
               h("strong", null, focus.title || "Untitled task"),
+              focus.live_activity_note
+                ? h("p", { className: "hermes-canvas-tooltip-description" },
+                    yardCondenseActivity(focus.live_activity_note, 180))
+                : null,
               h("code", null,
                 `${focus.board_name ? focus.board_name + " · " : ""}${focus.id} · P${focus.priority || 0}`),
             )
@@ -2646,6 +2760,16 @@
             const baseRadius = 64;
             const x = item.x + Math.cos(angle) * baseRadius;
             const y = item.y + Math.sin(angle) * baseRadius * 0.64;
+            const bubbleWidth = Math.min(
+              144,
+              Math.max(96, (layout.columnWidth - 12) / agents.length),
+            );
+            const bubbleSpacing = Math.min(
+              150,
+              Math.max(104, layout.columnWidth / agents.length),
+            );
+            const bubbleX = item.x +
+              (index - (agents.length - 1) / 2) * bubbleSpacing;
             const color = yardStateColor(agent.state);
             ctx.save();
             ctx.strokeStyle = color;
@@ -2657,7 +2781,13 @@
             ctx.stroke();
             ctx.restore();
             item.agentLayouts = item.agentLayouts || [];
-            item.agentLayouts.push({ agent, x, y });
+            item.agentLayouts.push({
+              agent,
+              x,
+              y,
+              bubbleX,
+              bubbleWidth,
+            });
           });
         });
 
@@ -2700,6 +2830,15 @@
             mission: item.mission,
           });
           for (const placed of item.agentLayouts || []) {
+            yardDrawActivityBubble(
+              ctx,
+              placed.agent,
+              placed.x,
+              placed.y,
+              placed.bubbleX,
+              placed.bubbleWidth,
+              phase,
+            );
             yardDrawAgent(
               ctx,
               placed.agent,
@@ -2887,6 +3026,10 @@
         "data-active-agent-names": workingRows.map(function (row) {
           return row.name;
         }).join(","),
+        "data-live-activity-summaries": workingRows.map(function (row) {
+          const activity = yardAgentActivity(row);
+          return activity ? `${row.name}: ${activity.text}` : row.name;
+        }).join(" | "),
         "data-agents-at-base": baseRows.length,
         "data-base-agent-names": baseRows.map(function (row) {
           return row.name;
@@ -3073,7 +3216,8 @@
         h("span", null, h("i", { className: "is-supervising" }), "Planning, review, or control work"),
         h("span", null, h("i", { className: "is-idle" }), "Agent at home base"),
         h("span", null, h("i", { className: "is-running" }), "Product implementation"),
-        h("strong", null, "A named agent beside active work means a live run exists."),
+        h("strong", null,
+          "Activity bubbles summarize explicit heartbeats or assignments—not private reasoning."),
       ),
     );
   }

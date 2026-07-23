@@ -267,6 +267,38 @@ def _json_object(raw: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _latest_running_activity_notes(
+    conn: sqlite3.Connection,
+) -> dict[str, str]:
+    """Return the latest explicit worker heartbeat note for running tasks.
+
+    Heartbeat notes are worker-authored progress receipts, not model
+    chain-of-thought. Null heartbeats only refresh claim liveness, so they do
+    not replace the last meaningful note while the same task is still running.
+    """
+    notes: dict[str, str] = {}
+    rows = conn.execute(
+        """
+        SELECT e.task_id, e.payload
+        FROM task_events e
+        JOIN tasks t ON t.id = e.task_id
+        WHERE t.status = 'running'
+          AND e.kind = 'heartbeat'
+          AND e.payload IS NOT NULL
+        ORDER BY e.id DESC
+        """
+    ).fetchall()
+    for row in rows:
+        task_id = str(row["task_id"])
+        if task_id in notes:
+            continue
+        payload = _json_object(row["payload"])
+        note = " ".join(str(payload.get("note") or "").split())
+        if note:
+            notes[task_id] = note[:240]
+    return notes
+
+
 def _controller_timestamp(raw: Any) -> int | None:
     if not raw:
         return None
@@ -1109,6 +1141,7 @@ def get_board(
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        activity_notes = _latest_running_activity_notes(conn)
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -1116,6 +1149,7 @@ def get_board(
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
             d = _task_dict(t, latest_summary=preview)
+            d["live_activity_note"] = activity_notes.get(t.id)
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -1209,6 +1243,7 @@ def get_agency_overview():
             ]
             open_ids = {task.id for task in tasks}
             summary_map = kanban_db.latest_summaries(conn, list(open_ids))
+            activity_notes = _latest_running_activity_notes(conn)
             for task in tasks:
                 summary = summary_map.get(task.id)
                 item = _task_dict(
@@ -1217,6 +1252,7 @@ def get_agency_overview():
                         summary[:_CARD_SUMMARY_PREVIEW_CHARS] if summary else None
                     ),
                 )
+                item["live_activity_note"] = activity_notes.get(task.id)
                 item["board_slug"] = slug
                 item["board_name"] = name
                 column = task.status if task.status in columns else "todo"
