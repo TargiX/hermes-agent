@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from dataclasses import asdict
@@ -54,6 +55,102 @@ from hermes_cli import kanban_diagnostics as kd
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _agency_controller_roster() -> list[dict[str, Any]]:
+    """Return machine-configured supervisors that do not own Kanban cards.
+
+    Product workers are visible through task claims. Lead/operator cron runs
+    live in separate execution ledgers, so treating the board as the entire
+    runtime made an active supervisor look idle. The optional runtime manifest
+    joins those ledgers without guessing roles from prompt text or profile
+    names.
+    """
+    hermes_home = Path(
+        os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
+    ).expanduser()
+    manifest_path = hermes_home / "runtime/agency-controllers.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+
+    raw_controllers = manifest.get("controllers")
+    if not isinstance(raw_controllers, list):
+        return []
+
+    controllers: list[dict[str, Any]] = []
+    for raw in raw_controllers[:16]:
+        if not isinstance(raw, dict):
+            continue
+        profile = str(raw.get("profile") or "").strip()
+        role = str(raw.get("role") or "").strip()
+        job_id = str(raw.get("job_id") or "").strip()
+        cron_profile = str(raw.get("cron_profile") or "default").strip()
+        if (
+            not profile
+            or not role
+            or not job_id
+            or not cron_profile
+            or "/" in cron_profile
+            or "\\" in cron_profile
+            or cron_profile in {".", ".."}
+        ):
+            continue
+        profile_home = (
+            hermes_home
+            if cron_profile == "default"
+            else hermes_home / "profiles" / cron_profile
+        )
+        executions_database = profile_home / "cron/executions.db"
+        latest: dict[str, Any] | None = None
+        try:
+            connection = sqlite3.connect(
+                f"file:{executions_database}?mode=ro",
+                uri=True,
+            )
+            connection.row_factory = sqlite3.Row
+            try:
+                row = connection.execute(
+                    """
+                    SELECT id, status, claimed_at, started_at, finished_at, error
+                    FROM executions
+                    WHERE job_id = ?
+                    ORDER BY claimed_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (job_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+            if row is not None:
+                latest = {
+                    "execution_id": str(row["id"]),
+                    "status": str(row["status"]),
+                    "claimed_at": row["claimed_at"],
+                    "started_at": row["started_at"],
+                    "finished_at": row["finished_at"],
+                    "error": str(row["error"] or ""),
+                }
+        except (OSError, sqlite3.Error):
+            latest = None
+
+        execution_status = str((latest or {}).get("status") or "")
+        controllers.append(
+            {
+                "profile": profile,
+                "role": role,
+                "job_id": job_id,
+                "cron_profile": cron_profile,
+                "state": (
+                    "running"
+                    if execution_status in {"claimed", "running"}
+                    else "idle"
+                ),
+                "latest_execution": latest,
+            }
+        )
+    return controllers
 
 
 # ---------------------------------------------------------------------------
@@ -406,17 +503,28 @@ def get_board(
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
         )
-        # Pre-fetch link counts per task (cheap: one query).
+        returned_task_ids = {task.id for task in tasks}
+        # Pre-fetch dependency links once. The compact graph is returned with
+        # the board so alternate visualizations can group several agent-owned
+        # cards into one shared mission instead of drawing the same work once
+        # per assignee.
+        link_rows = conn.execute(
+            "SELECT parent_id, child_id FROM task_links "
+            "ORDER BY parent_id, child_id"
+        ).fetchall()
         link_counts: dict[str, dict[str, int]] = {}
-        for row in conn.execute(
-            "SELECT parent_id, child_id FROM task_links"
-        ).fetchall():
+        for row in link_rows:
             link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})[
                 "children"
             ] += 1
             link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})[
                 "parents"
             ] += 1
+        relation_rows = conn.execute(
+            "SELECT source_task_id, target_task_id, relation "
+            "FROM task_relations "
+            "ORDER BY created_at, source_task_id, target_task_id, relation"
+        ).fetchall()
 
         # Comment + event counts (both cheap aggregates).
         comment_counts: dict[str, int] = {
@@ -503,11 +611,126 @@ def get_board(
             ],
             "tenants": tenants,
             "assignees": assignees,
+            "graph": {
+                "links": [
+                    {
+                        "parent_id": row["parent_id"],
+                        "child_id": row["child_id"],
+                    }
+                    for row in link_rows
+                    if row["parent_id"] in returned_task_ids
+                    and row["child_id"] in returned_task_ids
+                ],
+                "relations": [
+                    {
+                        "source_task_id": row["source_task_id"],
+                        "target_task_id": row["target_task_id"],
+                        "relation": row["relation"],
+                    }
+                    for row in relation_rows
+                    if row["source_task_id"] in returned_task_ids
+                    and row["target_task_id"] in returned_task_ids
+                ],
+            },
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }
     finally:
         conn.close()
+
+
+@router.get("/agency-overview")
+def get_agency_overview():
+    """Return open work from every active board for the shared agency map.
+
+    Editing and event streams remain board-scoped. This compact read model is
+    intentionally cross-board: a growth agent must not look idle merely
+    because the operator currently has the engineering board selected.
+    """
+    columns: dict[str, list[dict[str, Any]]] = {
+        name: [] for name in BOARD_COLUMNS if name != "done"
+    }
+    graph_links: list[dict[str, str]] = []
+    graph_relations: list[dict[str, str]] = []
+    sources: list[dict[str, Any]] = []
+
+    for board_meta in kanban_db.list_boards(include_archived=False):
+        slug = str(board_meta.get("slug") or "default")
+        name = str(board_meta.get("name") or slug)
+        conn = kanban_db.connect(board=slug)
+        try:
+            tasks = [
+                task
+                for task in kanban_db.list_tasks(conn, include_archived=False)
+                if task.status != "done"
+            ]
+            open_ids = {task.id for task in tasks}
+            summary_map = kanban_db.latest_summaries(conn, list(open_ids))
+            for task in tasks:
+                summary = summary_map.get(task.id)
+                item = _task_dict(
+                    task,
+                    latest_summary=(
+                        summary[:_CARD_SUMMARY_PREVIEW_CHARS] if summary else None
+                    ),
+                )
+                item["board_slug"] = slug
+                item["board_name"] = name
+                column = task.status if task.status in columns else "todo"
+                columns[column].append(item)
+
+            def task_key(task_id: str) -> str:
+                return f"{slug}:{task_id}"
+
+            for row in conn.execute(
+                "SELECT parent_id, child_id FROM task_links "
+                "ORDER BY parent_id, child_id"
+            ).fetchall():
+                if row["parent_id"] in open_ids and row["child_id"] in open_ids:
+                    graph_links.append(
+                        {
+                            "parent_id": task_key(row["parent_id"]),
+                            "child_id": task_key(row["child_id"]),
+                        }
+                    )
+            for row in conn.execute(
+                "SELECT source_task_id, target_task_id, relation "
+                "FROM task_relations "
+                "ORDER BY created_at, source_task_id, target_task_id, relation"
+            ).fetchall():
+                if (
+                    row["source_task_id"] in open_ids
+                    and row["target_task_id"] in open_ids
+                ):
+                    graph_relations.append(
+                        {
+                            "source_task_id": task_key(row["source_task_id"]),
+                            "target_task_id": task_key(row["target_task_id"]),
+                            "relation": row["relation"],
+                        }
+                    )
+            sources.append(
+                {
+                    "slug": slug,
+                    "name": name,
+                    "open_tasks": len(tasks),
+                }
+            )
+        finally:
+            conn.close()
+
+    return {
+        "columns": [
+            {"name": name, "tasks": columns[name]} for name in columns.keys()
+        ],
+        "graph": {
+            "links": graph_links,
+            "relations": graph_relations,
+        },
+        "boards": sources,
+        "controllers": _agency_controller_roster(),
+        "now": int(time.time()),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2183,6 +2406,7 @@ def list_profile_roster():
                 "provider": p.provider or "",
                 "description": p.description or "",
                 "description_auto": bool(p.description_auto),
+                "agency": p.agency or "",
                 "skill_count": int(p.skill_count or 0),
             }
             for p in profiles

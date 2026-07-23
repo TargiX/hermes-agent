@@ -1590,3 +1590,630 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* ---- Agency yard live map ------------------------------------------- */
+
+.hermes-kanban-view-switcher {
+  display: inline-flex;
+  align-self: flex-start;
+  padding: 0.2rem;
+  gap: 0.2rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.65rem;
+  background: color-mix(in srgb, var(--color-card) 92%, transparent);
+}
+
+.hermes-kanban-view-button {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.42rem;
+  min-height: 2rem;
+  padding: 0.35rem 0.7rem;
+  border: 0;
+  border-radius: 0.45rem;
+  background: transparent;
+  color: var(--color-muted-foreground);
+  font: 600 0.75rem/1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  cursor: pointer;
+  transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
+}
+
+.hermes-kanban-view-button:hover {
+  color: var(--color-foreground);
+  background: color-mix(in srgb, var(--color-foreground) 6%, transparent);
+}
+
+.hermes-kanban-view-button--active {
+  color: var(--color-foreground);
+  background: var(--color-background);
+  box-shadow: 0 1px 3px color-mix(in srgb, #10252f 16%, transparent);
+}
+
+.hermes-kanban-view-button:focus-visible,
+.hermes-yard-action:focus-visible,
+.hermes-agency-canvas:focus-visible,
+.hermes-canvas-selection button:focus-visible {
+  outline: 2px solid #55d6a3;
+  outline-offset: 2px;
+}
+
+.hermes-kanban-view-icon {
+  font: 700 0.9rem/1 var(--font-mono, ui-monospace, monospace);
+}
+
+.hermes-agency-yard {
+  --yard-ink: #10252f;
+  --yard-blue: #2d6c82;
+  --yard-mint: #55d6a3;
+  --yard-amber: #f4b942;
+  --yard-coral: #f06a5b;
+  --yard-review: #75aef0;
+  --yard-control: #56c7dd;
+  --yard-fog: #eaf0ec;
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  padding: clamp(1rem, 2vw, 1.65rem);
+  border: 1px solid color-mix(in srgb, var(--yard-blue) 52%, var(--color-border));
+  border-radius: 1rem;
+  color: var(--yard-fog);
+  background:
+    radial-gradient(circle at 86% 8%, color-mix(in srgb, var(--yard-blue) 44%, transparent), transparent 28rem),
+    linear-gradient(145deg, #0c2028 0%, var(--yard-ink) 58%, #163441 100%);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, white 8%, transparent),
+    0 18px 42px color-mix(in srgb, #061216 22%, transparent);
+}
+
+.hermes-agency-yard::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  opacity: 0.22;
+  pointer-events: none;
+  background-image:
+    linear-gradient(color-mix(in srgb, var(--yard-fog) 7%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--yard-fog) 7%, transparent) 1px, transparent 1px);
+  background-size: 26px 26px;
+  mask-image: linear-gradient(to bottom, black, transparent 72%);
+}
+
+.hermes-yard-masthead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.hermes-yard-title-block {
+  max-width: 46rem;
+}
+
+.hermes-yard-kicker {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-bottom: 0.38rem;
+  color: color-mix(in srgb, var(--yard-mint) 86%, white);
+  font: 700 0.64rem/1.2 var(--font-mono, ui-monospace, monospace);
+  letter-spacing: 0.15em;
+}
+
+.hermes-yard-live-dot {
+  width: 0.48rem;
+  height: 0.48rem;
+  border-radius: 50%;
+  background: var(--yard-mint);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--yard-mint) 55%, transparent);
+  animation: hermes-yard-live 2.2s ease-out infinite;
+}
+
+.hermes-yard-title-block h2 {
+  margin: 0;
+  color: #fff;
+  font: 740 clamp(1.45rem, 3vw, 2.35rem)/1.02 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  letter-spacing: -0.045em;
+}
+
+.hermes-yard-title-block p {
+  max-width: 42rem;
+  margin: 0.55rem 0 0;
+  color: color-mix(in srgb, var(--yard-fog) 72%, transparent);
+  font: 400 0.78rem/1.55 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+}
+
+.hermes-yard-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.45rem;
+}
+
+.hermes-yard-action {
+  appearance: none;
+  min-height: 2rem;
+  padding: 0.4rem 0.68rem;
+  border: 1px solid color-mix(in srgb, var(--yard-fog) 18%, transparent);
+  border-radius: 0.45rem;
+  background: color-mix(in srgb, var(--yard-fog) 5%, transparent);
+  color: var(--yard-fog);
+  font: 650 0.68rem/1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  cursor: pointer;
+}
+
+.hermes-yard-action:hover {
+  background: color-mix(in srgb, var(--yard-fog) 11%, transparent);
+  border-color: color-mix(in srgb, var(--yard-fog) 32%, transparent);
+}
+
+.hermes-yard-action--primary {
+  border-color: color-mix(in srgb, var(--yard-mint) 42%, transparent);
+  background: color-mix(in srgb, var(--yard-mint) 15%, transparent);
+  color: color-mix(in srgb, var(--yard-mint) 72%, white);
+}
+
+.hermes-yard-metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.55rem;
+  margin-bottom: 0.75rem;
+}
+
+.hermes-yard-metric {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+  padding: 0.58rem 0.68rem;
+  border: 1px solid color-mix(in srgb, var(--yard-fog) 12%, transparent);
+  border-left: 3px solid var(--yard-blue);
+  border-radius: 0.5rem;
+  background: color-mix(in srgb, #07171d 54%, transparent);
+}
+
+.hermes-yard-metric--running { border-left-color: var(--yard-mint); }
+.hermes-yard-metric--supervising { border-left-color: var(--yard-control); }
+.hermes-yard-metric--ready { border-left-color: var(--yard-amber); }
+.hermes-yard-metric--review { border-left-color: var(--yard-review); }
+.hermes-yard-metric--blocked { border-left-color: var(--yard-coral); }
+.hermes-yard-metric--idle { border-left-color: color-mix(in srgb, var(--yard-fog) 42%, transparent); }
+
+.hermes-yard-metric-value {
+  color: #fff;
+  font: 760 1.22rem/1 var(--font-mono, ui-monospace, monospace);
+}
+
+.hermes-yard-metric-label {
+  overflow: hidden;
+  color: color-mix(in srgb, var(--yard-fog) 66%, transparent);
+  font: 600 0.64rem/1.15 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hermes-agency-canvas-wrap {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--yard-fog) 14%, transparent);
+  border-radius: 0.78rem;
+  background: #0a1d25;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, white 5%, transparent),
+    inset 0 -26px 70px color-mix(in srgb, #061216 28%, transparent);
+}
+
+.hermes-agency-canvas {
+  display: block;
+  max-width: 100%;
+  touch-action: manipulation;
+}
+
+.hermes-canvas-tooltip {
+  position: fixed;
+  z-index: 6;
+  padding: 0.76rem 0.8rem 0.7rem;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--tooltip-tone) 42%, rgba(234, 240, 236, 0.14));
+  border-top: 3px solid var(--tooltip-tone);
+  border-radius: 0.62rem;
+  color: var(--yard-fog);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--tooltip-tone) 12%, transparent), transparent 42%),
+    rgba(7, 23, 29, 0.97);
+  box-shadow:
+    0 16px 38px rgba(3, 12, 16, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  pointer-events: none;
+  backdrop-filter: blur(16px);
+  animation: hermes-canvas-tooltip-in 110ms ease-out both;
+}
+
+.hermes-canvas-tooltip-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.58rem;
+}
+
+.hermes-canvas-tooltip-avatar {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 2.15rem;
+  height: 2.15rem;
+  border: 1px solid color-mix(in srgb, var(--tooltip-tone) 62%, white);
+  border-radius: 0.58rem 0.58rem 0.22rem 0.22rem;
+  color: #fff;
+  background: color-mix(in srgb, var(--tooltip-tone) 62%, #0a1d25);
+  font: 760 0.65rem/1 var(--font-mono, ui-monospace, monospace);
+}
+
+.hermes-canvas-tooltip-heading {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.hermes-canvas-tooltip-heading strong {
+  color: #fff;
+  font: 690 0.76rem/1.32 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  overflow-wrap: anywhere;
+}
+
+.hermes-canvas-tooltip-kicker,
+.hermes-canvas-tooltip-section-label {
+  color: color-mix(in srgb, var(--tooltip-tone) 72%, white);
+  font: 720 0.48rem/1.2 var(--font-mono, ui-monospace, monospace);
+  letter-spacing: 0.12em;
+}
+
+.hermes-canvas-tooltip-status {
+  flex: 0 0 auto;
+  padding: 0.22rem 0.36rem;
+  border: 1px solid color-mix(in srgb, var(--tooltip-status) 46%, transparent);
+  border-radius: 999px;
+  color: color-mix(in srgb, var(--tooltip-status) 78%, white);
+  background: color-mix(in srgb, var(--tooltip-status) 12%, transparent);
+  font: 680 0.5rem/1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  white-space: nowrap;
+}
+
+.hermes-canvas-tooltip-model {
+  margin-top: 0.42rem;
+  color: color-mix(in srgb, var(--yard-fog) 62%, transparent);
+  font: 620 0.57rem/1.3 var(--font-mono, ui-monospace, monospace);
+}
+
+.hermes-canvas-tooltip-description {
+  margin: 0.58rem 0 0;
+  color: color-mix(in srgb, var(--yard-fog) 72%, transparent);
+  font: 430 0.63rem/1.48 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+}
+
+.hermes-canvas-tooltip-description.is-muted {
+  color: color-mix(in srgb, var(--yard-fog) 43%, transparent);
+}
+
+.hermes-canvas-tooltip-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 0.65rem;
+  padding: 0.55rem 0;
+  border-top: 1px solid color-mix(in srgb, var(--yard-fog) 11%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--yard-fog) 11%, transparent);
+}
+
+.hermes-canvas-tooltip-facts > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.18rem;
+  padding: 0 0.48rem;
+  border-left: 1px solid color-mix(in srgb, var(--yard-fog) 9%, transparent);
+}
+
+.hermes-canvas-tooltip-facts > span:first-child {
+  padding-left: 0;
+  border-left: 0;
+}
+
+.hermes-canvas-tooltip-facts small {
+  overflow: hidden;
+  color: color-mix(in srgb, var(--yard-fog) 40%, transparent);
+  font: 680 0.43rem/1.2 var(--font-mono, ui-monospace, monospace);
+  letter-spacing: 0.06em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hermes-canvas-tooltip-facts strong {
+  overflow: hidden;
+  color: #fff;
+  font: 700 0.65rem/1.2 var(--font-mono, ui-monospace, monospace);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hermes-canvas-tooltip-current {
+  display: flex;
+  flex-direction: column;
+  gap: 0.24rem;
+  margin-top: 0.62rem;
+}
+
+.hermes-canvas-tooltip-current > strong {
+  color: #fff;
+  font: 640 0.64rem/1.4 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+}
+
+.hermes-canvas-tooltip-current code,
+.hermes-canvas-tooltip-task code {
+  color: color-mix(in srgb, var(--yard-fog) 42%, transparent);
+  font: 520 0.48rem/1.28 var(--font-mono, ui-monospace, monospace);
+}
+
+.hermes-canvas-tooltip-current.is-idle {
+  color: color-mix(in srgb, var(--yard-fog) 54%, transparent);
+  font: 520 0.58rem/1.42 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+}
+
+.hermes-canvas-tooltip-agents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.28rem;
+  margin-top: 0.58rem;
+}
+
+.hermes-canvas-tooltip-agents span {
+  padding: 0.21rem 0.34rem;
+  border-left: 2px solid var(--agent-tone);
+  color: color-mix(in srgb, var(--yard-fog) 70%, transparent);
+  background: color-mix(in srgb, var(--agent-tone) 10%, transparent);
+  font: 610 0.5rem/1.2 var(--font-mono, ui-monospace, monospace);
+}
+
+.hermes-canvas-tooltip-task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.42rem;
+  margin-top: 0.62rem;
+}
+
+.hermes-canvas-tooltip-task {
+  display: grid;
+  grid-template-columns: 0.42rem minmax(0, 1fr);
+  align-items: flex-start;
+  gap: 0.38rem;
+}
+
+.hermes-canvas-tooltip-task i {
+  width: 0.4rem;
+  height: 0.4rem;
+  margin-top: 0.18rem;
+  border-radius: 50%;
+  background: var(--task-tone);
+  box-shadow: 0 0 0 0.18rem color-mix(in srgb, var(--task-tone) 11%, transparent);
+}
+
+.hermes-canvas-tooltip-task > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.08rem;
+}
+
+.hermes-canvas-tooltip-task strong {
+  color: color-mix(in srgb, var(--yard-fog) 82%, white);
+  font: 570 0.57rem/1.35 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  overflow-wrap: anywhere;
+}
+
+.hermes-canvas-tooltip-more,
+.hermes-canvas-tooltip-foot {
+  color: color-mix(in srgb, var(--yard-fog) 40%, transparent);
+  font: 540 0.5rem/1.35 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+}
+
+.hermes-canvas-tooltip-foot {
+  margin-top: 0.62rem;
+  padding-top: 0.52rem;
+  border-top: 1px solid color-mix(in srgb, var(--yard-fog) 9%, transparent);
+}
+
+.hermes-canvas-hint,
+.hermes-canvas-selection {
+  position: absolute;
+  right: 0.75rem;
+  bottom: 0.65rem;
+  left: auto;
+  max-width: min(31rem, calc(100% - 1.5rem));
+  border: 1px solid color-mix(in srgb, var(--yard-fog) 14%, transparent);
+  border-radius: 0.48rem;
+  color: color-mix(in srgb, var(--yard-fog) 58%, transparent);
+  background: color-mix(in srgb, #07171d 84%, transparent);
+  box-shadow: 0 8px 20px color-mix(in srgb, #061216 34%, transparent);
+  backdrop-filter: blur(10px);
+  font: 560 0.56rem/1.4 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+}
+
+.hermes-canvas-hint {
+  padding: 0.42rem 0.55rem;
+  pointer-events: none;
+}
+
+.hermes-canvas-selection {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.3rem 0.65rem;
+  padding: 0.52rem 0.58rem;
+}
+
+.hermes-canvas-selection-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.16rem;
+}
+
+.hermes-canvas-selection-copy strong {
+  color: #fff;
+  font-size: 0.64rem;
+}
+
+.hermes-canvas-selection-copy span {
+  overflow: hidden;
+  color: color-mix(in srgb, var(--yard-mint) 72%, white);
+  font: 620 0.54rem/1.2 var(--font-mono, ui-monospace, monospace);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hermes-canvas-selection-note {
+  grid-column: 1 / -1;
+  color: color-mix(in srgb, var(--yard-fog) 48%, transparent);
+}
+
+.hermes-canvas-selection button {
+  appearance: none;
+  align-self: start;
+  padding: 0.3rem 0.45rem;
+  border: 1px solid color-mix(in srgb, var(--yard-fog) 16%, transparent);
+  border-radius: 0.35rem;
+  color: var(--yard-fog);
+  background: color-mix(in srgb, var(--yard-fog) 7%, transparent);
+  font: 650 0.55rem/1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  cursor: pointer;
+}
+
+.hermes-canvas-selection button:hover {
+  border-color: color-mix(in srgb, var(--yard-mint) 45%, transparent);
+  color: #fff;
+  background: color-mix(in srgb, var(--yard-mint) 11%, transparent);
+}
+
+.hermes-yard-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 0.85rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid color-mix(in srgb, var(--yard-fog) 10%, transparent);
+  color: color-mix(in srgb, var(--yard-fog) 48%, transparent);
+  font: 550 0.58rem/1.4 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+}
+
+.hermes-yard-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.hermes-yard-legend i {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--yard-fog) 35%, transparent);
+}
+
+.hermes-yard-legend .is-running { background: var(--yard-mint); }
+.hermes-yard-legend .is-supervising { background: var(--yard-control); }
+.hermes-yard-legend .is-ready { background: var(--yard-amber); }
+.hermes-yard-legend .is-review { background: var(--yard-review); }
+.hermes-yard-legend .is-blocked { background: var(--yard-coral); }
+.hermes-yard-legend .is-idle { background: color-mix(in srgb, var(--yard-fog) 35%, transparent); }
+
+.hermes-yard-legend strong {
+  margin-left: auto;
+  color: color-mix(in srgb, var(--yard-fog) 64%, transparent);
+  font-weight: 600;
+}
+
+.hermes-yard-empty {
+  padding: 3rem 1rem;
+  border: 1px dashed color-mix(in srgb, var(--yard-fog) 18%, transparent);
+  border-radius: 0.7rem;
+  color: color-mix(in srgb, var(--yard-fog) 52%, transparent);
+  text-align: center;
+  font-size: 0.75rem;
+}
+
+@keyframes hermes-yard-live {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--yard-mint) 50%, transparent); }
+  65%, 100% { box-shadow: 0 0 0 0.5rem transparent; }
+}
+
+@keyframes hermes-canvas-tooltip-in {
+  from {
+    opacity: 0;
+    transform: translateY(0.2rem) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (max-width: 720px) {
+  .hermes-yard-masthead {
+    flex-direction: column;
+    gap: 0.8rem;
+  }
+
+  .hermes-yard-actions {
+    justify-content: flex-start;
+  }
+
+  .hermes-yard-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .hermes-yard-legend strong {
+    width: 100%;
+    margin-left: 0;
+  }
+}
+
+@media (max-width: 520px) {
+  .hermes-agency-yard {
+    padding: 0.8rem;
+    border-radius: 0.75rem;
+  }
+
+  .hermes-yard-title-block h2 {
+    font-size: 1.48rem;
+  }
+
+  .hermes-yard-metric {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  .hermes-canvas-hint,
+  .hermes-canvas-selection {
+    right: 0.45rem;
+    bottom: 0.45rem;
+    max-width: calc(100% - 0.9rem);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hermes-yard-live-dot {
+    animation: none;
+  }
+
+  .hermes-canvas-tooltip {
+    animation: none;
+  }
+
+  .hermes-kanban-view-button {
+    transition: none;
+  }
+}

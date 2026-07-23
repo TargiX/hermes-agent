@@ -1,4 +1,4 @@
-"""Tests for the profile.yaml metadata layer (description + description_auto)
+"""Tests for the profile.yaml metadata layer (description, ownership, auto state)
 and the profile_describer LLM module.
 """
 
@@ -26,7 +26,7 @@ def profile_env(tmp_path, monkeypatch):
 
 def test_read_profile_meta_empty_when_missing(profile_env):
     meta = profiles_mod.read_profile_meta(profile_env)
-    assert meta == {"description": "", "description_auto": False}
+    assert meta == {"description": "", "description_auto": False, "agency": ""}
 
 
 def test_write_and_read_profile_meta(profile_env):
@@ -34,10 +34,12 @@ def test_write_and_read_profile_meta(profile_env):
         profile_env,
         description="a useful researcher",
         description_auto=False,
+        agency="Marketing",
     )
     meta = profiles_mod.read_profile_meta(profile_env)
     assert meta["description"] == "a useful researcher"
     assert meta["description_auto"] is False
+    assert meta["agency"] == "marketing"
 
 
 def test_write_profile_meta_preserves_other_fields(profile_env):
@@ -47,11 +49,13 @@ def test_write_profile_meta_preserves_other_fields(profile_env):
         profile_env,
         description="auto-gen",
         description_auto=True,
+        agency="development",
     )
     profiles_mod.write_profile_meta(profile_env, description="edited by hand")
     meta = profiles_mod.read_profile_meta(profile_env)
     assert meta["description"] == "edited by hand"
     assert meta["description_auto"] is True
+    assert meta["agency"] == "development"
 
 
 def test_write_profile_meta_rejects_missing_dir(tmp_path):
@@ -63,7 +67,7 @@ def test_write_profile_meta_rejects_missing_dir(tmp_path):
 def test_read_profile_meta_tolerates_corrupt_yaml(profile_env):
     (profile_env / "profile.yaml").write_text("not: valid: yaml: [unclosed")
     meta = profiles_mod.read_profile_meta(profile_env)
-    assert meta == {"description": "", "description_auto": False}
+    assert meta == {"description": "", "description_auto": False, "agency": ""}
 
 
 # ---------------------------------------------------------------------------

@@ -8,11 +8,14 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -80,6 +83,167 @@ def test_board_empty(client):
     assert data["latest_event_id"] == 0
 
 
+def test_profile_roster_exposes_machine_readable_agency(client, monkeypatch):
+    """The canvas can place profiles without guessing teams from their names."""
+    from hermes_cli import profiles as profiles_mod
+
+    monkeypatch.setattr(
+        profiles_mod,
+        "list_profiles",
+        lambda: [
+            SimpleNamespace(
+                name="campaigner",
+                is_default=False,
+                model="test-model",
+                provider="test-provider",
+                description="Campaign worker",
+                description_auto=False,
+                agency="marketing",
+                skill_count=3,
+            ),
+        ],
+    )
+
+    response = client.get("/api/plugins/kanban/profiles")
+    assert response.status_code == 200
+    assert response.json()["profiles"][0]["agency"] == "marketing"
+
+
+def test_agency_overview_combines_open_work_across_active_boards(client):
+    """A working agent is not shown idle just because another board is selected."""
+    kb.create_board("engineering", name="Engineering Agency")
+    kb.create_board("growth", name="Growth Agency")
+    with kb.connect(board="engineering") as conn:
+        engineering_task = kb.create_task(
+            conn,
+            title="Implement creator flow",
+            assignee="terra-frontend",
+        )
+    with kb.connect(board="growth") as conn:
+        growth_parent = kb.create_task(
+            conn,
+            title="Shape campaign",
+            assignee="growthlead",
+        )
+        growth_child = kb.create_task(
+            conn,
+            title="Review campaign",
+            assignee="growthreviewer",
+        )
+        kb.link_tasks(conn, growth_parent, growth_child)
+        completed = kb.create_task(
+            conn,
+            title="Old campaign",
+            assignee="growthstudio",
+        )
+        kb.complete_task(conn, completed, summary="Already complete")
+
+    response = client.get("/api/plugins/kanban/agency-overview")
+
+    assert response.status_code == 200
+    data = response.json()
+    tasks = [
+        task
+        for column in data["columns"]
+        for task in column["tasks"]
+    ]
+    assert {task["id"] for task in tasks} == {
+        engineering_task,
+        growth_parent,
+        growth_child,
+    }
+    assert {
+        task["board_slug"] for task in tasks
+    } == {"engineering", "growth"}
+    assert {
+        "parent_id": f"growth:{growth_parent}",
+        "child_id": f"growth:{growth_child}",
+    } in data["graph"]["links"]
+    assert {
+        source["slug"]: source["open_tasks"] for source in data["boards"]
+    }["growth"] == 2
+
+
+def test_agency_overview_exposes_active_controller_cron_runs(
+    client,
+    kanban_home,
+):
+    """Lead/operator activity stays visible even without a Kanban task claim."""
+    runtime = kanban_home / "runtime"
+    runtime.mkdir()
+    (runtime / "agency-controllers.json").write_text(
+        json.dumps(
+            {
+                "schema": "agency-controllers/v1",
+                "controllers": [
+                    {
+                        "profile": "agencyoperator",
+                        "role": "Agency Operator",
+                        "job_id": "operator-job",
+                        "cron_profile": "agencyoperator",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cron = kanban_home / "profiles/agencyoperator/cron"
+    cron.mkdir(parents=True)
+    connection = sqlite3.connect(cron / "executions.db")
+    try:
+        connection.execute(
+            """
+            CREATE TABLE executions (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                error TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO executions (
+                id, job_id, status, claimed_at, started_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "execution-1",
+                "operator-job",
+                "running",
+                "2026-07-23T22:00:00+07:00",
+                "2026-07-23T22:00:01+07:00",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    response = client.get("/api/plugins/kanban/agency-overview")
+
+    assert response.status_code == 200
+    assert response.json()["controllers"] == [
+        {
+            "profile": "agencyoperator",
+            "role": "Agency Operator",
+            "job_id": "operator-job",
+            "cron_profile": "agencyoperator",
+            "state": "running",
+            "latest_execution": {
+                "execution_id": "execution-1",
+                "status": "running",
+                "claimed_at": "2026-07-23T22:00:00+07:00",
+                "started_at": "2026-07-23T22:00:01+07:00",
+                "finished_at": None,
+                "error": "",
+            },
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
@@ -113,6 +277,64 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_board_exposes_shared_task_graph_for_visual_grouping(client):
+    """Mission views can group related agent cards without extra N+1 reads."""
+    parent = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Implement creator loop", "assignee": "builder"},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "Review creator loop",
+            "assignee": "reviewer",
+            "parents": [parent["id"]],
+        },
+    ).json()["task"]
+
+    conn = kb.connect()
+    try:
+        assert kb.add_task_relation(
+            conn,
+            parent["id"],
+            child["id"],
+            "reviews",
+            created_by="test",
+        )
+    finally:
+        conn.close()
+
+    response = client.get("/api/plugins/kanban/board")
+
+    assert response.status_code == 200
+    graph = response.json()["graph"]
+    assert {
+        "parent_id": parent["id"],
+        "child_id": child["id"],
+    } in graph["links"]
+    assert {
+        "source_task_id": parent["id"],
+        "target_task_id": child["id"],
+        "relation": "reviews",
+    } in graph["relations"]
+
+    archived = client.patch(
+        f"/api/plugins/kanban/tasks/{child['id']}",
+        json={"status": "archived"},
+    )
+    assert archived.status_code == 200
+
+    filtered_board = client.get("/api/plugins/kanban/board").json()
+    assert filtered_board["graph"] == {"links": [], "relations": []}
+    returned_parent = next(
+        task
+        for column in filtered_board["columns"]
+        for task in column["tasks"]
+        if task["id"] == parent["id"]
+    )
+    assert returned_parent["link_counts"]["children"] == 1
 
 
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(

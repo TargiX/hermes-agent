@@ -206,6 +206,7 @@
   // can inspect any board without shifting the CLI's active board out
   // from under a terminal they left open.
   const LS_BOARD_KEY = "hermes.kanban.selectedBoard";
+  const LS_VIEW_KEY = "hermes.kanban.viewMode";
 
   function readSelectedBoard() {
     try {
@@ -229,6 +230,23 @@
       // design intent. Regression: #20879.
       if (slug) window.localStorage.setItem(LS_BOARD_KEY, slug);
       else window.localStorage.removeItem(LS_BOARD_KEY);
+    } catch (_e) { /* ignore quota / private mode */ }
+  }
+
+  function readViewMode() {
+    try {
+      const value = window.localStorage.getItem(LS_VIEW_KEY);
+      if (value === "yard" || value === "board") return value;
+    } catch (_e) { /* ignore quota / private mode */ }
+    // Make the live staffing view discoverable on first use. The user's
+    // explicit choice persists immediately, so column-first users only see
+    // this default once.
+    return "yard";
+  }
+
+  function writeViewMode(mode) {
+    try {
+      window.localStorage.setItem(LS_VIEW_KEY, mode === "yard" ? "yard" : "board");
     } catch (_e) { /* ignore quota / private mode */ }
   }
 
@@ -530,6 +548,7 @@
     const [search, setSearch] = useState("");
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
+    const [viewMode, setViewMode] = useState(readViewMode);
 
     const [selectedTaskId, setSelectedTaskId] = useState(null);
     const [selectedIds, setSelectedIds] = useState(() => new Set());
@@ -538,6 +557,11 @@
     const [draggingTaskId, setDraggingTaskId] = useState(null);
     const handleDragStart = useCallback(function (taskId) { setDraggingTaskId(taskId); }, []);
     const handleDragEnd = useCallback(function () { setDraggingTaskId(null); }, []);
+    const changeViewMode = useCallback(function (mode) {
+      const next = mode === "yard" ? "yard" : "board";
+      setViewMode(next);
+      writeViewMode(next);
+    }, []);
     // Per-task event counter incremented whenever the WS stream reports
     // a new event for that task id. TaskDrawer useEffect-depends on its
     // own task's counter so it reloads itself on live events instead of
@@ -1041,6 +1065,9 @@
     if (!filteredBoard) return null;
 
     const renderMd = !config || config.render_markdown !== false;
+    const allTasks = boardData.columns.reduce(function (acc, c) {
+      return acc.concat(c.tasks);
+    }, []);
 
     return h(ErrorBoundary, null,
       h("div", { className: "hermes-kanban flex flex-col gap-4" },
@@ -1066,53 +1093,71 @@
             return updateBoard(board, payload).then(function () { setShowBoardSettings(false); });
           },
         }) : null,
-        h(OrchestrationPanel, null),
-        h(AttentionStrip, {
-          boardData,
-          onOpen: setSelectedTaskId,
+        h(KanbanViewSwitcher, {
+          mode: viewMode,
+          onChange: changeViewMode,
         }),
-        h(BoardToolbar, {
-          board: boardData,
-          tenantFilter, setTenantFilter,
-          assigneeFilter, setAssigneeFilter,
-          includeArchived, setIncludeArchived,
-          laneByProfile, setLaneByProfile,
-          search, setSearch,
-          onNudgeDispatch: function () {
-            SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
-              .then(loadBoard)
-              .catch(function (e) { setError(String(e.message || e)); });
-          },
-          onRefresh: loadBoard,
-        }),
-       selectedIds.size > 0 ? h(BulkActionBar, {
-         count: selectedIds.size,
-         assignees: (boardData && boardData.assignees) || [],
-         onApply: applyBulk,
-         onClear: clearSelected,
-         onSelectAllVisible: selectAllVisible,
-         onDelete: deleteSelected,
-       }) : null,
         error ? h("div", { className: "text-xs text-destructive px-2" }, error) : null,
-        h(BoardColumns, {
-          board: filteredBoard,
-          boardMeta: boardList.find(function (item) { return item.slug === board; }) || null,
-          laneByProfile,
-          selectedIds,
-          failedIds,
-          draggingTaskId,
-          onDragStart: handleDragStart,
-          onDragEnd: handleDragEnd,
-          toggleSelected,
-          toggleRange,
-          selectAllInColumn,
-          onMove: moveTask,
-          onMoveSelected: moveSelected,
-          onDelete: deleteTask,
-          onOpen: setSelectedTaskId,
-          onCreate: createTask,
-          allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
-        }),
+        viewMode === "yard"
+          ? h(AgencyYard, {
+              board: boardData,
+              onOpen: function (task) {
+                if (!task) return;
+                if (task.board_slug && task.board_slug !== board) {
+                  switchBoard(task.board_slug);
+                }
+                setSelectedTaskId(task.id);
+              },
+              onRefresh: loadBoard,
+            })
+          : h(React.Fragment, null,
+              h(OrchestrationPanel, null),
+              h(AttentionStrip, {
+                boardData,
+                onOpen: setSelectedTaskId,
+              }),
+              h(BoardToolbar, {
+                board: boardData,
+                tenantFilter, setTenantFilter,
+                assigneeFilter, setAssigneeFilter,
+                includeArchived, setIncludeArchived,
+                laneByProfile, setLaneByProfile,
+                search, setSearch,
+                onNudgeDispatch: function () {
+                  SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
+                    .then(loadBoard)
+                    .catch(function (e) { setError(String(e.message || e)); });
+                },
+                onRefresh: loadBoard,
+              }),
+              selectedIds.size > 0 ? h(BulkActionBar, {
+                count: selectedIds.size,
+                assignees: (boardData && boardData.assignees) || [],
+                onApply: applyBulk,
+                onClear: clearSelected,
+                onSelectAllVisible: selectAllVisible,
+                onDelete: deleteSelected,
+              }) : null,
+              h(BoardColumns, {
+                board: filteredBoard,
+                boardMeta: boardList.find(function (item) { return item.slug === board; }) || null,
+                laneByProfile,
+                selectedIds,
+                failedIds,
+                draggingTaskId,
+                onDragStart: handleDragStart,
+                onDragEnd: handleDragEnd,
+                toggleSelected,
+                toggleRange,
+                selectAllInColumn,
+                onMove: moveTask,
+                onMoveSelected: moveSelected,
+                onDelete: deleteTask,
+                onOpen: setSelectedTaskId,
+                onCreate: createTask,
+                allTasks,
+              }),
+            ),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
           boardSlug: board,
@@ -1120,10 +1165,1498 @@
           onOpenTask: setSelectedTaskId,
           onRefresh: loadBoard,
           renderMarkdown: renderMd,
-          allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
+          allTasks,
           assignees: (boardData && boardData.assignees) || [],
           eventTick: taskEventTick[selectedTaskId] || 0,
         }) : null,
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Agency yard — a live, truthful staffing map over the same board data.
+  //
+  // This is deliberately a view, not a second orchestration system. Position
+  // comes only from persisted task status, and only ``running`` is described
+  // as active work. Clicking the workshop opens the canonical task drawer.
+  // -------------------------------------------------------------------------
+
+  const YARD_FOCUS_RANK = {
+    supervising: -1,
+    running: 0,
+    ready: 1,
+    review: 2,
+    triage: 3,
+    todo: 4,
+    scheduled: 5,
+    blocked: 6,
+  };
+
+  function yardOperationalState(task) {
+    if (!task) return "idle";
+    if (task.status === "blocked" && task.block_kind === "review_required") {
+      return "review";
+    }
+    return task.status;
+  }
+
+  function yardPlacementForState(state) {
+    if (state === "supervising") return "control";
+    if (state === "running") return "mission";
+    if (state === "review") return "review";
+    if (state === "blocked") return "blocked";
+    return "base";
+  }
+
+  function KanbanViewSwitcher(props) {
+    const setMode = function (mode) {
+      if (props.onChange) props.onChange(mode);
+    };
+    return h("div", {
+      className: "hermes-kanban-view-switcher",
+      role: "group",
+      "aria-label": "Kanban view",
+    },
+      h("button", {
+        type: "button",
+        className: cn(
+          "hermes-kanban-view-button",
+          props.mode === "yard" ? "hermes-kanban-view-button--active" : "",
+        ),
+        "aria-pressed": props.mode === "yard",
+        onClick: function () { setMode("yard"); },
+      },
+        h("span", { className: "hermes-kanban-view-icon", "aria-hidden": "true" }, "⌂"),
+        "Agency yard",
+      ),
+      h("button", {
+        type: "button",
+        className: cn(
+          "hermes-kanban-view-button",
+          props.mode === "board" ? "hermes-kanban-view-button--active" : "",
+        ),
+        "aria-pressed": props.mode === "board",
+        onClick: function () { setMode("board"); },
+      },
+        h("span", { className: "hermes-kanban-view-icon", "aria-hidden": "true" }, "▦"),
+        "Board",
+      ),
+    );
+  }
+
+  function yardInitials(name) {
+    const pieces = String(name || "?").split(/[-_\s]+/).filter(Boolean);
+    if (pieces.length === 0) return "?";
+    if (pieces.length === 1) return pieces[0].slice(0, 2).toUpperCase();
+    return (pieces[0][0] + pieces[pieces.length - 1][0]).toUpperCase();
+  }
+
+  function yardTaskSort(a, b) {
+    const stateA = yardOperationalState(a);
+    const stateB = yardOperationalState(b);
+    const rankA = YARD_FOCUS_RANK[stateA] == null ? 99 : YARD_FOCUS_RANK[stateA];
+    const rankB = YARD_FOCUS_RANK[stateB] == null ? 99 : YARD_FOCUS_RANK[stateB];
+    if (rankA !== rankB) return rankA - rankB;
+    if ((a.priority || 0) !== (b.priority || 0)) return (b.priority || 0) - (a.priority || 0);
+    return (b.created_at || 0) - (a.created_at || 0);
+  }
+
+  function buildYardRoster(board, profiles) {
+    const openTasks = [];
+    for (const column of (board && board.columns) || []) {
+      for (const task of column.tasks || []) {
+        if (task.status !== "done" && task.status !== "archived") openTasks.push(task);
+      }
+    }
+
+    const profileByName = {};
+    const controllerByName = {};
+    const names = new Set();
+    for (const profile of profiles || []) {
+      profileByName[profile.name] = profile;
+      names.add(profile.name);
+    }
+    for (const controller of (board && board.controllers) || []) {
+      if (!controller || !controller.profile) continue;
+      controllerByName[controller.profile] = controller;
+      names.add(controller.profile);
+    }
+
+    const tasksByName = {};
+    for (const task of openTasks) {
+      if (!task.assignee) continue;
+      names.add(task.assignee);
+      (tasksByName[task.assignee] = tasksByName[task.assignee] || []).push(task);
+    }
+
+    const rows = Array.from(names).map(function (name) {
+      const tasks = (tasksByName[name] || []).slice().sort(yardTaskSort);
+      const focus = tasks[0] || null;
+      const controller = controllerByName[name] || null;
+      const state = controller && controller.state === "running"
+        ? "supervising"
+        : yardOperationalState(focus);
+      return {
+        name,
+        profile: profileByName[name] || null,
+        controller,
+        agency: yardAgency(profileByName[name] || null),
+        focus,
+        state,
+        placement: yardPlacementForState(state),
+        openCount: tasks.length,
+      };
+    });
+
+    rows.sort(function (a, b) {
+      const rankA = YARD_FOCUS_RANK[a.state] == null ? 98 : YARD_FOCUS_RANK[a.state];
+      const rankB = YARD_FOCUS_RANK[b.state] == null ? 98 : YARD_FOCUS_RANK[b.state];
+      if (rankA !== rankB) return rankA - rankB;
+      const priorityA = a.focus ? (a.focus.priority || 0) : 0;
+      const priorityB = b.focus ? (b.focus.priority || 0) : 0;
+      if (priorityA !== priorityB) return priorityB - priorityA;
+      return a.name.localeCompare(b.name);
+    });
+
+    return { rows, openTasks };
+  }
+
+  function YardMetric(props) {
+    return h("div", { className: cn("hermes-yard-metric", `hermes-yard-metric--${props.tone}`) },
+      h("span", { className: "hermes-yard-metric-value" }, props.value),
+      h("span", { className: "hermes-yard-metric-label" }, props.label),
+    );
+  }
+
+  function yardMissionTitle(task) {
+    const raw = String((task && task.title) || "Untitled mission");
+    return raw
+      .replace(/^(Phosphene|Portfolio(?: Lab)?|Agency|Hermes|Control-plane)\s+/i, "")
+      .replace(/^(review|correction|publication|implementation|reproduction|evidence|mission implementation|current-source integration|current-base integration):\s*/i, "")
+      .trim();
+  }
+
+  function yardTaskMissionKey(task, graphRoot) {
+    const title = String(task.title || "");
+    const body = String(task.body || "");
+    // A PR mention in explanatory prose is not mission identity. Only the
+    // visible title or an anchored machine-readable field may group cards.
+    const pr = /\bPR\s*#(\d+)\b/i.exec(title) ||
+      /\b(?:existing_)?pr_number:\s*#?(\d+)\b/i.exec(body);
+    if (pr) return `pr:${pr[1]}`;
+    const mission = /\bproduct_mission_id:\s*([a-z0-9._-]+)/i.exec(body);
+    if (mission) return `mission:${mission[1]}`;
+    return `graph:${graphRoot || task.id}`;
+  }
+
+  function yardGraphTaskKey(task) {
+    return task.board_slug ? `${task.board_slug}:${task.id}` : task.id;
+  }
+
+  function buildYardScene(board, profiles) {
+    const roster = buildYardRoster(board, profiles);
+    const allTasks = [];
+    for (const column of (board && board.columns) || []) {
+      for (const task of column.tasks || []) allTasks.push(task);
+    }
+    const taskById = {};
+    const parent = {};
+    for (const task of allTasks) {
+      const taskKey = yardGraphTaskKey(task);
+      taskById[taskKey] = task;
+      parent[taskKey] = taskKey;
+    }
+    const openIds = new Set(roster.openTasks.map(yardGraphTaskKey));
+    const find = function (id) {
+      let root = id;
+      while (parent[root] && parent[root] !== root) root = parent[root];
+      let cursor = id;
+      while (parent[cursor] && parent[cursor] !== cursor) {
+        const next = parent[cursor];
+        parent[cursor] = root;
+        cursor = next;
+      }
+      return root;
+    };
+    const union = function (left, right) {
+      if (!taskById[left] || !taskById[right]) return;
+      // One-hop terminal stages may connect two current assignments, but a
+      // purely historical edge must not collapse the whole archive into one
+      // giant mission.
+      if (!openIds.has(left) && !openIds.has(right)) return;
+      const a = find(left);
+      const b = find(right);
+      if (a !== b) parent[b] = a;
+    };
+    const graph = (board && board.graph) || {};
+    for (const link of graph.links || []) union(link.parent_id, link.child_id);
+    for (const relation of graph.relations || []) {
+      union(relation.source_task_id, relation.target_task_id);
+    }
+
+    const missionByKey = {};
+    for (const task of roster.openTasks) {
+      const key = yardTaskMissionKey(task, find(yardGraphTaskKey(task)));
+      const mission = missionByKey[key] || {
+        id: key,
+        tasks: [],
+        agents: [],
+      };
+      mission.tasks.push(task);
+      missionByKey[key] = mission;
+    }
+
+    for (const row of roster.rows) {
+      if (!row.focus || row.placement !== "mission") continue;
+      const key = yardTaskMissionKey(row.focus, find(yardGraphTaskKey(row.focus)));
+      if (missionByKey[key]) missionByKey[key].agents.push(row);
+    }
+
+    const rosterByName = {};
+    for (const row of roster.rows) rosterByName[row.name] = row;
+    const missions = Object.values(missionByKey).map(function (mission) {
+      const sortedTasks = mission.tasks.slice().sort(yardTaskSort);
+      const anchor = sortedTasks[0];
+      const agencyKeys = Array.from(new Set(mission.tasks.map(function (task) {
+        const owner = task.assignee ? rosterByName[task.assignee] : null;
+        return owner ? owner.agency.key : "unassigned";
+      })));
+      return Object.assign(mission, {
+        anchor,
+        status: yardOperationalState(anchor),
+        title: yardMissionTitle(anchor),
+        priority: anchor ? (anchor.priority || 0) : 0,
+        agencyKeys,
+      });
+    }).sort(function (a, b) {
+      const withPeopleA = a.agents.length > 0 ? 0 : 1;
+      const withPeopleB = b.agents.length > 0 ? 0 : 1;
+      if (withPeopleA !== withPeopleB) return withPeopleA - withPeopleB;
+      const rankA = YARD_FOCUS_RANK[a.status] == null ? 99 : YARD_FOCUS_RANK[a.status];
+      const rankB = YARD_FOCUS_RANK[b.status] == null ? 99 : YARD_FOCUS_RANK[b.status];
+      if (rankA !== rankB) return rankA - rankB;
+      return b.priority - a.priority;
+    });
+
+    const reviewTasks = roster.openTasks.filter(function (task) {
+      return yardOperationalState(task) === "review";
+    });
+    const blockedTasks = roster.openTasks.filter(function (task) {
+      return yardOperationalState(task) === "blocked";
+    });
+    const fieldMissions = missions.filter(function (mission) {
+      return mission.status !== "review" && mission.status !== "blocked";
+    });
+
+    // The floor is for work that is executing now or can be picked up next.
+    // Review handoffs and genuine blockers have their own shared operational
+    // zones, so they cannot flood the field with identical red missions.
+    const visibleMissions = [];
+    const representedMissionIds = new Set();
+    for (const agencyKey of ["development", "marketing", "unassigned"]) {
+      const candidate = fieldMissions.find(function (mission) {
+        return mission.agencyKeys.includes(agencyKey);
+      });
+      if (candidate) {
+        visibleMissions.push(candidate);
+        representedMissionIds.add(candidate.id);
+      }
+    }
+    for (const mission of fieldMissions) {
+      if (visibleMissions.length >= 6) break;
+      if (representedMissionIds.has(mission.id)) continue;
+      visibleMissions.push(mission);
+      representedMissionIds.add(mission.id);
+    }
+    if (fieldMissions.length > visibleMissions.length) {
+      const overflowMissions = fieldMissions.filter(function (mission) {
+        return !representedMissionIds.has(mission.id);
+      });
+      const overflowTasks = [];
+      const overflowAgents = [];
+      for (const mission of overflowMissions) {
+        overflowTasks.push.apply(overflowTasks, mission.tasks);
+        overflowAgents.push.apply(overflowAgents, mission.agents);
+      }
+      visibleMissions.push({
+        id: "mission:overflow",
+        title: `${overflowMissions.length} other workstreams`,
+        status: "todo",
+        priority: 0,
+        tasks: overflowTasks,
+        agents: overflowAgents,
+        anchor: overflowTasks.slice().sort(yardTaskSort)[0] || null,
+        overflowCount: overflowMissions.length,
+        agencyKeys: Array.from(new Set(overflowMissions.flatMap(function (mission) {
+          return mission.agencyKeys;
+        }))),
+      });
+    }
+
+    const basesByKey = {};
+    for (const row of roster.rows) {
+      const base = basesByKey[row.agency.key] || {
+        agency: row.agency,
+        rows: [],
+        idleAgents: [],
+        residentAgents: [],
+      };
+      base.rows.push(row);
+      if (!row.focus) base.idleAgents.push(row);
+      if (row.placement === "base") base.residentAgents.push(row);
+      basesByKey[row.agency.key] = base;
+    }
+    const baseOrder = { development: 0, marketing: 1, unassigned: 2 };
+    const bases = Object.values(basesByKey).sort(function (a, b) {
+      return (baseOrder[a.agency.key] == null ? 99 : baseOrder[a.agency.key]) -
+        (baseOrder[b.agency.key] == null ? 99 : baseOrder[b.agency.key]);
+    });
+
+    const blockedCauseCounts = {};
+    for (const task of blockedTasks) {
+      const cause = task.block_kind || "unclassified";
+      blockedCauseCounts[cause] = (blockedCauseCounts[cause] || 0) + 1;
+    }
+    const docks = [
+      {
+        key: "control",
+        kind: "control",
+        label: "Control Room",
+        shortLabel: "SUPERVISING",
+        state: "supervising",
+        note: "Lead and Operator coordinating the agency control plane",
+        tasks: [],
+        agents: roster.rows.filter(function (row) {
+          return row.placement === "control";
+        }),
+        causeCounts: {},
+      },
+      {
+        key: "review",
+        label: "Review Gate",
+        shortLabel: "WAITING REVIEW",
+        state: "review",
+        note: "Handoffs awaiting independent review",
+        tasks: reviewTasks,
+        agents: roster.rows.filter(function (row) { return row.placement === "review"; }),
+        causeCounts: { review_required: reviewTasks.length },
+      },
+      {
+        key: "blocked",
+        label: "Blocked Dock",
+        shortLabel: "NEEDS ACTION",
+        state: "blocked",
+        note: "Input, capability, or recovery required",
+        tasks: blockedTasks,
+        agents: roster.rows.filter(function (row) { return row.placement === "blocked"; }),
+        causeCounts: blockedCauseCounts,
+      },
+    ].filter(function (dock) {
+      return dock.tasks.length > 0 || dock.agents.length > 0;
+    });
+
+    return {
+      roster,
+      missions: visibleMissions,
+      idleAgents: roster.rows.filter(function (row) { return !row.focus; }),
+      bases,
+      docks,
+      reviewTaskCount: reviewTasks.length,
+      blockedTaskCount: blockedTasks.length,
+      fieldMissionCount: fieldMissions.length,
+      totalMissionCount: missions.length,
+    };
+  }
+
+  const YARD_CANVAS_COLORS = {
+    ink: "#0a1d25",
+    deep: "#0f2934",
+    blue: "#2d6c82",
+    mint: "#55d6a3",
+    amber: "#f4b942",
+    coral: "#f06a5b",
+    fog: "#eaf0ec",
+    muted: "#78909a",
+    review: "#75aef0",
+    control: "#56c7dd",
+    triage: "#b792da",
+    marketing: "#d89bff",
+    unassigned: "#94a3ad",
+  };
+
+  const YARD_AGENCIES = {
+    development: {
+      key: "development",
+      label: "Developer Base",
+      shortLabel: "DEV BASE",
+      color: YARD_CANVAS_COLORS.review,
+    },
+    marketing: {
+      key: "marketing",
+      label: "Marketing Base",
+      shortLabel: "MARKETING BASE",
+      color: YARD_CANVAS_COLORS.marketing,
+    },
+    unassigned: {
+      key: "unassigned",
+      label: "Unassigned Base",
+      shortLabel: "UNASSIGNED",
+      color: YARD_CANVAS_COLORS.unassigned,
+    },
+  };
+
+  function yardAgency(profile) {
+    const key = String((profile && profile.agency) || "").trim().toLowerCase();
+    return YARD_AGENCIES[key] || Object.assign({}, YARD_AGENCIES.unassigned, {
+      key: key || "unassigned",
+      label: key ? `${key.replace(/[-_]+/g, " ")} Base` : "Unassigned Base",
+      shortLabel: key ? key.replace(/[-_]+/g, " ").toUpperCase() : "UNASSIGNED",
+    });
+  }
+
+  function yardStateColor(status) {
+    if (status === "supervising") return YARD_CANVAS_COLORS.control;
+    if (status === "running") return YARD_CANVAS_COLORS.mint;
+    if (status === "ready") return YARD_CANVAS_COLORS.amber;
+    if (status === "blocked") return YARD_CANVAS_COLORS.coral;
+    if (status === "review") return YARD_CANVAS_COLORS.review;
+    if (status === "triage") return YARD_CANVAS_COLORS.triage;
+    return YARD_CANVAS_COLORS.muted;
+  }
+
+  function yardRoundedRect(ctx, x, y, width, height, radius) {
+    const r = Math.min(radius, width / 2, height / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + width - r, y);
+    ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+    ctx.lineTo(x + width, y + height - r);
+    ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+    ctx.lineTo(x + r, y + height);
+    ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
+
+  function yardHexagon(ctx, x, y, radius) {
+    ctx.beginPath();
+    for (let i = 0; i < 6; i += 1) {
+      const angle = Math.PI / 3 * i - Math.PI / 6;
+      const px = x + Math.cos(angle) * radius;
+      const py = y + Math.sin(angle) * radius;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+  }
+
+  function yardDrawWrapped(ctx, text, x, y, maxWidth, lineHeight, maxLines) {
+    const words = String(text || "").split(/\s+/).filter(Boolean);
+    const lines = [];
+    let line = "";
+    for (const word of words) {
+      const candidate = line ? `${line} ${word}` : word;
+      if (ctx.measureText(candidate).width <= maxWidth || !line) {
+        line = candidate;
+      } else {
+        lines.push(line);
+        line = word;
+        if (lines.length >= maxLines) break;
+      }
+    }
+    if (line && lines.length < maxLines) lines.push(line);
+    if (lines.length === maxLines && words.length > lines.join(" ").split(/\s+/).length) {
+      lines[maxLines - 1] = lines[maxLines - 1].replace(/[.,;:]?$/, "…");
+    }
+    lines.forEach(function (value, index) {
+      ctx.fillText(value, x, y + index * lineHeight);
+    });
+  }
+
+  function yardDrawBase(ctx, x, y, base) {
+    const color = base.agency.color;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.2;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(-46, -6);
+    ctx.lineTo(0, -48);
+    ctx.lineTo(46, -6);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 0.78;
+    ctx.stroke();
+    yardRoundedRect(ctx, -37, -6, 74, 62, 6);
+    ctx.fillStyle = "rgba(15,41,52,0.92)";
+    ctx.globalAlpha = 1;
+    ctx.fill();
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = 0.62;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = color;
+    yardRoundedRect(ctx, -27, 9, 54, 16, 4);
+    ctx.globalAlpha = 0.16;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = color;
+    ctx.font = "750 7px ui-monospace, monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(base.agency.shortLabel, 0, 20);
+    ctx.fillStyle = YARD_CANVAS_COLORS.fog;
+    ctx.font = "700 10px ui-monospace, monospace";
+    ctx.fillText(base.agency.label.toUpperCase(), 0, 76);
+    ctx.fillStyle = "rgba(234,240,236,0.52)";
+    ctx.font = "500 9px ui-monospace, monospace";
+    ctx.fillText(
+      `${base.residentAgents.length} here · ${base.rows.length} rostered`,
+      0,
+      91,
+    );
+    ctx.restore();
+  }
+
+  function yardDrawDock(ctx, x, y, dock) {
+    const color = yardStateColor(dock.state);
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.globalAlpha = 0.82;
+    yardRoundedRect(ctx, -49, -29, 98, 58, 9);
+    ctx.fillStyle = "rgba(10,29,37,0.94)";
+    ctx.fill();
+    ctx.stroke();
+    ctx.globalAlpha = 0.15;
+    ctx.fillStyle = color;
+    yardRoundedRect(ctx, -43, -23, 86, 46, 6);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = color;
+    ctx.font = "800 8px ui-monospace, monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(dock.shortLabel, 0, -6);
+    ctx.fillStyle = YARD_CANVAS_COLORS.fog;
+    ctx.font = "780 17px ui-monospace, monospace";
+    ctx.fillText(
+      String(dock.kind === "control" ? dock.agents.length : dock.tasks.length),
+      0,
+      15,
+    );
+    ctx.fillStyle = YARD_CANVAS_COLORS.fog;
+    ctx.font = "700 10px ui-monospace, monospace";
+    ctx.fillText(dock.label.toUpperCase(), 0, 47);
+    ctx.fillStyle = "rgba(234,240,236,0.5)";
+    ctx.font = "500 7px ui-monospace, monospace";
+    yardDrawWrapped(ctx, dock.note, 0, 60, 135, 9, 2);
+    ctx.restore();
+  }
+
+  function yardDrawAgent(ctx, agent, x, y, selected, phase, labelMode) {
+    const color = yardStateColor(agent.state);
+    const moving = agent.state === "running" || agent.state === "supervising";
+    const bob = moving ? Math.sin(phase * 3 + x * 0.01) * 2 : 0;
+    const drawY = y + bob;
+    ctx.save();
+    if (selected) {
+      ctx.strokeStyle = YARD_CANVAS_COLORS.fog;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(x, drawY, 19, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.fillStyle = "rgba(6,18,22,0.72)";
+    ctx.beginPath();
+    ctx.ellipse(x, drawY + 17, 12, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = color;
+    ctx.strokeStyle = "rgba(255,255,255,0.46)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(x, drawY - 8, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    yardRoundedRect(ctx, x - 10, drawY - 1, 20, 20, 7);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.font = "700 7px ui-monospace, monospace";
+    ctx.fillText(yardInitials(agent.name), x, drawY + 12);
+    ctx.fillStyle = YARD_CANVAS_COLORS.fog;
+    ctx.font = "600 9px ui-monospace, monospace";
+    const shortName = agent.name.length > 16 ? agent.name.slice(0, 14) + "…" : agent.name;
+    if (labelMode === "list") {
+      ctx.textAlign = "left";
+      ctx.fillText("@" + shortName, x + 18, drawY + 5);
+    } else if (labelMode === "above") {
+      ctx.fillText("@" + shortName, x, drawY - 22);
+    } else {
+      ctx.fillText("@" + shortName, x, drawY + 34);
+    }
+    ctx.restore();
+  }
+
+  function yardDrawMission(ctx, mission, x, y, keyboardSelected, phase) {
+    const color = yardStateColor(mission.status);
+    const pulse = mission.status === "running" ? 5 + Math.sin(phase * 2.5) * 3 : 3;
+    ctx.save();
+    ctx.shadowColor = color;
+    ctx.shadowBlur = keyboardSelected ? 18 : pulse;
+    yardHexagon(ctx, x, y, 38);
+    ctx.fillStyle = "rgba(10,29,37,0.96)";
+    ctx.fill();
+    ctx.lineWidth = keyboardSelected ? 3 : 2;
+    ctx.strokeStyle = color;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.beginPath();
+    ctx.arc(x, y, 19, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.18;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "rgba(234,240,236,0.56)";
+    ctx.textAlign = "center";
+    ctx.font = "700 8px ui-monospace, monospace";
+    ctx.fillText(
+      mission.overflowCount ? "BACKLOG HUB" : `${mission.tasks.length} TASK${mission.tasks.length === 1 ? "" : "S"}`,
+      x,
+      y - 49,
+    );
+    ctx.fillStyle = YARD_CANVAS_COLORS.fog;
+    ctx.font = "650 11px ui-sans-serif, system-ui, sans-serif";
+    yardDrawWrapped(ctx, mission.title, x, y + 57, 145, 14, 3);
+    ctx.fillStyle = color;
+    ctx.font = "700 8px ui-monospace, monospace";
+    ctx.fillText(yardStatusLabel(mission.status).toUpperCase(), x, y + 103);
+    ctx.restore();
+  }
+
+  function yardCanvasLayout(width, missionCount, bases, docks) {
+    const compact = width < 680;
+    const columns = compact ? 1 : (width < 900 ? 2 : 3);
+    const fieldLeft = compact ? 26 : 196;
+    const fieldRight = 34;
+    const usable = Math.max(240, width - fieldLeft - fieldRight);
+    const columnWidth = usable / columns;
+    const rows = Math.max(1, Math.ceil(missionCount / columns));
+    const rowHeight = compact ? 230 : 218;
+    const baseStackHeight = (bases || []).reduce(function (height, base) {
+      return height + 128 + base.residentAgents.length * 32;
+    }, (docks || []).reduce(function (height, dock) {
+      return height + 116 + dock.agents.length * 32;
+    }, 18));
+    const top = compact ? baseStackHeight + 54 : 108;
+    const missionHeight = top + rows * rowHeight + 88;
+    const height = compact
+      ? missionHeight
+      : Math.max(missionHeight, baseStackHeight + 58);
+    return {
+      compact,
+      columns,
+      fieldLeft,
+      columnWidth,
+      rowHeight,
+      top,
+      height,
+      baseStackHeight,
+    };
+  }
+
+  function yardStatusLabel(status) {
+    const labels = {
+      supervising: "Supervising now",
+      running: "Running now",
+      ready: "Ready to dispatch",
+      review: "Waiting for review",
+      blocked: "Needs action",
+      triage: "Needs shaping",
+      todo: "Waiting",
+      scheduled: "Scheduled",
+      idle: "Available",
+    };
+    return labels[status] || String(status || "Unknown");
+  }
+
+  function yardBlockCauseLabel(kind) {
+    const labels = {
+      review_required: "Review required",
+      needs_input: "Needs input",
+      capability: "Capability missing",
+      transient: "Transient failure",
+      unclassified: "Unclassified",
+    };
+    return labels[kind] || String(kind || "Unclassified").replace(/_/g, " ");
+  }
+
+  function YardTooltipStatus(props) {
+    return h("span", {
+      className: "hermes-canvas-tooltip-status",
+      style: { "--tooltip-status": yardStateColor(props.status) },
+    }, yardStatusLabel(props.status));
+  }
+
+  function AgencyHoverInspector(props) {
+    const hover = props.hover;
+    if (!hover) return null;
+    const tone = hover.type === "agent"
+      ? yardStateColor(hover.agent.state)
+      : hover.type === "dock"
+        ? yardStateColor(hover.dock.state)
+        : yardStateColor(hover.mission.status);
+    const style = {
+      left: hover.left + "px",
+      top: hover.top + "px",
+      width: hover.width + "px",
+      "--tooltip-tone": tone,
+    };
+
+    if (hover.type === "agent") {
+      const agent = hover.agent;
+      const profile = agent.profile || {};
+      const focus = agent.focus;
+      const modelLine = [profile.provider, profile.model].filter(Boolean).join(" · ");
+      return h("aside", {
+        className: "hermes-canvas-tooltip hermes-canvas-tooltip--agent",
+        role: "tooltip",
+        style,
+      },
+        h("div", { className: "hermes-canvas-tooltip-head" },
+          h("div", { className: "hermes-canvas-tooltip-avatar", "aria-hidden": "true" },
+            yardInitials(agent.name)),
+          h("div", { className: "hermes-canvas-tooltip-heading" },
+            h("span", { className: "hermes-canvas-tooltip-kicker" },
+              agent.controller && agent.state === "supervising"
+                ? "CONTROL ROOM · " + agent.controller.role.toUpperCase()
+                : agent.agency.label.toUpperCase() + " · AGENT"),
+            h("strong", null, "@" + agent.name),
+          ),
+          h(YardTooltipStatus, { status: agent.state }),
+        ),
+        modelLine
+          ? h("div", { className: "hermes-canvas-tooltip-model" }, modelLine)
+          : null,
+        profile.description
+          ? h("p", { className: "hermes-canvas-tooltip-description" }, profile.description)
+          : h("p", { className: "hermes-canvas-tooltip-description is-muted" },
+              "No profile description is recorded for this agent."),
+        h("div", { className: "hermes-canvas-tooltip-facts" },
+          h("span", null,
+            h("small", null, "OPEN ASSIGNMENTS"),
+            h("strong", null, String(agent.openCount || 0)),
+          ),
+          h("span", null,
+            h("small", null, "LOADED SKILLS"),
+            h("strong", null, String(profile.skill_count || 0)),
+          ),
+          h("span", null,
+            h("small", null, "HOME BASE"),
+            h("strong", null, agent.agency.label),
+          ),
+        ),
+        agent.controller && agent.state === "supervising"
+          ? h("div", { className: "hermes-canvas-tooltip-current" },
+              h("span", { className: "hermes-canvas-tooltip-section-label" },
+                "CURRENT CONTROL DUTY"),
+              h("strong", null, agent.controller.role),
+              h("code", null,
+                `${agent.controller.job_id} · ${agent.controller.latest_execution && agent.controller.latest_execution.started_at
+                  ? agent.controller.latest_execution.started_at
+                  : "claimed"}`),
+            )
+          : focus
+          ? h("div", { className: "hermes-canvas-tooltip-current" },
+              h("span", { className: "hermes-canvas-tooltip-section-label" },
+                "CURRENT ASSIGNMENT"),
+              h("strong", null, focus.title || "Untitled task"),
+              h("code", null,
+                `${focus.board_name ? focus.board_name + " · " : ""}${focus.id} · P${focus.priority || 0}`),
+            )
+          : h("div", { className: "hermes-canvas-tooltip-current is-idle" },
+              `No open assignment. This agent is at ${agent.agency.label}.`),
+      );
+    }
+
+    if (hover.type === "dock") {
+      const dock = hover.dock;
+      const causes = Object.entries(dock.causeCounts || {}).sort(function (a, b) {
+        return b[1] - a[1];
+      });
+      return h("aside", {
+        className: "hermes-canvas-tooltip hermes-canvas-tooltip--mission",
+        role: "tooltip",
+        style,
+      },
+        h("div", { className: "hermes-canvas-tooltip-head" },
+          h("div", { className: "hermes-canvas-tooltip-heading" },
+            h("span", { className: "hermes-canvas-tooltip-kicker" }, "SHARED OPERATIONS ZONE"),
+            h("strong", null, dock.label),
+          ),
+          h(YardTooltipStatus, { status: dock.state }),
+        ),
+        h("p", { className: "hermes-canvas-tooltip-description" }, dock.note + "."),
+        h("div", { className: "hermes-canvas-tooltip-facts" },
+          h("span", null,
+            h("small", null, dock.kind === "control" ? "CONTROLLERS" : "CARDS"),
+            h("strong", null, String(
+              dock.kind === "control" ? dock.agents.length : dock.tasks.length
+            )),
+          ),
+          h("span", null,
+            h("small", null, "AGENTS HERE"),
+            h("strong", null, String(dock.agents.length)),
+          ),
+          h("span", null,
+            h("small", null, "EXECUTING"),
+            h("strong", null, "0"),
+          ),
+        ),
+        causes.length
+          ? h("div", { className: "hermes-canvas-tooltip-task-list" },
+              h("span", { className: "hermes-canvas-tooltip-section-label" }, "WHY THEY ARE HERE"),
+              causes.map(function (entry) {
+                return h("div", {
+                  className: "hermes-canvas-tooltip-task",
+                  key: entry[0],
+                },
+                  h("i", { style: { "--task-tone": tone } }),
+                  h("span", null,
+                    h("strong", null, yardBlockCauseLabel(entry[0])),
+                    h("code", null, `${entry[1]} card${entry[1] === 1 ? "" : "s"}`),
+                  ),
+                );
+              }),
+            )
+          : null,
+        dock.agents.length
+          ? h("div", { className: "hermes-canvas-tooltip-agents" },
+              dock.agents.map(function (agent) {
+                return h("span", {
+                  key: agent.name,
+                  style: { "--agent-tone": tone },
+                }, "@" + agent.name);
+              }),
+            )
+          : null,
+        h("div", { className: "hermes-canvas-tooltip-foot" },
+          dock.kind === "control"
+            ? "These controllers coordinate or repair the agency; they are active, but are not product workers."
+            : dock.state === "review"
+            ? "These agents are waiting on a review handoff; they are not executing now."
+            : "These agents need intervention or recovery; they are not executing now."),
+      );
+    }
+
+    const mission = hover.mission;
+    const tasks = (mission.tasks || []).slice().sort(yardTaskSort);
+    const agents = mission.agents || [];
+    const missionIdentity = mission.id.startsWith("pr:")
+      ? `PR #${mission.id.slice(3)}`
+      : mission.id.startsWith("mission:")
+        ? mission.id.slice(8)
+        : "Linked task group";
+    const missionLabel = mission.anchor && mission.anchor.board_name
+      ? `${mission.anchor.board_name} · ${missionIdentity}`
+      : missionIdentity;
+    return h("aside", {
+      className: "hermes-canvas-tooltip hermes-canvas-tooltip--mission",
+      role: "tooltip",
+      style,
+    },
+      h("div", { className: "hermes-canvas-tooltip-head" },
+        h("div", { className: "hermes-canvas-tooltip-heading" },
+          h("span", { className: "hermes-canvas-tooltip-kicker" }, missionLabel),
+          h("strong", null, mission.anchor ? mission.anchor.title : mission.title),
+        ),
+        h(YardTooltipStatus, { status: mission.status }),
+      ),
+      h("div", { className: "hermes-canvas-tooltip-facts" },
+        h("span", null,
+          h("small", null, "CARDS"),
+          h("strong", null, String(tasks.length)),
+        ),
+        h("span", null,
+          h("small", null, "AGENTS"),
+          h("strong", null, String(agents.length)),
+        ),
+        h("span", null,
+          h("small", null, "LEAD PRIORITY"),
+          h("strong", null, "P" + String(mission.priority || 0)),
+        ),
+      ),
+      agents.length
+        ? h("div", { className: "hermes-canvas-tooltip-agents" },
+            agents.map(function (agent) {
+              return h("span", {
+                key: agent.name,
+                style: { "--agent-tone": yardStateColor(agent.state) },
+              }, "@" + agent.name);
+            }),
+          )
+        : h("p", { className: "hermes-canvas-tooltip-description is-muted" },
+            "No agent currently owns an open card in this mission."),
+      h("div", { className: "hermes-canvas-tooltip-task-list" },
+        h("span", { className: "hermes-canvas-tooltip-section-label" },
+          "RELATED CARDS"),
+        tasks.slice(0, 4).map(function (task) {
+          const taskState = yardOperationalState(task);
+          return h("div", { className: "hermes-canvas-tooltip-task", key: task.id },
+            h("i", { style: { "--task-tone": yardStateColor(taskState) } }),
+            h("span", null,
+              h("strong", null, task.title || "Untitled task"),
+              h("code", null, `${task.id} · ${yardStatusLabel(taskState)}`),
+            ),
+          );
+        }),
+        tasks.length > 4
+          ? h("small", { className: "hermes-canvas-tooltip-more" },
+              `+${tasks.length - 4} more related card${tasks.length - 4 === 1 ? "" : "s"}`)
+          : null,
+      ),
+      h("div", { className: "hermes-canvas-tooltip-foot" },
+        "Click the mission to open its leading card."),
+    );
+  }
+
+  function AgencyCanvas(props) {
+    const canvasRef = useRef(null);
+    const wrapRef = useRef(null);
+    const hitRef = useRef([]);
+    const [width, setWidth] = useState(0);
+    const [selectedAgents, setSelectedAgents] = useState(function () { return new Set(); });
+    const [keyboardMission, setKeyboardMission] = useState(0);
+    const [hovered, setHovered] = useState(null);
+
+    const layout = yardCanvasLayout(
+      width || 900,
+      props.scene.missions.length,
+      props.scene.bases,
+      props.scene.docks,
+    );
+
+    useEffect(function () {
+      const element = wrapRef.current;
+      if (!element) return undefined;
+      const update = function () {
+        const next = Math.max(300, Math.floor(element.getBoundingClientRect().width));
+        setWidth(function (current) { return current === next ? current : next; });
+      };
+      update();
+      if (typeof ResizeObserver === "undefined") {
+        window.addEventListener("resize", update);
+        return function () { window.removeEventListener("resize", update); };
+      }
+      const observer = new ResizeObserver(update);
+      observer.observe(element);
+      return function () { observer.disconnect(); };
+    }, []);
+
+    useEffect(function () {
+      const clearOutsideCanvas = function (event) {
+        if (event.target !== canvasRef.current) {
+          setHovered(function (current) { return current ? null : current; });
+        }
+      };
+      window.addEventListener("pointermove", clearOutsideCanvas, true);
+      return function () {
+        window.removeEventListener("pointermove", clearOutsideCanvas, true);
+      };
+    }, []);
+
+    useEffect(function () {
+      const canvas = canvasRef.current;
+      if (!canvas || !width) return undefined;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return undefined;
+      const height = layout.height;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+      canvas.style.height = height + "px";
+      canvas.style.width = width + "px";
+      const reducedMotion = window.matchMedia &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const animated = props.scene.roster.rows.some(function (row) {
+        return row.state === "running" || row.state === "supervising";
+      });
+      let frame = null;
+      let stopped = false;
+      let lastPaint = -Infinity;
+
+      const paint = function (timestamp) {
+        if (stopped) return;
+        // A full shared scene is materially larger than the old per-agent
+        // sprites. Twelve frames per second keeps the live cue legible without
+        // monopolising the dashboard's main thread.
+        if (animated && !reducedMotion && timestamp - lastPaint < 80) {
+          frame = requestAnimationFrame(paint);
+          return;
+        }
+        lastPaint = timestamp;
+        const phase = reducedMotion ? 0 : timestamp / 1000;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, width, height);
+        const colors = YARD_CANVAS_COLORS;
+        const background = ctx.createLinearGradient(0, 0, width, height);
+        background.addColorStop(0, colors.ink);
+        background.addColorStop(0.56, colors.deep);
+        background.addColorStop(1, "#173844");
+        ctx.fillStyle = background;
+        ctx.fillRect(0, 0, width, height);
+
+        ctx.strokeStyle = "rgba(234,240,236,0.055)";
+        ctx.lineWidth = 1;
+        for (let gx = 0; gx < width; gx += 26) {
+          ctx.beginPath();
+          ctx.moveTo(gx, 0);
+          ctx.lineTo(gx, height);
+          ctx.stroke();
+        }
+        for (let gy = 0; gy < height; gy += 26) {
+          ctx.beginPath();
+          ctx.moveTo(0, gy);
+          ctx.lineTo(width, gy);
+          ctx.stroke();
+        }
+
+        const hits = [];
+        let baseCursorY = 62;
+        const baseLayouts = [];
+        props.scene.bases.forEach(function (base) {
+          const x = layout.compact ? width / 2 : 92;
+          const y = baseCursorY;
+          const idleStartY = y + 105;
+          const agentX = layout.compact ? Math.max(34, x - 118) : 34;
+          const placedBase = { base, x, y };
+          baseLayouts.push(placedBase);
+          yardDrawBase(ctx, x, y, base);
+          base.residentAgents.forEach(function (agent, index) {
+            const agentY = idleStartY + index * 32;
+            yardDrawAgent(
+              ctx,
+              agent,
+              agentX,
+              agentY,
+              selectedAgents.has(agent.name),
+              phase,
+              "list",
+            );
+            hits.push({ type: "agent", x: agentX, y: agentY, radius: 21, agent });
+          });
+          baseCursorY += 128 + base.residentAgents.length * 32;
+        });
+
+        props.scene.docks.forEach(function (dock) {
+          const x = layout.compact ? width / 2 : 92;
+          const y = baseCursorY + 12;
+          const agentX = layout.compact ? Math.max(34, x - 118) : 34;
+          const agentStartY = y + 92;
+          yardDrawDock(ctx, x, y, dock);
+          hits.push({
+            type: "dock",
+            x: x - 58,
+            y: y - 34,
+            width: 116,
+            height: 108,
+            dock,
+          });
+          dock.agents.forEach(function (agent, index) {
+            const agentY = agentStartY + index * 32;
+            yardDrawAgent(
+              ctx,
+              agent,
+              agentX,
+              agentY,
+              selectedAgents.has(agent.name),
+              phase,
+              "list",
+            );
+            hits.push({ type: "agent", x: agentX, y: agentY, radius: 21, agent });
+          });
+          baseCursorY += 116 + dock.agents.length * 32;
+        });
+
+        const missionLayouts = [];
+        props.scene.missions.forEach(function (mission, index) {
+          const column = index % layout.columns;
+          const row = Math.floor(index / layout.columns);
+          const x = layout.fieldLeft + layout.columnWidth * (column + 0.5);
+          const y = layout.top + layout.rowHeight * row;
+          missionLayouts.push({ mission, x, y });
+        });
+
+        ctx.lineCap = "round";
+        missionLayouts.forEach(function (item) {
+          const agents = (item.mission.agents || []).filter(function (agent) {
+            return agent.state === "running";
+          });
+          agents.forEach(function (agent, index) {
+            const angleStart = -Math.PI + 0.3;
+            const angleEnd = -0.3;
+            const angle = angleStart +
+              ((angleEnd - angleStart) * (index + 1) / (agents.length + 1));
+            const baseRadius = 64;
+            const x = item.x + Math.cos(angle) * baseRadius;
+            const y = item.y + Math.sin(angle) * baseRadius * 0.64;
+            const color = yardStateColor(agent.state);
+            ctx.save();
+            ctx.strokeStyle = color;
+            ctx.globalAlpha = 0.72;
+            ctx.lineWidth = 2.2;
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+            ctx.lineTo(item.x, item.y);
+            ctx.stroke();
+            ctx.restore();
+            item.agentLayouts = item.agentLayouts || [];
+            item.agentLayouts.push({ agent, x, y });
+          });
+        });
+
+        const baseLayoutByKey = {};
+        for (const item of baseLayouts) baseLayoutByKey[item.base.agency.key] = item;
+        missionLayouts.forEach(function (item) {
+          const participatingBases = new Set((item.mission.agents || []).map(function (agent) {
+            return agent.agency.key;
+          }));
+          for (const baseKey of participatingBases) {
+            const baseLayout = baseLayoutByKey[baseKey];
+            if (!baseLayout) continue;
+            ctx.save();
+            ctx.strokeStyle = baseLayout.base.agency.color;
+            ctx.globalAlpha = 0.18;
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 9]);
+            ctx.beginPath();
+            ctx.moveTo(baseLayout.x, baseLayout.y);
+            ctx.lineTo(item.x, item.y);
+            ctx.stroke();
+            ctx.restore();
+          }
+        });
+
+        missionLayouts.forEach(function (item, index) {
+          yardDrawMission(
+            ctx,
+            item.mission,
+            item.x,
+            item.y,
+            keyboardMission === index,
+            phase,
+          );
+          hits.push({
+            type: "mission",
+            x: item.x,
+            y: item.y,
+            radius: 48,
+            mission: item.mission,
+          });
+          for (const placed of item.agentLayouts || []) {
+            yardDrawAgent(
+              ctx,
+              placed.agent,
+              placed.x,
+              placed.y,
+              selectedAgents.has(placed.agent.name),
+              phase,
+              "above",
+            );
+            hits.push({
+              type: "agent",
+              x: placed.x,
+              y: placed.y,
+              radius: 21,
+              agent: placed.agent,
+            });
+          }
+        });
+
+        ctx.fillStyle = "rgba(234,240,236,0.44)";
+        ctx.font = "600 9px ui-monospace, monospace";
+        ctx.textAlign = "left";
+        ctx.fillText("AGENCY COMMONS · SHARED MISSION MAP", 18, height - 20);
+        hitRef.current = hits;
+
+        if (animated && !reducedMotion) frame = requestAnimationFrame(paint);
+      };
+
+      frame = requestAnimationFrame(paint);
+      return function () {
+        stopped = true;
+        if (frame) cancelAnimationFrame(frame);
+      };
+    }, [width, layout.height, layout.columns, layout.columnWidth, layout.fieldLeft,
+      layout.rowHeight, layout.top, layout.compact, props.scene, selectedAgents,
+      keyboardMission]);
+
+    const pointFromEvent = function (event) {
+      const rect = canvasRef.current.getBoundingClientRect();
+      return {
+        x: (event.clientX - rect.left) * (width / rect.width),
+        y: (event.clientY - rect.top) * (layout.height / rect.height),
+      };
+    };
+    const hitAt = function (point) {
+      for (let index = hitRef.current.length - 1; index >= 0; index -= 1) {
+        const hit = hitRef.current[index];
+        if (hit.width != null && hit.height != null) {
+          if (point.x >= hit.x && point.x <= hit.x + hit.width &&
+              point.y >= hit.y && point.y <= hit.y + hit.height) {
+            return hit;
+          }
+          continue;
+        }
+        const dx = point.x - hit.x;
+        const dy = point.y - hit.y;
+        if (dx * dx + dy * dy <= hit.radius * hit.radius) return hit;
+      }
+      return null;
+    };
+    const handleClick = function (event) {
+      const hit = hitAt(pointFromEvent(event));
+      if (!hit) {
+        if (!event.shiftKey) setSelectedAgents(new Set());
+        return;
+      }
+      if (hit.type === "mission") {
+        if (hit.mission.anchor && props.onOpen) props.onOpen(hit.mission.anchor);
+        return;
+      }
+      if (hit.type === "dock") return;
+      setSelectedAgents(function (previous) {
+        const next = new Set(event.shiftKey ? previous : []);
+        if (next.has(hit.agent.name)) next.delete(hit.agent.name);
+        else next.add(hit.agent.name);
+        return next;
+      });
+    };
+    const handlePointerMove = function (event) {
+      const hit = hitAt(pointFromEvent(event));
+      if (canvasRef.current) canvasRef.current.style.cursor = hit ? "pointer" : "default";
+      if (!hit) {
+        setHovered(null);
+        return;
+      }
+      const pointerX = event.clientX;
+      const pointerY = event.clientY;
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const tooltipWidth = Math.min(340, Math.max(270, width - 24));
+      const estimatedHeight = hit.type === "agent" ? 315 :
+        hit.type === "dock" ? 330 : 350;
+      let left = pointerX + 18;
+      if (left + tooltipWidth > viewportWidth - 12) {
+        left = pointerX - tooltipWidth - 18;
+      }
+      left = Math.max(12, Math.min(left, viewportWidth - tooltipWidth - 12));
+      let top = pointerY + 16;
+      if (top + estimatedHeight > viewportHeight - 12) {
+        top = pointerY - estimatedHeight - 16;
+      }
+      top = Math.max(12, Math.min(top, viewportHeight - estimatedHeight - 12));
+      const identity = hit.type === "agent" ? hit.agent.name :
+        hit.type === "dock" ? hit.dock.key : hit.mission.id;
+      setHovered(function (previous) {
+        if (previous &&
+            previous.type === hit.type &&
+            previous.identity === identity &&
+            Math.abs(previous.left - left) < 3 &&
+            Math.abs(previous.top - top) < 3) {
+          return previous;
+        }
+        const subject = hit.type === "agent"
+          ? { agent: hit.agent }
+          : hit.type === "dock"
+            ? { dock: hit.dock }
+            : { mission: hit.mission };
+        return Object.assign({
+          type: hit.type,
+          identity,
+          left,
+          top,
+          width: tooltipWidth,
+        }, subject);
+      });
+    };
+    const handleKeyDown = function (event) {
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+        event.preventDefault();
+        setKeyboardMission(function (current) {
+          return props.scene.missions.length ? (current + 1) % props.scene.missions.length : 0;
+        });
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+        event.preventDefault();
+        setKeyboardMission(function (current) {
+          return props.scene.missions.length
+            ? (current - 1 + props.scene.missions.length) % props.scene.missions.length
+            : 0;
+        });
+      } else if (event.key === "Enter") {
+        const mission = props.scene.missions[keyboardMission];
+        if (mission && mission.anchor && props.onOpen) props.onOpen(mission.anchor);
+      } else if (event.key === "Escape") {
+        setSelectedAgents(new Set());
+      }
+    };
+
+    const selectedRows = props.scene.roster.rows.filter(function (row) {
+      return selectedAgents.has(row.name);
+    });
+
+    return h("div", { className: "hermes-agency-canvas-wrap", ref: wrapRef },
+      h("canvas", {
+        ref: canvasRef,
+        className: "hermes-agency-canvas",
+        height: layout.height,
+        tabIndex: 0,
+        role: "img",
+        "data-visible-mission-states": props.scene.missions.map(function (mission) {
+          return mission.status;
+        }).join(","),
+        "data-running-agents": props.scene.roster.rows.filter(function (row) {
+          return row.state === "running";
+        }).length,
+        "data-supervising-agents": props.scene.roster.rows.filter(function (row) {
+          return row.state === "supervising";
+        }).length,
+        "data-review-tasks": props.scene.reviewTaskCount,
+        "data-blocked-tasks": props.scene.blockedTaskCount,
+        "aria-label": `${props.scene.bases.length} agency bases, ${props.scene.missions.length} current or next missions, ${props.scene.reviewTaskCount} cards waiting for review, ${props.scene.blockedTaskCount} cards needing action, and ${props.scene.roster.rows.length} agent profiles. Green agents execute product work; cyan agents supervise the control plane. Use arrow keys to move between missions and Enter to open one.`,
+        onClick: handleClick,
+        onPointerMove: handlePointerMove,
+        onPointerLeave: function () {
+          if (canvasRef.current) canvasRef.current.style.cursor = "default";
+          setHovered(null);
+        },
+        onMouseLeave: function () { setHovered(null); },
+        onKeyDown: handleKeyDown,
+      }),
+      h(AgencyHoverInspector, { hover: hovered }),
+      selectedRows.length > 0
+        ? h("div", { className: "hermes-canvas-selection" },
+            h("div", { className: "hermes-canvas-selection-copy" },
+              h("strong", null, `${selectedRows.length} agent${selectedRows.length === 1 ? "" : "s"} selected`),
+              h("span", null, selectedRows.map(function (row) { return "@" + row.name; }).join(" · ")),
+            ),
+            h("span", { className: "hermes-canvas-selection-note" },
+              "Command actions are intentionally not wired yet; dispatch remains automation-owned."),
+            h("button", {
+              type: "button",
+              onClick: function () { setSelectedAgents(new Set()); },
+            }, "Clear"),
+          )
+        : h("div", { className: "hermes-canvas-hint" },
+            "Click a mission to open it. Click agents to inspect selection; Shift-click selects several."),
+    );
+  }
+
+  function AgencyYard(props) {
+    const [profiles, setProfiles] = useState([]);
+    const [overviewBoard, setOverviewBoard] = useState(null);
+
+    useEffect(function () {
+      let cancelled = false;
+      SDK.fetchJSON(`${API}/profiles`)
+        .then(function (data) {
+          if (!cancelled) setProfiles((data && data.profiles) || []);
+        })
+        .catch(function () {
+          // Board assignees still render truthfully if profile metadata is
+          // temporarily unavailable; the view does not invent roster rows.
+        });
+      return function () { cancelled = true; };
+    }, []);
+
+    const loadOverview = useCallback(function () {
+      return SDK.fetchJSON(`${API}/agency-overview`)
+        .then(function (data) {
+          setOverviewBoard(data);
+          return data;
+        })
+        .catch(function () {
+          // Keep the last truthful cross-board snapshot. On first-load failure,
+          // the selected board remains a clearly narrower fallback.
+          return null;
+        });
+    }, []);
+
+    useEffect(function () {
+      loadOverview();
+      const interval = setInterval(loadOverview, 15000);
+      return function () { clearInterval(interval); };
+    }, [loadOverview]);
+
+    useEffect(function () {
+      if (props.board && props.board.latest_event_id != null) loadOverview();
+    }, [props.board && props.board.latest_event_id, loadOverview]);
+
+    const scene = useMemo(function () {
+      return buildYardScene(overviewBoard || props.board, profiles);
+    }, [overviewBoard, props.board, profiles]);
+
+    const taskCounts = {
+      supervising: scene.roster.rows.filter(function (row) {
+        return row.state === "supervising";
+      }).length,
+      running: scene.roster.openTasks.filter(function (task) { return task.status === "running"; }).length,
+      ready: scene.roster.openTasks.filter(function (task) { return task.status === "ready"; }).length,
+      review: scene.reviewTaskCount,
+      blocked: scene.blockedTaskCount,
+    };
+
+    return h("section", { className: "hermes-agency-yard", "aria-labelledby": "agency-yard-title" },
+      h("div", { className: "hermes-yard-masthead" },
+        h("div", { className: "hermes-yard-title-block" },
+          h("div", { className: "hermes-yard-kicker" },
+            h("span", { className: "hermes-yard-live-dot", "aria-hidden": "true" }),
+            "LIVE FROM THE BOARD",
+          ),
+          h("h2", { id: "agency-yard-title" }, "The agencies, on one floor"),
+          h("p", null,
+            "Green agents execute product work. Cyan Lead and Operator supervise from Control Room; review and blocker queues stay separate.",
+          ),
+        ),
+        h("div", { className: "hermes-yard-actions" },
+          h("button", {
+            type: "button",
+            className: "hermes-yard-action",
+            onClick: function () {
+              loadOverview();
+              if (props.onRefresh) props.onRefresh();
+            },
+          }, "Refresh"),
+        ),
+      ),
+      h("div", { className: "hermes-yard-metrics", "aria-label": "Live task totals" },
+        h(YardMetric, { value: taskCounts.supervising, label: "supervising now", tone: "supervising" }),
+        h(YardMetric, { value: taskCounts.running, label: "running now", tone: "running" }),
+        h(YardMetric, { value: taskCounts.ready, label: "ready to dispatch", tone: "ready" }),
+        h(YardMetric, { value: taskCounts.review, label: "waiting for review", tone: "review" }),
+        h(YardMetric, { value: taskCounts.blocked, label: "need action", tone: "blocked" }),
+      ),
+      scene.roster.rows.length === 0
+        ? h("div", { className: "hermes-yard-empty" },
+            "No installed profiles or assigned open tasks were found on this board.")
+        : h(AgencyCanvas, {
+            scene,
+            onOpen: props.onOpen,
+          }),
+      h("div", { className: "hermes-yard-legend", "aria-label": "Map legend" },
+        h("span", null, h("i", { className: "is-supervising" }), "Control-plane supervisor"),
+        h("span", null, h("i", { className: "is-running" }), "Executing now"),
+        h("span", null, h("i", { className: "is-ready" }), "Ready or queued at base"),
+        h("span", null, h("i", { className: "is-review" }), "Waiting at review gate"),
+        h("span", null, h("i", { className: "is-blocked" }), "Needs action at blocked dock"),
+        h("strong", null, "Green = product execution · cyan = supervision."),
       ),
     );
   }
