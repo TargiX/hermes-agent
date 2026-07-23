@@ -164,6 +164,128 @@ def test_agency_overview_combines_open_work_across_active_boards(client):
     }["growth"] == 2
 
 
+def test_agency_overview_exposes_recent_factory_objects(client):
+    """The canvas gets exact task transformations, never PR guesses from prose."""
+    now = int(time.time())
+    kb.create_board("engineering", name="Engineering Agency")
+    with kb.connect(board="engineering") as conn:
+        published_id = kb.create_task(
+            conn,
+            title="Publish creator export",
+            assignee="agency-publisher",
+        )
+        blocked_id = kb.create_task(
+            conn,
+            title="Investigate unrelated PR #999 mention",
+            assignee="terra-fullstack",
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'done', started_at = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (now - 90, now - 10, published_id),
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'blocked', started_at = ?,
+                block_kind = 'needs_input'
+            WHERE id = ?
+            """,
+            (now - 60, blocked_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, profile, status, started_at, ended_at,
+                outcome, metadata
+            ) VALUES (?, ?, 'done', ?, ?, 'completed', ?)
+            """,
+            (
+                published_id,
+                "agency-publisher",
+                now - 90,
+                now - 10,
+                json.dumps(
+                    {
+                        "pr_url": (
+                            "https://github.com/TargiX/nuxt-flux/pull/951"
+                        ),
+                        "pr_number": 951,
+                        "pr_state": "OPEN",
+                        "draft": True,
+                    }
+                ),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, profile, status, started_at, ended_at,
+                outcome, metadata
+            ) VALUES (?, ?, 'blocked', ?, ?, 'blocked', ?)
+            """,
+            (
+                blocked_id,
+                "terra-fullstack",
+                now - 60,
+                now - 5,
+                json.dumps({"note": "PR #999 is only context"}),
+            ),
+        )
+        for task_id, kind, timestamp in (
+            (published_id, "claimed", now - 80),
+            (published_id, "spawned", now - 70),
+            (published_id, "completed", now - 10),
+            (blocked_id, "claimed", now - 50),
+            (blocked_id, "blocked", now - 5),
+        ):
+            conn.execute(
+                """
+                INSERT INTO task_events (task_id, kind, payload, created_at)
+                VALUES (?, ?, '{}', ?)
+                """,
+                (task_id, kind, timestamp),
+            )
+        conn.commit()
+
+    response = client.get("/api/plugins/kanban/agency-overview")
+
+    assert response.status_code == 200
+    flow = response.json()["factory_flow"]
+    assert flow["schema"] == "agency-factory-flow/v1"
+    assert flow["window_seconds"] == 2 * 60 * 60
+    objects = {
+        item["task"]["id"]: item
+        for item in flow["objects"]
+    }
+    published = objects[published_id]
+    assert published["artifact"] == {
+        "kind": "pull_request",
+        "label": "PR #951",
+        "pr_number": 951,
+        "url": "https://github.com/TargiX/nuxt-flux/pull/951",
+        "state": "OPEN",
+        "draft": True,
+        "run_id": published["artifact"]["run_id"],
+    }
+    assert {
+        event["kind"] for event in published["events"]
+    } >= {"created", "claimed", "spawned", "completed"}
+
+    blocked = objects[blocked_id]
+    assert blocked["artifact"] is None
+    assert blocked["blocker"] == {
+        "kind": "needs_input",
+        "label": "needs input",
+    }
+    assert blocked["task"]["title"] == (
+        "Investigate unrelated PR #999 mention"
+    )
+
+
 def test_agency_overview_exposes_latest_meaningful_worker_heartbeat(client):
     """The live canvas gets explicit progress without exposing hidden reasoning."""
     kb.create_board("engineering", name="Engineering Agency")

@@ -1700,6 +1700,23 @@
 
   function buildYardScene(board, profiles) {
     const roster = buildYardRoster(board, profiles);
+    const factoryFlow = (board && board.factory_flow) || {};
+    const factoryObjects = Array.isArray(factoryFlow.objects)
+      ? factoryFlow.objects
+          .filter(function (object) {
+            // A running task already exists as the single live paper object
+            // beside its worker. It joins the conveyor after that run exits.
+            return !object.task || object.task.status !== "running";
+          })
+          .map(function (object) {
+            return Object.assign({}, object, {
+              task: Object.assign({}, object.task || {}, {
+                board_slug: object.board_slug,
+                board_name: object.board_name,
+              }),
+            });
+          })
+      : [];
     const allTasks = [];
     for (const column of (board && board.columns) || []) {
       for (const task of column.tasks || []) allTasks.push(task);
@@ -1894,6 +1911,8 @@
       }).length,
       fieldMissionCount: fieldMissions.length,
       totalMissionCount: missions.length,
+      factoryObjects,
+      factoryWindowSeconds: Number(factoryFlow.window_seconds || 0),
     };
   }
 
@@ -2214,23 +2233,60 @@
     ctx.save();
     ctx.shadowColor = color;
     ctx.shadowBlur = keyboardSelected ? 18 : pulse;
-    yardHexagon(ctx, x, y, 38);
     ctx.fillStyle = "rgba(10,29,37,0.96)";
-    ctx.fill();
     ctx.lineWidth = keyboardSelected ? 3 : 2;
     ctx.strokeStyle = color;
-    ctx.stroke();
-    ctx.shadowBlur = 0;
-    ctx.beginPath();
-    ctx.arc(x, y, 19, 0, Math.PI * 2);
-    ctx.fillStyle = color;
-    ctx.globalAlpha = 0.18;
-    ctx.fill();
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.arc(x, y, 5, 0, Math.PI * 2);
-    ctx.fill();
+    if (mission.activityKind) {
+      yardRoundedRect(ctx, x - 46, y - 31, 92, 62, 8);
+      ctx.fill();
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.globalAlpha = 0.2;
+      ctx.fillStyle = color;
+      yardRoundedRect(ctx, x - 37, y - 20, 74, 28, 5);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.4;
+      for (const dialX of [-23, 0, 23]) {
+        ctx.beginPath();
+        ctx.arc(x + dialX, y + 19, 3.2, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(x - 34, y - 39);
+      ctx.lineTo(x + 23, y - 39);
+      ctx.lineTo(x + 34, y - 28);
+      ctx.lineTo(x + 34, y + 39);
+      ctx.lineTo(x - 34, y + 39);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.beginPath();
+      ctx.moveTo(x + 23, y - 39);
+      ctx.lineTo(x + 23, y - 28);
+      ctx.lineTo(x + 34, y - 28);
+      ctx.stroke();
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.18;
+      yardRoundedRect(ctx, x - 24, y - 23, 48, 13, 3);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = color;
+      ctx.font = "800 7px ui-monospace, monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("TASK", x, y - 14);
+      ctx.strokeStyle = "rgba(234,240,236,0.3)";
+      ctx.lineWidth = 1;
+      for (const lineY of [1, 10, 19]) {
+        ctx.beginPath();
+        ctx.moveTo(x - 21, y + lineY);
+        ctx.lineTo(x + 21, y + lineY);
+        ctx.stroke();
+      }
+    }
     ctx.fillStyle = "rgba(234,240,236,0.56)";
     ctx.textAlign = "center";
     ctx.font = "700 8px ui-monospace, monospace";
@@ -2241,7 +2297,7 @@
           ? "LIVE WORK HUB"
           : `${mission.tasks.length} TASK${mission.tasks.length === 1 ? "" : "S"}`,
       x,
-      y - 49,
+      y - 51,
     );
     ctx.fillStyle = YARD_CANVAS_COLORS.fog;
     ctx.font = "650 11px ui-sans-serif, system-ui, sans-serif";
@@ -2250,6 +2306,314 @@
     ctx.font = "700 8px ui-monospace, monospace";
     ctx.fillText(yardStatusLabel(mission.status).toUpperCase(), x, y + 103);
     ctx.restore();
+  }
+
+  function yardFactoryEventKinds(object) {
+    return new Set((object.events || []).map(function (event) {
+      return event.kind;
+    }));
+  }
+
+  function yardFactoryEventLabel(kind) {
+    const labels = {
+      created: "Created",
+      claimed: "Claimed",
+      spawned: "Worker started",
+      commented: "Task updated",
+      blocked: "Blocked",
+      unblocked: "Unblocked",
+      completed: "Completed",
+    };
+    return labels[kind] || String(kind || "Updated").replace(/_/g, " ");
+  }
+
+  function yardDrawFlowArrow(ctx, fromX, toX, y, reached, color) {
+    const start = fromX + 42;
+    const end = toX - 42;
+    if (end <= start) return;
+    ctx.save();
+    ctx.strokeStyle = reached ? color : "rgba(234,240,236,0.16)";
+    ctx.fillStyle = reached ? color : "rgba(234,240,236,0.16)";
+    ctx.globalAlpha = reached ? 0.75 : 1;
+    ctx.lineWidth = reached ? 1.7 : 1;
+    ctx.setLineDash(reached ? [] : [3, 6]);
+    ctx.beginPath();
+    ctx.moveTo(start, y);
+    ctx.lineTo(end, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(end, y);
+    ctx.lineTo(end - 7, y - 4);
+    ctx.lineTo(end - 7, y + 4);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function yardDrawFactoryTask(ctx, object, x, y, compact) {
+    const task = object.task || {};
+    const latest = yardFactoryEventLabel(object.latest_event_kind);
+    const width = compact ? 58 : 74;
+    const height = compact ? 50 : 58;
+    ctx.save();
+    ctx.fillStyle = "rgba(234,240,236,0.96)";
+    ctx.strokeStyle = YARD_CANVAS_COLORS.amber;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x - width / 2, y - height / 2);
+    ctx.lineTo(x + width / 2 - 12, y - height / 2);
+    ctx.lineTo(x + width / 2, y - height / 2 + 12);
+    ctx.lineTo(x + width / 2, y + height / 2);
+    ctx.lineTo(x - width / 2, y + height / 2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x + width / 2 - 12, y - height / 2);
+    ctx.lineTo(x + width / 2 - 12, y - height / 2 + 12);
+    ctx.lineTo(x + width / 2, y - height / 2 + 12);
+    ctx.stroke();
+    ctx.fillStyle = YARD_CANVAS_COLORS.ink;
+    ctx.textAlign = "center";
+    ctx.font = "800 7px ui-monospace, monospace";
+    ctx.fillText("TASK", x, y - 10);
+    ctx.font = "650 6px ui-monospace, monospace";
+    ctx.fillStyle = "#46606a";
+    ctx.fillText(String(task.id || "").slice(0, 13), x, y + 2);
+    ctx.fillStyle = YARD_CANVAS_COLORS.amber;
+    ctx.font = "800 6px ui-monospace, monospace";
+    ctx.fillText(latest.toUpperCase(), x, y + 16);
+    ctx.restore();
+  }
+
+  function yardDrawFactoryWorkbench(ctx, object, x, y, reached) {
+    const task = object.task || {};
+    const color = reached ? YARD_CANVAS_COLORS.mint : YARD_CANVAS_COLORS.muted;
+    ctx.save();
+    ctx.globalAlpha = reached ? 1 : 0.38;
+    ctx.fillStyle = "rgba(10,29,37,0.94)";
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    yardRoundedRect(ctx, x - 39, y - 23, 78, 46, 7);
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x - 45, y + 25);
+    ctx.lineTo(x + 45, y + 25);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x - 30, y + 25);
+    ctx.lineTo(x - 25, y + 34);
+    ctx.moveTo(x + 30, y + 25);
+    ctx.lineTo(x + 25, y + 34);
+    ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.textAlign = "center";
+    ctx.font = "800 7px ui-monospace, monospace";
+    ctx.fillText(reached ? "WORKED" : "WAITING", x, y - 5);
+    ctx.fillStyle = reached
+      ? YARD_CANVAS_COLORS.fog
+      : "rgba(234,240,236,0.45)";
+    ctx.font = "650 7px ui-monospace, monospace";
+    ctx.fillText(
+      task.assignee ? "@" + task.assignee : "UNASSIGNED",
+      x,
+      y + 8,
+    );
+    ctx.restore();
+  }
+
+  function yardDrawFactoryArtifact(ctx, object, x, y) {
+    const artifact = object.artifact;
+    const blocker = object.blocker;
+    ctx.save();
+    ctx.textAlign = "center";
+    if (artifact && artifact.kind === "pull_request") {
+      ctx.fillStyle = "rgba(10,29,37,0.96)";
+      ctx.strokeStyle = YARD_CANVAS_COLORS.review;
+      ctx.lineWidth = 2;
+      yardRoundedRect(ctx, x - 38, y - 26, 76, 52, 10);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = YARD_CANVAS_COLORS.review;
+      ctx.font = "800 7px ui-monospace, monospace";
+      ctx.fillText(artifact.draft ? "DRAFT PR" : "PULL REQUEST", x, y - 7);
+      ctx.fillStyle = YARD_CANVAS_COLORS.fog;
+      ctx.font = "800 12px ui-monospace, monospace";
+      ctx.fillText(artifact.label, x, y + 10);
+    } else if (artifact && artifact.kind === "patch") {
+      ctx.strokeStyle = YARD_CANVAS_COLORS.mint;
+      ctx.fillStyle = "rgba(10,29,37,0.96)";
+      ctx.lineWidth = 1.5;
+      for (const offset of [8, 4, 0]) {
+        yardRoundedRect(ctx, x - 34 + offset, y - 25 - offset, 68, 50, 5);
+        ctx.fill();
+        ctx.stroke();
+      }
+      ctx.fillStyle = YARD_CANVAS_COLORS.mint;
+      ctx.font = "800 8px ui-monospace, monospace";
+      ctx.fillText("CODE PATCH", x + 4, y - 5);
+      ctx.fillStyle = YARD_CANVAS_COLORS.fog;
+      ctx.font = "700 8px ui-monospace, monospace";
+      ctx.fillText(`${artifact.files_count || 0} FILES`, x + 4, y + 10);
+    } else if (artifact && artifact.kind === "result") {
+      ctx.fillStyle = "rgba(10,29,37,0.96)";
+      ctx.strokeStyle = YARD_CANVAS_COLORS.mint;
+      ctx.lineWidth = 1.5;
+      yardRoundedRect(ctx, x - 35, y - 27, 70, 54, 5);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = YARD_CANVAS_COLORS.mint;
+      ctx.font = "800 7px ui-monospace, monospace";
+      ctx.fillText("RESULT", x, y - 9);
+      ctx.strokeStyle = "rgba(234,240,236,0.34)";
+      for (const lineY of [0, 8, 16]) {
+        ctx.beginPath();
+        ctx.moveTo(x - 22, y + lineY);
+        ctx.lineTo(x + 22, y + lineY);
+        ctx.stroke();
+      }
+    } else if (blocker) {
+      ctx.strokeStyle = YARD_CANVAS_COLORS.coral;
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(x - 32, y - 20);
+      ctx.lineTo(x + 32, y + 20);
+      ctx.moveTo(x + 32, y - 20);
+      ctx.lineTo(x - 32, y + 20);
+      ctx.stroke();
+      ctx.fillStyle = YARD_CANVAS_COLORS.coral;
+      ctx.font = "800 7px ui-monospace, monospace";
+      ctx.fillText("NO OUTPUT", x, y + 34);
+    } else {
+      ctx.strokeStyle = "rgba(234,240,236,0.2)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 5]);
+      yardRoundedRect(ctx, x - 34, y - 24, 68, 48, 6);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "rgba(234,240,236,0.42)";
+      ctx.font = "700 7px ui-monospace, monospace";
+      ctx.fillText("NO OUTPUT YET", x, y + 3);
+    }
+    ctx.restore();
+  }
+
+  function yardDrawFactoryGate(ctx, object, x, y) {
+    const task = object.task || {};
+    const isBlocked = Boolean(object.blocker);
+    const isReview = isBlocked && object.blocker.kind === "review_required";
+    const isDone = task.status === "done";
+    const color = isReview
+      ? YARD_CANVAS_COLORS.review
+      : isBlocked
+      ? YARD_CANVAS_COLORS.coral
+      : isDone
+        ? YARD_CANVAS_COLORS.mint
+        : yardStateColor(task.status);
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = "rgba(10,29,37,0.94)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x - 29, y + 28);
+    ctx.lineTo(x - 29, y - 27);
+    ctx.lineTo(x + 29, y - 27);
+    ctx.lineTo(x + 29, y + 28);
+    ctx.stroke();
+    if (isBlocked && !isReview) {
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.moveTo(x - 24, y - 15);
+      ctx.lineTo(x + 24, y + 15);
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.15;
+      ctx.fillRect(x - 23, y - 20, 46, 42);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = color;
+      ctx.font = "900 16px ui-monospace, monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(isDone ? "✓" : "→", x, y + 7);
+    }
+    ctx.fillStyle = color;
+    ctx.font = "800 7px ui-monospace, monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(
+      isBlocked
+        ? yardBlockCauseLabel(object.blocker.kind).toUpperCase()
+        : yardStatusLabel(task.status).toUpperCase(),
+      x,
+      y + 42,
+    );
+    ctx.restore();
+  }
+
+  function yardDrawFactoryRow(ctx, object, layout, rowIndex) {
+    const y = layout.factoryTop + rowIndex * layout.factoryRowHeight;
+    const stageXs = layout.factoryStageXs;
+    const eventKinds = yardFactoryEventKinds(object);
+    const worked = Boolean(
+      object.task && object.task.started_at
+    ) || eventKinds.has("claimed") || eventKinds.has("spawned") ||
+      eventKinds.has("completed") || eventKinds.has("blocked");
+    const outputReached = Boolean(object.artifact) || Boolean(object.blocker);
+    const gateReached = outputReached || eventKinds.has("completed");
+    const pathColor = object.blocker
+      ? object.blocker.kind === "review_required"
+        ? YARD_CANVAS_COLORS.review
+        : YARD_CANVAS_COLORS.coral
+      : object.artifact
+        ? YARD_CANVAS_COLORS.mint
+        : YARD_CANVAS_COLORS.amber;
+
+    ctx.save();
+    ctx.strokeStyle = "rgba(234,240,236,0.08)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(layout.fieldLeft, y + 53);
+    ctx.lineTo(layout.width - layout.fieldRight, y + 53);
+    ctx.stroke();
+    ctx.restore();
+    yardDrawFlowArrow(ctx, stageXs[0], stageXs[1], y, worked, pathColor);
+    yardDrawFlowArrow(ctx, stageXs[1], stageXs[2], y, outputReached, pathColor);
+    yardDrawFlowArrow(ctx, stageXs[2], stageXs[3], y, gateReached, pathColor);
+    yardDrawFactoryTask(ctx, object, stageXs[0], y, layout.compact);
+    yardDrawFactoryWorkbench(ctx, object, stageXs[1], y, worked);
+    yardDrawFactoryArtifact(ctx, object, stageXs[2], y);
+    yardDrawFactoryGate(ctx, object, stageXs[3], y);
+
+    ctx.save();
+    ctx.fillStyle = YARD_CANVAS_COLORS.fog;
+    ctx.font = "650 9px ui-sans-serif, system-ui, sans-serif";
+    ctx.textAlign = "left";
+    const titleX = layout.fieldLeft + 4;
+    yardDrawWrapped(
+      ctx,
+      object.task && object.task.title,
+      titleX,
+      y - 45,
+      Math.max(130, stageXs[1] - titleX - 48),
+      11,
+      2,
+    );
+    ctx.fillStyle = "rgba(234,240,236,0.42)";
+    ctx.font = "650 7px ui-monospace, monospace";
+    ctx.textAlign = "right";
+    ctx.fillText(
+      String(object.board_name || object.board_slug || "").toUpperCase(),
+      layout.width - layout.fieldRight,
+      y - 43,
+    );
+    ctx.restore();
+    return {
+      x: layout.fieldLeft,
+      y: y - 52,
+      width: layout.width - layout.fieldLeft - layout.fieldRight,
+      height: 105,
+    };
   }
 
   function yardBaseStackHeight(bases, compact) {
@@ -2273,7 +2637,7 @@
     }, 22);
   }
 
-  function yardCanvasLayout(width, missionCount, bases, docks) {
+  function yardCanvasLayout(width, missionCount, factoryCount, bases, docks) {
     const compact = width < 760;
     const columns = compact ? 1 : (width < 1080 ? 2 : 3);
     const fieldLeft = compact ? 26 : 340;
@@ -2289,10 +2653,21 @@
       ? top + rows * rowHeight + 24
       : 62;
     const missionHeight = top + rows * rowHeight + 72;
+    const visibleFactoryCount = Math.min(factoryCount, compact ? 4 : 6);
+    const factoryRowHeight = compact ? 118 : 112;
+    const factoryTop = missionHeight + (visibleFactoryCount ? 62 : 0);
+    const factoryHeight = visibleFactoryCount
+      ? factoryTop + visibleFactoryCount * factoryRowHeight + 42
+      : missionHeight;
+    const factoryUsable = width - fieldLeft - fieldRight;
+    const factoryStageXs = [0.12, 0.42, 0.69, 0.91].map(function (portion) {
+      return fieldLeft + factoryUsable * portion;
+    });
     const height = compact
-      ? dockTop + dockStackHeight + 28
-      : Math.max(620, missionHeight, baseStackHeight + 36, dockStackHeight + 36);
+      ? Math.max(dockTop + dockStackHeight + 28, factoryHeight)
+      : Math.max(620, factoryHeight, baseStackHeight + 36, dockStackHeight + 36);
     return {
+      width,
       compact,
       columns,
       fieldLeft,
@@ -2304,6 +2679,10 @@
       height,
       baseStackHeight,
       dockStackHeight,
+      factoryTop,
+      factoryRowHeight,
+      factoryStageXs,
+      visibleFactoryCount,
     };
   }
 
@@ -2317,6 +2696,7 @@
       triage: "Needs shaping",
       todo: "Waiting",
       scheduled: "Scheduled",
+      done: "Completed",
       idle: "Available",
     };
     return labels[status] || String(status || "Unknown");
@@ -2350,13 +2730,99 @@
       ? yardStateColor(hover.agent.state)
       : hover.type === "dock"
         ? yardStateColor(hover.dock.state)
-        : yardStateColor(hover.mission.status);
+        : hover.type === "factory"
+          ? hover.factory.blocker
+            ? hover.factory.blocker.kind === "review_required"
+              ? YARD_CANVAS_COLORS.review
+              : YARD_CANVAS_COLORS.coral
+            : hover.factory.artifact
+              ? YARD_CANVAS_COLORS.mint
+              : YARD_CANVAS_COLORS.amber
+          : yardStateColor(hover.mission.status);
     const style = {
       left: hover.left + "px",
       top: hover.top + "px",
       width: hover.width + "px",
       "--tooltip-tone": tone,
     };
+
+    if (hover.type === "factory") {
+      const object = hover.factory;
+      const task = object.task || {};
+      const artifact = object.artifact;
+      const events = (object.events || []).slice(-6).reverse();
+      return h("aside", {
+        className: "hermes-canvas-tooltip hermes-canvas-tooltip--mission",
+        role: "tooltip",
+        style,
+      },
+        h("div", { className: "hermes-canvas-tooltip-head" },
+          h("div", { className: "hermes-canvas-tooltip-heading" },
+            h("span", { className: "hermes-canvas-tooltip-kicker" },
+              "FACTORY OBJECT · " +
+              String(object.board_name || object.board_slug || "BOARD").toUpperCase()),
+            h("strong", null, task.title || "Untitled task"),
+          ),
+          h(YardTooltipStatus, { status: task.status }),
+        ),
+        h("p", { className: "hermes-canvas-tooltip-description" },
+          artifact
+            ? `This task produced ${artifact.label || artifact.kind}.`
+            : object.blocker
+              ? `Work stopped at ${yardBlockCauseLabel(object.blocker.kind)}.`
+              : "This task has not produced a machine-readable output yet."),
+        h("div", { className: "hermes-canvas-tooltip-facts" },
+          h("span", null,
+            h("small", null, "TASK"),
+            h("strong", null, task.id || "Unknown"),
+          ),
+          h("span", null,
+            h("small", null, "WORKER"),
+            h("strong", null, task.assignee ? "@" + task.assignee : "Unassigned"),
+          ),
+          h("span", null,
+            h("small", null, "OUTPUT"),
+            h("strong", null,
+              artifact
+                ? artifact.label
+                : object.blocker
+                  ? "Blocker"
+                  : "Pending"),
+          ),
+        ),
+        events.length
+          ? h("div", { className: "hermes-canvas-tooltip-task-list" },
+              h("span", { className: "hermes-canvas-tooltip-section-label" },
+                "RECORDED TRANSFORMATIONS"),
+              events.map(function (event) {
+                return h("div", {
+                  className: "hermes-canvas-tooltip-task",
+                  key: event.id,
+                },
+                  h("i", { style: { "--task-tone": tone } }),
+                  h("span", null,
+                    h("strong", null, yardFactoryEventLabel(event.kind)),
+                    h("code", null,
+                      [
+                        event.actor ? "@" + event.actor : "",
+                        event.created_at
+                          ? new Date(event.created_at * 1000).toLocaleTimeString(
+                              [],
+                              { hour: "2-digit", minute: "2-digit" },
+                            )
+                          : "",
+                      ].filter(Boolean).join(" · ")),
+                  ),
+                );
+              }),
+            )
+          : null,
+        h("div", { className: "hermes-canvas-tooltip-foot" },
+          artifact && artifact.kind === "pull_request"
+            ? "PR identity comes from the exact publication receipt, never from text mentions."
+            : "Only explicit board events are shown; this is operational history, not private reasoning."),
+      );
+    }
 
     if (hover.type === "agent") {
       const agent = hover.agent;
@@ -2610,6 +3076,7 @@
     const layout = yardCanvasLayout(
       width || 900,
       props.scene.missions.length,
+      props.scene.factoryObjects.length,
       props.scene.bases,
       props.scene.docks,
     );
@@ -2705,7 +3172,7 @@
           ctx.textAlign = "center";
           ctx.fillText("AGENT BASES", 150, 28);
           ctx.fillText(
-            "ACTIVE WORK · BUILD · PLAN · REVIEW · RECOVER",
+            "LIVE WORKBENCH · BUILD · PLAN · REVIEW · RECOVER",
             layout.fieldLeft + (width - layout.fieldLeft - layout.fieldRight) / 2,
             28,
           );
@@ -2912,10 +3379,59 @@
           }
         });
 
+        if (layout.visibleFactoryCount > 0) {
+          const headerY = layout.factoryTop - 54;
+          ctx.save();
+          ctx.fillStyle = YARD_CANVAS_COLORS.amber;
+          ctx.font = "800 8px ui-monospace, monospace";
+          ctx.textAlign = "left";
+          ctx.fillText(
+            `RECENT FACTORY FLOW · LAST ${Math.round(
+              (props.scene.factoryWindowSeconds || 7200) / 3600,
+            )}H`,
+            layout.fieldLeft,
+            headerY,
+          );
+          const stageLabels = ["TASK INTAKE", "WORKBENCH", "OUTPUT", "GATE"];
+          ctx.fillStyle = "rgba(234,240,236,0.46)";
+          ctx.textAlign = "center";
+          stageLabels.forEach(function (label, index) {
+            ctx.fillText(label, layout.factoryStageXs[index], headerY + 19);
+          });
+          ctx.restore();
+
+          props.scene.factoryObjects
+            .slice(0, layout.visibleFactoryCount)
+            .forEach(function (object, index) {
+              const bounds = yardDrawFactoryRow(ctx, object, layout, index);
+              hits.push(Object.assign({
+                type: "factory",
+                factory: object,
+              }, bounds));
+            });
+          if (props.scene.factoryObjects.length > layout.visibleFactoryCount) {
+            ctx.save();
+            ctx.fillStyle = "rgba(234,240,236,0.42)";
+            ctx.font = "650 8px ui-monospace, monospace";
+            ctx.textAlign = "right";
+            ctx.fillText(
+              `+${props.scene.factoryObjects.length - layout.visibleFactoryCount} EARLIER OBJECTS ON BOARD`,
+              width - layout.fieldRight,
+              layout.factoryTop +
+                layout.visibleFactoryCount * layout.factoryRowHeight - 4,
+            );
+            ctx.restore();
+          }
+        }
+
         ctx.fillStyle = "rgba(234,240,236,0.44)";
         ctx.font = "600 9px ui-monospace, monospace";
         ctx.textAlign = "left";
-        ctx.fillText("LIVE FLOOR · AGENTS MOVE ONLY WITH AN ACTIVE RUN", 18, height - 20);
+        ctx.fillText(
+          "FACTORY FLOOR · PEOPLE ARE LIVE · OBJECTS PRESERVE RECENT TRANSFORMATIONS",
+          18,
+          height - 20,
+        );
         hitRef.current = hits;
 
         if (animated && !reducedMotion) frame = requestAnimationFrame(paint);
@@ -2927,8 +3443,9 @@
         if (frame) cancelAnimationFrame(frame);
       };
     }, [width, layout.height, layout.columns, layout.columnWidth, layout.fieldLeft,
-      layout.rowHeight, layout.top, layout.dockTop, layout.compact, props.scene,
-      selectedAgents, keyboardMission]);
+      layout.rowHeight, layout.top, layout.dockTop, layout.factoryTop,
+      layout.factoryRowHeight, layout.visibleFactoryCount, layout.compact,
+      props.scene, selectedAgents, keyboardMission]);
 
     const pointFromEvent = function (event) {
       const rect = canvasRef.current.getBoundingClientRect();
@@ -2963,6 +3480,10 @@
         if (hit.mission.anchor && props.onOpen) props.onOpen(hit.mission.anchor);
         return;
       }
+      if (hit.type === "factory") {
+        if (hit.factory.task && props.onOpen) props.onOpen(hit.factory.task);
+        return;
+      }
       if (hit.type === "dock") return;
       setSelectedAgents(function (previous) {
         const next = new Set(event.shiftKey ? previous : []);
@@ -2984,7 +3505,8 @@
       const viewportHeight = window.innerHeight;
       const tooltipWidth = Math.min(340, Math.max(270, width - 24));
       const estimatedHeight = hit.type === "agent" ? 315 :
-        hit.type === "dock" ? 330 : 350;
+        hit.type === "dock" ? 330 :
+          hit.type === "factory" ? 390 : 350;
       let left = pointerX + 18;
       if (left + tooltipWidth > viewportWidth - 12) {
         left = pointerX - tooltipWidth - 18;
@@ -2996,7 +3518,8 @@
       }
       top = Math.max(12, Math.min(top, viewportHeight - estimatedHeight - 12));
       const identity = hit.type === "agent" ? hit.agent.name :
-        hit.type === "dock" ? hit.dock.key : hit.mission.id;
+        hit.type === "dock" ? hit.dock.key :
+          hit.type === "factory" ? hit.factory.id : hit.mission.id;
       setHovered(function (previous) {
         if (previous &&
             previous.type === hit.type &&
@@ -3009,7 +3532,9 @@
           ? { agent: hit.agent }
           : hit.type === "dock"
             ? { dock: hit.dock }
-            : { mission: hit.mission };
+            : hit.type === "factory"
+              ? { factory: hit.factory }
+              : { mission: hit.mission };
         return Object.assign({
           type: hit.type,
           identity,
@@ -3091,7 +3616,15 @@
         "data-visible-activity-kinds": props.scene.missions.map(function (mission) {
           return mission.activityKind || "delivery";
         }).join(","),
-        "aria-label": `${workingRows.length} agents working now: ${runningRows.length} building across ${props.scene.runningTaskCount} product task runs and ${supervisingRows.length} planning, review, or control agents across ${props.scene.controllerRunCount} live runs. ${baseRows.length} agents are at base. Queued cards without a live agent run are excluded.`,
+        "data-factory-objects": props.scene.factoryObjects.length,
+        "data-factory-transformations": props.scene.factoryObjects.map(function (object) {
+          return `${object.task && object.task.id}:${object.latest_event_kind}->${object.artifact
+            ? object.artifact.kind
+            : object.blocker
+              ? "blocker"
+              : "pending"}`;
+        }).join(" | "),
+        "aria-label": `${workingRows.length} agents working now: ${runningRows.length} building across ${props.scene.runningTaskCount} product task runs and ${supervisingRows.length} planning, review, or control agents across ${props.scene.controllerRunCount} live runs. ${baseRows.length} agents are at base. The factory conveyor shows ${props.scene.factoryObjects.length} recent task objects and what they became.`,
         onClick: handleClick,
         onPointerMove: handlePointerMove,
         onPointerLeave: function () {
@@ -3103,12 +3636,18 @@
       }),
       workingRows.length === 0
         ? h("div", {
-            className: "hermes-canvas-idle-truth",
+            className: cn(
+              "hermes-canvas-idle-truth",
+              props.scene.factoryObjects.length > 0 && "is-with-flow",
+            ),
             "data-testid": "agency-idle-truth",
           },
             h("span", null, "LIVE AGENCY"),
             h("strong", null, "No agent work is running right now"),
-            h("small", null, "Building, planning, review, and recovery appear here when an agent run starts."),
+            h("small", null,
+              props.scene.factoryObjects.length > 0
+                ? "The conveyor below preserves what recent tasks became."
+                : "Building, planning, review, and recovery appear here when an agent run starts."),
           )
         : null,
       h(AgencyHoverInspector, { hover: hovered }),
@@ -3128,7 +3667,9 @@
         : h("div", { className: "hermes-canvas-hint" },
             workingRows.length > 0
               ? "Hover active work or agents for details. Click a product task to open it."
-              : "Hover or click an agent to inspect it. Live task runs will appear in the center."),
+              : props.scene.factoryObjects.length > 0
+                ? "No one is running now. Hover a factory row to inspect its recorded transformations."
+                : "Hover or click an agent to inspect it. Live task runs will appear in the center."),
     );
   }
 
@@ -3205,9 +3746,7 @@
       active: scene.activeAgentCount,
       taskRuns: scene.runningTaskCount,
       controllerRuns: scene.controllerRunCount,
-      atBase: scene.roster.rows.filter(function (row) {
-        return row.state === "idle";
-      }).length,
+      factoryObjects: scene.factoryObjects.length,
     };
 
     return h("section", { className: "hermes-agency-yard", "aria-labelledby": "agency-yard-title" },
@@ -3219,7 +3758,7 @@
           ),
           h("h2", { id: "agency-yard-title" }, "The agencies, on one floor"),
           h("p", null,
-            "Building, planning, review, and recovery all count as work—but only while a real agent run is live.",
+            "Agents show who is working now. The factory floor shows what each recent task became.",
           ),
         ),
         h("div", { className: "hermes-yard-actions" },
@@ -3253,9 +3792,11 @@
           tone: "supervising",
         }),
         h(YardMetric, {
-          value: taskCounts.atBase,
-          label: taskCounts.atBase === 1 ? "agent at base" : "agents at base",
-          tone: "idle",
+          value: taskCounts.factoryObjects,
+          label: taskCounts.factoryObjects === 1
+            ? "recent factory object"
+            : "recent factory objects",
+          tone: "ready",
         }),
       ),
       h(AgencyHealthPanel, { health: agencyHealth }),
@@ -3270,8 +3811,11 @@
         h("span", null, h("i", { className: "is-supervising" }), "Planning, review, or control work"),
         h("span", null, h("i", { className: "is-idle" }), "Agent at home base"),
         h("span", null, h("i", { className: "is-running" }), "Product implementation"),
+        h("span", null, h("i", { className: "is-ready" }), "Task object"),
+        h("span", null, h("i", { className: "is-review" }), "PR, patch, or result"),
+        h("span", null, h("i", { className: "is-blocked" }), "Blocked transformation"),
         h("strong", null,
-          "Activity bubbles summarize explicit tool actions, heartbeats, or assignments—not private reasoning."),
+          "The conveyor uses explicit board events and machine-readable receipts—not private reasoning."),
       ),
     );
   }

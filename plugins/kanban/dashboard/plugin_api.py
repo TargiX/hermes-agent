@@ -969,6 +969,22 @@ BOARD_COLUMNS: list[str] = [
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
+_FACTORY_FLOW_WINDOW_SECONDS = 2 * 60 * 60
+_FACTORY_FLOW_MAX_OBJECTS = 8
+_FACTORY_FLOW_EVENT_KINDS = frozenset(
+    {
+        "created",
+        "claimed",
+        "spawned",
+        "commented",
+        "blocked",
+        "unblocked",
+        "completed",
+    }
+)
+_GITHUB_PR_URL_PATTERN = re.compile(
+    r"^https://github\.com/[^/\s]+/[^/\s]+/pull/(?P<number>\d+)$"
+)
 
 
 def _task_dict(
@@ -990,6 +1006,191 @@ def _task_dict(
     d["latest_summary"] = latest_summary
     # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
+
+
+def _factory_artifact_from_runs(
+    conn: sqlite3.Connection,
+    task: kanban_db.Task,
+) -> dict[str, Any] | None:
+    """Return the newest machine-readable object produced by a task.
+
+    A PR is an output only when a run receipt carries an exact ``pr_url``;
+    prose mentions such as "do not use PR #927" never become artifacts.
+    Before publication, a non-empty reviewed diff is represented as a patch.
+    Evidence-only completions become result objects so successful research
+    does not disappear merely because it produced no code.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, status, outcome, metadata
+        FROM task_runs
+        WHERE task_id = ? AND metadata IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 16
+        """,
+        (task.id,),
+    ).fetchall()
+    parsed: list[tuple[sqlite3.Row, dict[str, Any]]] = []
+    for row in rows:
+        metadata = _json_object(row["metadata"])
+        if metadata:
+            parsed.append((row, metadata))
+
+    for row, metadata in parsed:
+        pr_url = str(metadata.get("pr_url") or "").strip()
+        match = _GITHUB_PR_URL_PATTERN.fullmatch(pr_url)
+        if match is None:
+            continue
+        raw_number = metadata.get("pr_number")
+        pr_number = (
+            raw_number
+            if isinstance(raw_number, int) and raw_number > 0
+            else int(match.group("number"))
+        )
+        return {
+            "kind": "pull_request",
+            "label": f"PR #{pr_number}",
+            "pr_number": pr_number,
+            "url": pr_url,
+            "state": str(metadata.get("pr_state") or "").strip() or None,
+            "draft": (
+                metadata.get("draft")
+                if isinstance(metadata.get("draft"), bool)
+                else None
+            ),
+            "run_id": int(row["id"]),
+        }
+
+    for row, metadata in parsed:
+        fingerprint = str(
+            metadata.get("diff_fingerprint")
+            or metadata.get("diff_sha256")
+            or ""
+        ).strip()
+        changed_files = metadata.get("changed_files")
+        if (
+            not fingerprint
+            or not isinstance(changed_files, list)
+            or not changed_files
+        ):
+            continue
+        return {
+            "kind": "patch",
+            "label": "Code patch",
+            "files_count": len(changed_files),
+            "fingerprint": fingerprint[:12],
+            "run_id": int(row["id"]),
+        }
+
+    if task.status == "done":
+        return {
+            "kind": "result",
+            "label": "Completed result",
+            "run_id": int(parsed[0][0]["id"]) if parsed else None,
+        }
+    return None
+
+
+def _recent_factory_objects(
+    conn: sqlite3.Connection,
+    *,
+    board_slug: str,
+    board_name: str,
+    now: int,
+) -> list[dict[str, Any]]:
+    """Build a bounded task → work → artifact lifecycle for the live floor."""
+    cutoff = now - _FACTORY_FLOW_WINDOW_SECONDS
+    placeholders = ",".join("?" for _ in _FACTORY_FLOW_EVENT_KINDS)
+    rows = conn.execute(
+        f"""
+        SELECT id, task_id, kind, payload, created_at
+        FROM task_events
+        WHERE created_at >= ?
+          AND kind IN ({placeholders})
+        ORDER BY id DESC
+        LIMIT 240
+        """,
+        (cutoff, *sorted(_FACTORY_FLOW_EVENT_KINDS)),
+    ).fetchall()
+
+    grouped: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["task_id"]), []).append(row)
+
+    objects: list[dict[str, Any]] = []
+    for task_id, task_rows in grouped.items():
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            continue
+        events: list[dict[str, Any]] = []
+        for row in reversed(task_rows[:12]):
+            payload = _json_object(row["payload"])
+            actor = ""
+            if row["kind"] == "created":
+                actor = str(
+                    payload.get("by")
+                    or task.created_by
+                    or ""
+                ).strip()
+            elif row["kind"] == "commented":
+                actor = str(payload.get("author") or "").strip()
+            elif row["kind"] in {
+                "claimed",
+                "spawned",
+                "blocked",
+                "completed",
+            }:
+                actor = str(task.assignee or "").strip()
+            events.append(
+                {
+                    "id": int(row["id"]),
+                    "kind": str(row["kind"]),
+                    "created_at": int(row["created_at"]),
+                    "actor": actor or None,
+                }
+            )
+        newest = task_rows[0]
+        artifact = _factory_artifact_from_runs(conn, task)
+        blocker = (
+            {
+                "kind": str(task.block_kind or "unclassified"),
+                "label": str(task.block_kind or "unclassified").replace(
+                    "_",
+                    " ",
+                ),
+            }
+            if task.status == "blocked"
+            else None
+        )
+        objects.append(
+            {
+                "id": f"{board_slug}:{task.id}",
+                "board_slug": board_slug,
+                "board_name": board_name,
+                "task": {
+                    "id": task.id,
+                    "title": task.title,
+                    "assignee": task.assignee,
+                    "status": task.status,
+                    "priority": task.priority,
+                    "created_by": task.created_by,
+                    "created_at": task.created_at,
+                    "started_at": task.started_at,
+                    "completed_at": task.completed_at,
+                    "block_kind": task.block_kind,
+                },
+                "events": events,
+                "latest_event_kind": str(newest["kind"]),
+                "last_event_at": int(newest["created_at"]),
+                "artifact": artifact,
+                "blocker": blocker,
+            }
+        )
+    objects.sort(
+        key=lambda item: (item["last_event_at"], item["id"]),
+        reverse=True,
+    )
+    return objects[:_FACTORY_FLOW_MAX_OBJECTS]
 
 
 def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
@@ -1374,6 +1575,8 @@ def get_agency_overview():
     graph_links: list[dict[str, str]] = []
     graph_relations: list[dict[str, str]] = []
     sources: list[dict[str, Any]] = []
+    now = int(time.time())
+    factory_objects: list[dict[str, Any]] = []
 
     for board_meta in kanban_db.list_boards(include_archived=False):
         slug = str(board_meta.get("slug") or "default")
@@ -1432,6 +1635,14 @@ def get_agency_overview():
                             "relation": row["relation"],
                         }
                     )
+            factory_objects.extend(
+                _recent_factory_objects(
+                    conn,
+                    board_slug=slug,
+                    board_name=name,
+                    now=now,
+                )
+            )
             sources.append(
                 {
                     "slug": slug,
@@ -1442,6 +1653,11 @@ def get_agency_overview():
         finally:
             conn.close()
 
+    factory_objects.sort(
+        key=lambda item: (item["last_event_at"], item["id"]),
+        reverse=True,
+    )
+    factory_objects = factory_objects[:_FACTORY_FLOW_MAX_OBJECTS]
     return {
         "columns": [
             {"name": name, "tasks": columns[name]} for name in columns.keys()
@@ -1452,7 +1668,12 @@ def get_agency_overview():
         },
         "boards": sources,
         "controllers": _agency_controller_roster(),
-        "now": int(time.time()),
+        "factory_flow": {
+            "schema": "agency-factory-flow/v1",
+            "window_seconds": _FACTORY_FLOW_WINDOW_SECONDS,
+            "objects": factory_objects,
+        },
+        "now": now,
     }
 
 
