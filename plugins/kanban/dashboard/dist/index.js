@@ -1814,6 +1814,10 @@
     unassigned: "#94a3ad",
   };
 
+  const YARD_AGENT_ROW_HEIGHT = 50;
+  const YARD_BASE_AGENT_OFFSET = 130;
+  const YARD_BASE_SECTION_PADDING = 146;
+
   const YARD_AGENCIES = {
     development: {
       key: "development",
@@ -2028,14 +2032,13 @@
     ctx.fillText(yardInitials(agent.name), x, drawY + 12);
     ctx.fillStyle = YARD_CANVAS_COLORS.fog;
     ctx.font = "600 9px ui-monospace, monospace";
-    const shortName = agent.name.length > 18 ? agent.name.slice(0, 16) + "…" : agent.name;
     if (labelMode === "list") {
       ctx.textAlign = "left";
       ctx.fillText("@" + agent.name, x + 18, drawY + 5);
     } else if (labelMode === "above") {
-      ctx.fillText("@" + shortName, x, drawY - 22);
+      ctx.fillText("@" + agent.name, x, drawY - 22);
     } else if (labelMode !== "compact") {
-      ctx.fillText("@" + shortName, x, drawY + 34);
+      ctx.fillText("@" + agent.name, x, drawY + 34);
     }
     ctx.restore();
   }
@@ -2092,7 +2095,8 @@
         1,
         Math.ceil(base.residentAgents.length / columns),
       );
-      return height + 126 + agentRows * 34;
+      return height + YARD_BASE_SECTION_PADDING +
+        agentRows * YARD_AGENT_ROW_HEIGHT;
     }, 22);
   }
 
@@ -2545,7 +2549,7 @@
         props.scene.bases.forEach(function (base) {
           const x = layout.compact ? width / 2 : 150;
           const y = baseCursorY;
-          const idleStartY = y + 112;
+          const idleStartY = y + YARD_BASE_AGENT_OFFSET;
           const placedBase = { base, x, y };
           baseLayouts.push(placedBase);
           yardDrawBase(ctx, x, y, base);
@@ -2554,9 +2558,9 @@
             const column = index % columns;
             const row = Math.floor(index / columns);
             const agentX = layout.compact
-              ? x - 100
-              : x - 112 + column * 156;
-            const agentY = idleStartY + row * 34;
+              ? x
+              : x - 68 + column * 136;
+            const agentY = idleStartY + row * YARD_AGENT_ROW_HEIGHT;
             yardDrawAgent(
               ctx,
               agent,
@@ -2564,23 +2568,23 @@
               agentY,
               selectedAgents.has(agent.name),
               phase,
-              "list",
+              "above",
             );
             hits.push({
               type: "agent",
-              x: agentX - 16,
-              y: agentY - 20,
-              width: layout.compact ? 236 : 148,
-              height: 34,
+              x: agentX - 70,
+              y: agentY - 32,
+              width: 140,
+              height: 54,
               agent,
             });
           });
-          baseCursorY += 126 + Math.max(
+          baseCursorY += YARD_BASE_SECTION_PADDING + Math.max(
             1,
             Math.ceil(
               base.residentAgents.length / (layout.compact ? 1 : 2),
             ),
-          ) * 34;
+          ) * YARD_AGENT_ROW_HEIGHT;
         });
 
         let dockCursorY = layout.dockTop;
