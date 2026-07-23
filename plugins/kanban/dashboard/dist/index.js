@@ -1608,6 +1608,56 @@
     return (boundary > maxChars * 0.58 ? clipped.slice(0, boundary) : clipped) + "…";
   }
 
+  function yardControllerAction(controller) {
+    const execution = (controller && controller.latest_execution) || {};
+    const activity = execution.activity || {};
+    if (activity.phase === "finishing") {
+      return {
+        label: "WRAPPING UP",
+        text: "Finishing this control run and recording the outcome",
+      };
+    }
+    const tool = String(activity.last_tool || "");
+    const counts = activity.tool_counts || {};
+    const count = Math.max(1, Number(counts[tool] || 0));
+    const plural = count === 1 ? "" : "s";
+    const failed = activity.last_tool_status === "failed";
+    const retrySuffix = failed ? " · correcting the failed attempt" : "";
+    const actions = {
+      kanban_list: `Scanned ${count} work queue${plural} · choosing what moves next`,
+      kanban_show: `Inspected ${count} task${plural} · deciding the next action`,
+      kanban_comment: `Updated ${count} task thread${plural} · checking what remains`,
+      kanban_create: `Created ${count} worker task${plural} · checking dispatch`,
+      kanban_link: `Linked ${count} task dependenc${count === 1 ? "y" : "ies"} · checking the plan`,
+      kanban_unblock: `Released ${count} cleared blocker${plural} · checking capacity`,
+      delegate_task: `Briefed ${count} specialist agent${plural} · awaiting the result`,
+      terminal: `Checked live repository state${retrySuffix}`,
+      web_search: `Researched current external evidence${retrySuffix}`,
+      browser: `Inspected the live product flow${retrySuffix}`,
+    };
+    if (actions[tool]) {
+      return {
+        label: failed ? "RECOVERING" : "CURRENT ACTIVITY",
+        text: actions[tool],
+      };
+    }
+    if (tool) {
+      return {
+        label: failed ? "RECOVERING" : "CURRENT ACTIVITY",
+        text: failed
+          ? "Correcting the last operational step"
+          : "Reviewing the latest result and choosing the next step",
+      };
+    }
+    if (activity.session_id) {
+      return {
+        label: "GETTING ORIENTED",
+        text: "Reading the brief and planning this control run",
+      };
+    }
+    return null;
+  }
+
   function yardAgentActivity(agent) {
     if (agent.focus) {
       const heartbeat = yardCondenseActivity(
@@ -1628,6 +1678,10 @@
     }
     const controller = (agent.activeControllers || [])[0];
     if (!controller) return null;
+    const controllerAction = yardControllerAction(controller);
+    if (controllerAction) {
+      return Object.assign(controllerAction, { source: "controller-action" });
+    }
     const kind = yardControllerActivityKind(controller);
     const role = String(controller.role || yardActivityLabel(kind));
     const roleParts = role.split(/\s+[—–]\s+/);
@@ -3217,7 +3271,7 @@
         h("span", null, h("i", { className: "is-idle" }), "Agent at home base"),
         h("span", null, h("i", { className: "is-running" }), "Product implementation"),
         h("strong", null,
-          "Activity bubbles summarize explicit heartbeats or assignments—not private reasoning."),
+          "Activity bubbles summarize explicit tool actions, heartbeats, or assignments—not private reasoning."),
       ),
     );
   }

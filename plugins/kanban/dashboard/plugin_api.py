@@ -39,6 +39,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from dataclasses import asdict
@@ -73,6 +74,137 @@ _EXECUTION_INCIDENT_OUTCOMES = frozenset(
 _WORKFLOW_FAULT_EVENT_KINDS = frozenset(
     {"block_loop_detected", "protocol_violation"}
 )
+_CONTROLLER_ACTIVITY_LOG_TAIL_BYTES = 2 * 1024 * 1024
+
+
+def _controller_activity_from_log(
+    log_path: Path,
+    *,
+    job_id: str,
+    started_at: Any,
+) -> dict[str, Any] | None:
+    """Summarize explicit controller actions from the bounded agent log tail.
+
+    The activity bubble must never expose prompts, tool arguments, model
+    responses, or private reasoning. Tool names and completion counts are
+    already operational telemetry, and are enough to distinguish queue
+    inspection, task updates, and dispatch from a generic "Planning" label.
+    """
+    try:
+        started = datetime.fromisoformat(str(started_at))
+    except (TypeError, ValueError):
+        return None
+    started_local = started.replace(tzinfo=None) - timedelta(seconds=5)
+
+    try:
+        with log_path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            offset = max(0, size - _CONTROLLER_ACTIVITY_LOG_TAIL_BYTES)
+            stream.seek(offset)
+            raw = stream.read()
+    except OSError:
+        return None
+
+    text = raw.decode("utf-8", errors="replace")
+    if offset:
+        _, separator, text = text.partition("\n")
+        if not separator:
+            return None
+
+    session_prefix = f"cron_{job_id}_"
+    line_pattern = re.compile(
+        r"^(?P<timestamp>\d{4}-\d{2}-\d{2} "
+        r"\d{2}:\d{2}:\d{2},\d{3}) "
+        r"[A-Z]+ \[(?P<session>[^\]]+)\] (?P<body>.*)$"
+    )
+    completed_tool_pattern = re.compile(
+        r"agent\.tool_executor: tool "
+        r"(?P<tool>[a-zA-Z0-9_.-]+) completed\b"
+    )
+    failed_tool_pattern = re.compile(
+        r"agent\.tool_executor: Tool "
+        r"(?P<tool>[a-zA-Z0-9_.-]+) returned error\b"
+    )
+    api_call_pattern = re.compile(
+        r"agent\.conversation_loop: API call #(?P<count>\d+):"
+    )
+
+    session_id = ""
+    latest_at = ""
+    last_tool = ""
+    last_tool_status = ""
+    last_tool_at = ""
+    api_calls = 0
+    tool_counts: dict[str, int] = {}
+    turn_ended = False
+
+    for line in text.splitlines():
+        match = line_pattern.match(line)
+        if not match:
+            continue
+        session = match.group("session")
+        if not session.startswith(session_prefix):
+            continue
+        try:
+            line_time = datetime.strptime(
+                match.group("timestamp"),
+                "%Y-%m-%d %H:%M:%S,%f",
+            )
+        except ValueError:
+            continue
+        if line_time < started_local:
+            continue
+
+        if session_id and session != session_id:
+            # A newer non-overlapping execution of the same job supersedes
+            # telemetry from the earlier session in the bounded tail.
+            session_id = session
+            last_tool = ""
+            last_tool_status = ""
+            last_tool_at = ""
+            api_calls = 0
+            tool_counts = {}
+            turn_ended = False
+        elif not session_id:
+            session_id = session
+
+        latest_at = match.group("timestamp")
+        body = match.group("body")
+        tool_match = completed_tool_pattern.search(body)
+        status_value = "completed"
+        if tool_match is None:
+            tool_match = failed_tool_pattern.search(body)
+            status_value = "failed"
+        if tool_match is not None:
+            tool = tool_match.group("tool")
+            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            last_tool = tool
+            last_tool_status = status_value
+            last_tool_at = latest_at
+            turn_ended = False
+            continue
+
+        api_match = api_call_pattern.search(body)
+        if api_match is not None:
+            api_calls = max(api_calls, int(api_match.group("count")))
+            turn_ended = False
+        elif "agent.conversation_loop: Turn ended:" in body:
+            turn_ended = True
+
+    if not session_id:
+        return None
+    return {
+        "source": "agent_log",
+        "session_id": session_id,
+        "last_event_at": latest_at,
+        "last_tool": last_tool or None,
+        "last_tool_status": last_tool_status or None,
+        "last_tool_at": last_tool_at or None,
+        "tool_counts": tool_counts,
+        "api_calls": api_calls,
+        "phase": "finishing" if turn_ended else "active",
+    }
 
 
 def _agency_controller_specs() -> list[dict[str, Any]]:
@@ -120,6 +252,7 @@ def _agency_controller_specs() -> list[dict[str, Any]]:
                 "job_id": job_id,
                 "cron_profile": cron_profile,
                 "executions_database": profile_home / "cron/executions.db",
+                "agent_log": profile_home / "logs/agent.log",
             }
         )
     return specs
@@ -169,6 +302,7 @@ def _profile_cron_activity_specs() -> list[dict[str, Any]]:
                     "job_id": job_id,
                     "cron_profile": profile_home.name,
                     "executions_database": profile_home / "cron/executions.db",
+                    "agent_log": profile_home / "logs/agent.log",
                     "active_only": True,
                 }
             )
@@ -204,6 +338,7 @@ def _agency_controller_roster() -> list[dict[str, Any]]:
         job_id = str(spec["job_id"])
         cron_profile = str(spec["cron_profile"])
         executions_database = Path(spec["executions_database"])
+        agent_log = Path(spec["agent_log"])
         latest: dict[str, Any] | None = None
         try:
             connection = sqlite3.connect(
@@ -242,6 +377,15 @@ def _agency_controller_roster() -> list[dict[str, Any]]:
             if execution_status in {"claimed", "running"}
             else "idle"
         )
+        if state == "running" and latest is not None:
+            activity = _controller_activity_from_log(
+                agent_log,
+                job_id=job_id,
+                started_at=latest.get("started_at")
+                or latest.get("claimed_at"),
+            )
+            if activity is not None:
+                latest["activity"] = activity
         if spec.get("active_only") and state != "running":
             continue
         controllers.append(

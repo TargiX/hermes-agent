@@ -291,6 +291,120 @@ def test_agency_overview_exposes_active_controller_cron_runs(
     ]
 
 
+def test_agency_overview_exposes_safe_controller_action_summary(
+    client,
+    kanban_home,
+):
+    """The canvas gets explicit tool activity without prompts or arguments."""
+    runtime = kanban_home / "runtime"
+    runtime.mkdir()
+    (runtime / "agency-controllers.json").write_text(
+        json.dumps(
+            {
+                "schema": "agency-controllers/v1",
+                "controllers": [
+                    {
+                        "profile": "phosphenelead",
+                        "role": "Engineering Lead",
+                        "job_id": "lead-job",
+                        "cron_profile": "default",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cron = kanban_home / "cron"
+    cron.mkdir()
+    connection = sqlite3.connect(cron / "executions.db")
+    try:
+        connection.execute(
+            """
+            CREATE TABLE executions (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                error TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO executions (
+                id, job_id, status, claimed_at, started_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "lead-execution-1",
+                "lead-job",
+                "running",
+                "2026-07-24T01:11:34+07:00",
+                "2026-07-24T01:11:34+07:00",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    logs = kanban_home / "logs"
+    logs.mkdir()
+    (logs / "agent.log").write_text(
+        "\n".join(
+            [
+                "2026-07-24 01:12:19,659 INFO "
+                "[cron_lead-job_20260724_011209] "
+                "agent.turn_context: conversation turn: secret prompt omitted",
+                "2026-07-24 01:12:28,282 INFO "
+                "[cron_lead-job_20260724_011209] "
+                "agent.tool_executor: tool kanban_show completed "
+                "(0.02s, 100 chars)",
+                "2026-07-24 01:12:31,420 INFO "
+                "[cron_lead-job_20260724_011209] "
+                "agent.tool_executor: tool kanban_show completed "
+                "(0.01s, 200 chars)",
+                "2026-07-24 01:13:01,021 INFO "
+                "[cron_lead-job_20260724_011209] "
+                "agent.tool_executor: tool kanban_comment completed "
+                "(0.01s, 57 chars)",
+                "2026-07-24 01:13:02,097 INFO "
+                "[cron_lead-job_20260724_011209] "
+                "agent.tool_executor: tool kanban_comment completed "
+                "(0.00s, 57 chars)",
+                "2026-07-24 01:13:03,181 INFO "
+                "[cron_lead-job_20260724_011209] "
+                "agent.tool_executor: tool kanban_comment completed "
+                "(0.00s, 57 chars)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get("/api/plugins/kanban/agency-overview")
+
+    assert response.status_code == 200
+    activity = response.json()["controllers"][0][
+        "latest_execution"
+    ]["activity"]
+    assert activity == {
+        "source": "agent_log",
+        "session_id": "cron_lead-job_20260724_011209",
+        "last_event_at": "2026-07-24 01:13:03,181",
+        "last_tool": "kanban_comment",
+        "last_tool_status": "completed",
+        "last_tool_at": "2026-07-24 01:13:03,181",
+        "tool_counts": {
+            "kanban_show": 2,
+            "kanban_comment": 3,
+        },
+        "api_calls": 0,
+        "phase": "active",
+    }
+    assert "secret prompt omitted" not in json.dumps(activity)
+
+
 def test_agency_overview_discovers_active_profile_cron_runs(
     client,
     kanban_home,
