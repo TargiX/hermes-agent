@@ -3641,6 +3641,63 @@ def test_worktree_shared_path_overlay_quarantines_materialized_source_child(
     assert recovered[0].read_text(encoding="utf-8") == "local\n"
 
 
+def test_worktree_shared_path_overlay_quarantines_build_tool_scratch_entry(
+    kanban_home,
+    tmp_path,
+):
+    """A tool's scratch directory must not brick the worktree forever.
+
+    Vite writes `.vite-temp` straight into the dependency root. It belongs to
+    neither Hermes nor the shared source, so failing closed on it made every
+    later spawn for that worktree impossible.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    shared_dependencies = repo / "node_modules"
+    (shared_dependencies / ".cache").mkdir(parents=True)
+    (shared_dependencies / ".pnpm").mkdir()
+    workspace = repo / ".worktrees" / "scratch"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "-b",
+            "wt/scratch",
+            str(workspace),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    kb._prepare_worktree_shared_paths(
+        workspace,
+        ["node_modules"],
+        {"node_modules": [".cache"]},
+    )
+    scratch = workspace / "node_modules" / ".vite-temp"
+    scratch.mkdir()
+    (scratch / "chunk.js").write_text("scratch\n", encoding="utf-8")
+
+    # Fails closed before the fix; must now leave a canonical overlay behind.
+    kb._prepare_worktree_shared_paths(
+        workspace,
+        ["node_modules"],
+        {"node_modules": [".cache"]},
+    )
+
+    assert not os.path.lexists(scratch)
+    assert (workspace / "node_modules" / ".pnpm").is_symlink()
+    assert (workspace / "node_modules" / ".cache").is_dir()
+    recovery_root = kanban_home / "runtime" / "worktree-overlay-recovery"
+    recovered = list(recovery_root.rglob("chunk.js"))
+    assert len(recovered) == 1
+    assert recovered[0].read_text(encoding="utf-8") == "scratch\n"
+
+
 def test_worktree_shared_path_overlay_preserves_hook_owned_isolated_runtime(
     tmp_path,
 ):

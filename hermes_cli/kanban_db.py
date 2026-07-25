@@ -7866,7 +7866,9 @@ def _prepare_worktree_shared_paths(
     repository setup hook may deliberately materialize the complete path and
     advance the marker to version 2 with ``mode: isolated``. An exact v2 marker
     preserves that hook-owned runtime across retries; mismatched markers still
-    fail closed.
+    fail closed. An overlay entry owned by neither Hermes nor the shared source
+    — a build tool's scratch directory, say — is quarantined rather than
+    treated as corruption, because failing closed on it bricks the worktree.
     """
     if not shared_paths:
         return
@@ -8071,10 +8073,14 @@ def _prepare_worktree_shared_paths(
         unexpected = {
             entry.name for entry in root.iterdir()
         } - allowed_names - source_names
-        if unexpected:
-            raise RuntimeError(
-                f"worktree shared overlay contains unexpected entries: {sorted(unexpected)!r}"
-            )
+        # Build tools write scratch directories such as Vite's `.vite-temp`
+        # straight into the dependency root. Failing closed here bricks the
+        # worktree for every later spawn even though the entry belongs to
+        # neither Hermes nor the shared source. Quarantine it exactly like a
+        # materialized source-owned child: the bytes are preserved outside the
+        # repository and the overlay is left in its canonical shape.
+        for name in sorted(unexpected):
+            _quarantine_materialized_overlay_entry(root / name, relative_text)
 
     for raw_path in shared_paths:
         if not isinstance(raw_path, str) or not raw_path.strip():
