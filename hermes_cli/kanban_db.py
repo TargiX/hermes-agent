@@ -10108,8 +10108,23 @@ def ensure_triage_recovery_tasks(
     for row in incident_rows:
         if len(created) >= limit:
             break
+        active_recovery = conn.execute(
+            """
+            SELECT recovery.id
+              FROM task_relations AS relation
+              JOIN tasks AS recovery ON recovery.id = relation.target_task_id
+             WHERE relation.source_task_id = ?
+               AND relation.relation = 'recovers'
+               AND recovery.status NOT IN ('done', 'archived')
+             ORDER BY recovery.created_at DESC
+             LIMIT 1
+            """,
+            (row["id"],),
+        ).fetchone()
+        if active_recovery is not None:
+            continue
         idempotency_key = (
-            "kanban-triage-recovery/v1:"
+            "kanban-triage-recovery/v2:"
             f"{row['id']}:{row['block_kind']}:{int(row['block_recurrences'])}"
         )
         existing = conn.execute(

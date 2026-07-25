@@ -3474,6 +3474,51 @@ def test_triage_recovery_cap_advances_past_existing_incidents(kanban_home):
     assert set(first).isdisjoint(second)
 
 
+def test_triage_recovery_revisits_done_legacy_recovery_once(kanban_home):
+    with kb.connect() as conn:
+        original_id = kb.create_task(
+            conn,
+            title="Legacy unresolved capability incident",
+            assignee="worker",
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'triage', block_kind = 'capability', "
+            "block_recurrences = ? WHERE id = ?",
+            (kb.BLOCK_RECURRENCE_LIMIT, original_id),
+        )
+        legacy_id = kb.create_task(
+            conn,
+            title="Legacy recovery without a disposition callback",
+            assignee="operator",
+            relations=[(original_id, "recovers")],
+            idempotency_key=(
+                "kanban-triage-recovery/v1:"
+                f"{original_id}:capability:{kb.BLOCK_RECURRENCE_LIMIT}"
+            ),
+        )
+        assert kb.complete_task(conn, legacy_id, result="legacy narrative only")
+
+        created = kb.ensure_triage_recovery_tasks(
+            conn,
+            assignee="operator",
+            max_new=3,
+        )
+        repeated = kb.ensure_triage_recovery_tasks(
+            conn,
+            assignee="operator",
+            max_new=3,
+        )
+        follow_up = kb.get_task(conn, created[0])
+
+    assert len(created) == 1
+    assert follow_up is not None
+    assert follow_up.idempotency_key == (
+        "kanban-triage-recovery/v2:"
+        f"{original_id}:capability:{kb.BLOCK_RECURRENCE_LIMIT}"
+    )
+    assert repeated == []
+
+
 def test_set_task_skills_repairs_blocked_worker_without_replacing_card(
     kanban_home,
 ):
