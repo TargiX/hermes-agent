@@ -1264,7 +1264,8 @@ class TestSessionRetirement:
 
     def test_final_agent_message_without_turn_completed_is_recovered(self):
         """A completed assistant item is still a usable terminal response when
-        codex omits turn/completed and then goes quiet.
+        codex omits turn/completed and then goes quiet, but the incomplete
+        protocol means the client must not be reused for a follow-up turn.
         """
         client = FakeClient()
         client.queue_notification(
@@ -1282,12 +1283,12 @@ class TestSessionRetirement:
         assert r.final_text == "done"
         assert r.interrupted is False
         assert r.error is None
-        assert r.should_retire is False
+        assert r.should_retire is True
         assert any(
             msg["role"] == "assistant" and msg.get("content") == "done"
             for msg in r.projected_messages
         )
-        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+        assert any(method == "turn/interrupt" for method, _ in client.requests)
 
     def test_post_tool_quiet_watchdog_trips_and_retires(self):
         client = FakeClient()

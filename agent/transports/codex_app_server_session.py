@@ -810,6 +810,11 @@ class CodexAppServerSession:
                 "assistant message but before turn/completed; accepting "
                 "the assistant text as the terminal response"
             )
+            # The text is useful, but the JSON-RPC turn is still live from
+            # codex's perspective.  Interrupt and retire this client so a
+            # caller cannot put a second prompt onto the wedged thread.
+            self._issue_interrupt(result.turn_id)
+            result.should_retire = True
             turn_complete = True
 
         if not turn_complete and not result.interrupted:

@@ -765,7 +765,11 @@ def run_codex_app_server_turn(
     # projected assistant/tool messages are persisted in Hermes history.
     api_calls = 1
     kanban_guard_attempts = 0
-    while not turn.interrupted and turn.error is None:
+    while (
+        not turn.interrupted
+        and turn.error is None
+        and not turn.should_retire
+    ):
         try:
             from agent.kanban_stop import build_kanban_stop_nudge
 

@@ -76,6 +76,37 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["agent_persisted"] is True
 
 
+def test_retiring_turn_skips_same_session_kanban_followup(monkeypatch):
+    """A response recovered without ``turn/completed`` is useful, but its
+    app-server thread is no longer trustworthy.  Do not spend another full
+    turn deadline nudging that same thread for the Kanban terminal callback;
+    the worker reaper can retry the task in its preserved workspace.
+    """
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.should_retire = True
+    agent._codex_session.run_turn.return_value = turn
+    session = agent._codex_session
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_recover_me")
+    monkeypatch.setattr(
+        "agent.kanban_stop.build_kanban_stop_nudge",
+        lambda **_: "Call kanban_complete now.",
+    )
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["completed"] is True
+    assert agent._codex_session is None
+    session.run_turn.assert_called_once_with(user_input="hello")
+    session.close.assert_called_once_with()
+
+
 def test_codex_user_interrupt_is_reported_and_cleared():
     agent = _make_agent(session_db=None)
     turn = _make_turn()
