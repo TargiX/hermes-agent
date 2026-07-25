@@ -1518,6 +1518,81 @@ def test_multiple_attempts_preserved_as_runs(kanban_home):
         conn.close()
 
 
+def test_dispatch_recovers_pre_spawn_orphan_after_grace(
+    kanban_home, all_assignees_spawnable
+):
+    """A committed claim with no spawned worker must not occupy capacity forever.
+
+    This is the failure shape left when the dispatcher commits ``claimed`` and
+    then loses the tick during workspace setup or a transient DB incident:
+    there is no pid, session, heartbeat, or spawned event to recover through
+    ordinary crash detection.
+    """
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="pre-spawn orphan", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        first_run_id = claimed.current_run_id
+        old = int(time.time()) - kb.DEFAULT_PRESPAWN_ORPHAN_GRACE_SECONDS - 1
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = ?",
+                (old, first_run_id),
+            )
+
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: 43210)
+
+        assert result.reclaimed == 1
+        assert [task_id for task_id, _assignee, _workspace in result.spawned] == [
+            tid
+        ]
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.worker_pid == 43210
+        assert task.current_run_id != first_run_id
+        first_run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id = ?",
+            (first_run_id,),
+        ).fetchone()
+        assert dict(first_run) == {
+            "status": "released",
+            "outcome": "reclaimed",
+            "ended_at": pytest.approx(int(time.time()), abs=2),
+        }
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'pre_spawn_reclaimed'",
+            (tid,),
+        ).fetchone()
+        assert event is not None
+    finally:
+        conn.close()
+
+
+def test_dispatch_keeps_fresh_pre_spawn_claim(
+    kanban_home, all_assignees_spawnable
+):
+    """A still-fresh workspace setup must not be mistaken for an orphan."""
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="fresh setup", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: 43210)
+
+        assert result.reclaimed == 0
+        assert result.spawned == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.worker_pid is None
+    finally:
+        conn.close()
+
+
 def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
     """A worker from an earlier attempt cannot close a later retry."""
     import hermes_cli.kanban_db as _kb

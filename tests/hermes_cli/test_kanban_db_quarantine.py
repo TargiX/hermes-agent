@@ -115,6 +115,50 @@ def test_recovery_clear_keeps_marker_when_validation_fails(tmp_path):
     assert marker.is_file()
 
 
+def test_transient_malformed_write_needs_fresh_probe_confirmation(db_path):
+    """One poisoned connection must not quarantine an independently healthy DB.
+
+    SQLite can surface ``database disk image is malformed`` from a stale WAL
+    view even though a fresh connection proves the database is intact.  The
+    write still fails and must be retried by its caller, but the fleet-wide
+    quarantine marker is too destructive without independent confirmation.
+    """
+
+    class TransientMalformedConnection:
+        def __init__(self, real: sqlite3.Connection):
+            self._real = real
+            self._armed = True
+
+        def execute(self, sql, *args, **kwargs):
+            if (
+                self._armed
+                and sql.lstrip().upper().startswith("INSERT")
+                and "task_events" in sql.lower()
+            ):
+                self._armed = False
+                try:
+                    self._real.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    with kb.connect(db_path) as conn:
+        wrapper = TransientMalformedConnection(conn)
+        with pytest.raises(
+            sqlite3.DatabaseError, match="database disk image is malformed"
+        ):
+            with kb.write_txn(wrapper):
+                kb._append_event(wrapper, "t_missing", "test", None)
+
+    assert not kb._db_quarantine_path(db_path).exists()
+    with kb.connect(db_path) as probe:
+        assert probe.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
 def test_write_lock_timeout_fails_closed(db_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "100")
     conn = kb.connect(db_path)

@@ -217,6 +217,15 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 
+# A dispatcher claim is committed before workspace preparation and process
+# spawn. If that tick aborts in between (gateway crash, DB quarantine, setup
+# exception whose failure receipt could not be written), ordinary crash
+# detection cannot see it because no worker PID exists yet. The board-scoped
+# dispatch lock guarantees another dispatch tick cannot overlap a legitimate
+# in-progress setup, so a pid/session/heartbeat-free run older than this grace
+# is an orphan and can be safely requeued.
+DEFAULT_PRESPAWN_ORPHAN_GRACE_SECONDS = 5 * 60
+
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
 # as wedged and reclaim regardless of PID liveness (#29747 gap 3).
@@ -3097,8 +3106,46 @@ def _raise_if_sqlite_corrupt(
     path: Optional[Path],
     exc: BaseException,
 ) -> None:
-    if path is not None and _is_corruption_error(exc):
+    if path is None or not _is_corruption_error(exc):
+        return
+
+    # A single long-lived WAL connection can report SQLITE_CORRUPT from a
+    # stale/poisoned view while a fresh connection proves the on-disk database
+    # is healthy. Fleet-wide quarantine is intentionally expensive, so require
+    # an independent full integrity probe before publishing that verdict.
+    # The original write still fails and its caller still retries; we merely
+    # avoid turning one transient connection failure into a board-wide outage.
+    persistent = True
+    try:
+        probe = _sqlite_connect(path.resolve())
+        try:
+            persistent = not _integrity_messages_ok(_run_integrity_check(probe))
+        finally:
+            probe.close()
+    except sqlite3.OperationalError as probe_exc:
+        # Busy/locked is not proof of corruption. Preserve the original error
+        # and let the next normal operation retry on a fresh connection.
+        persistent = False
+        _log.warning(
+            "kanban write reported corruption for %s, but the independent "
+            "probe was transiently unavailable (%s); preserving the write "
+            "error without publishing fleet quarantine",
+            path,
+            probe_exc,
+        )
+    except (OSError, sqlite3.DatabaseError):
+        # A fresh connection also cannot read the file: this is independently
+        # confirmed corruption and must remain fail-closed.
+        persistent = True
+
+    if persistent:
         _raise_corrupt_db(path, f"sqlite write failed: {exc}")
+    _log.warning(
+        "kanban write connection reported %r for %s, but a fresh full "
+        "integrity probe passed; treating it as a transient connection fault",
+        str(exc),
+        path,
+    )
 
 
 @contextlib.contextmanager
@@ -5118,6 +5165,107 @@ def release_stale_claims(
             payload.update(termination)
             _append_event(
                 conn, row["id"], "reclaimed",
+                payload,
+                run_id=run_id,
+            )
+            reclaimed += 1
+    return reclaimed
+
+
+def recover_unspawned_claims(
+    conn: sqlite3.Connection,
+    *,
+    grace_seconds: int = DEFAULT_PRESPAWN_ORPHAN_GRACE_SECONDS,
+) -> int:
+    """Requeue committed dispatcher claims that never reached process spawn.
+
+    These rows have an active run but no PID, session, heartbeat, or ``spawned``
+    event. They are invisible to ordinary crash detection and otherwise occupy
+    a concurrency slot until the full claim TTL expires. Because dispatch
+    ticks are serialized by the board-scoped dispatch lock, a later tick cannot
+    race a still-running workspace setup from an earlier tick.
+
+    Recovery is neutral rather than a worker failure: the model never started,
+    so the run closes as ``reclaimed`` and the task returns to ``ready`` without
+    incrementing its failure counter.
+    """
+
+    now = int(time.time())
+    cutoff = now - max(1, int(grace_seconds))
+    rows = conn.execute(
+        """
+        SELECT t.id, t.current_run_id, t.claim_lock, r.started_at
+          FROM tasks AS t
+          JOIN task_runs AS r ON r.id = t.current_run_id
+         WHERE t.status = 'running'
+           AND t.worker_pid IS NULL
+           AND t.last_heartbeat_at IS NULL
+           AND r.status = 'running'
+           AND r.worker_pid IS NULL
+           AND r.session_id IS NULL
+           AND r.started_at <= ?
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM task_events AS event
+                WHERE event.run_id = r.id
+                  AND event.kind = 'spawned'
+           )
+        """,
+        (cutoff,),
+    ).fetchall()
+    reclaimed = 0
+    for row in rows:
+        run_id = int(row["current_run_id"])
+        with write_txn(conn):
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'ready',
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL,
+                       last_heartbeat_at = NULL,
+                       current_run_id = NULL
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND current_run_id = ?
+                   AND worker_pid IS NULL
+                   AND last_heartbeat_at IS NULL
+                """,
+                (row["id"], run_id),
+            )
+            if cur.rowcount != 1:
+                continue
+            elapsed = max(0, now - int(row["started_at"]))
+            payload = {
+                "run_id": run_id,
+                "elapsed_seconds": elapsed,
+                "grace_seconds": max(1, int(grace_seconds)),
+                "claim_lock": row["claim_lock"],
+                "reason": "claim committed but no worker process was spawned",
+            }
+            conn.execute(
+                """
+                UPDATE task_runs
+                   SET status = 'released',
+                       outcome = 'reclaimed',
+                       summary = 'dispatcher pre-spawn orphan reclaimed',
+                       ended_at = ?,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL,
+                       metadata = ?
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND worker_pid IS NULL
+                   AND session_id IS NULL
+                """,
+                (now, json.dumps(payload, ensure_ascii=False), run_id),
+            )
+            _append_event(
+                conn,
+                row["id"],
+                "pre_spawn_reclaimed",
                 payload,
                 run_id=run_id,
             )
@@ -10498,7 +10646,8 @@ def _dispatch_once_locked(
         dry_run=dry_run,
         board=board,
     )
-    result.reclaimed = release_stale_claims(conn)
+    result.reclaimed = recover_unspawned_claims(conn)
+    result.reclaimed += release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
