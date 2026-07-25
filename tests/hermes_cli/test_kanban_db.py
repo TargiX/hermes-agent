@@ -4537,8 +4537,10 @@ def test_latest_summaries_batch_omits_tasks_without_summary(kanban_home):
 # Rollback-journal compatibility
 # ---------------------------------------------------------------------------
 
-def test_connect_uses_delete_without_attempting_wal(tmp_path, monkeypatch):
-    """Kanban must never enter the recurrent multi-process WAL path."""
+def test_connect_uses_delete_without_attempting_wal_on_vulnerable_sqlite(
+    tmp_path, monkeypatch
+):
+    """Kanban avoids WAL when the linked SQLite has the WAL-reset bug."""
     import sqlite3 as _sqlite3
     from unittest.mock import patch as _patch
 
@@ -4563,7 +4565,16 @@ def test_connect_uses_delete_without_attempting_wal(tmp_path, monkeypatch):
             *args, factory=_WalRejectingConnection, **kwargs
         )
 
-    with _patch("hermes_cli.kanban_db.sqlite3.connect", side_effect=wal_rejecting_connect):
+    with (
+        _patch(
+            "hermes_cli.kanban_db.sqlite3.connect",
+            side_effect=wal_rejecting_connect,
+        ),
+        _patch(
+            "hermes_state.is_sqlite_wal_reset_vulnerable",
+            return_value=True,
+        ),
+    ):
         conn = kb.connect()
 
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
@@ -5677,16 +5688,22 @@ def test_repeated_corrupt_open_reuses_single_backup_and_marker(tmp_path):
     assert backup.read_bytes() == original
 
     # Mutating a quarantined DB must not trick the fleet into probing/writing it
-    # again. A recovery operator must first archive the marker after validating
-    # a replacement DB.
+    # again. Preserve the newly observed bytes under a second content-addressed
+    # backup, but leave the live path quarantined for an operator to replace.
     with db_path.open("r+b") as f:
         f.seek(4096)
         f.write(b"\xAB" * 64)
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     with pytest.raises(kb.KanbanDbCorruptError) as excinfo2:
         kb.connect(db_path=db_path)
-    assert excinfo2.value.backup_path is None
-    assert list(tmp_path.glob("kanban.db.corrupt.*.bak")) == [backup]
+    second_backup = excinfo2.value.backup_path
+    assert second_backup is not None
+    assert second_backup != backup
+    assert second_backup.exists()
+    assert set(tmp_path.glob("kanban.db.corrupt.*.bak")) == {
+        backup,
+        second_backup,
+    }
 
 
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
@@ -6025,13 +6042,16 @@ def test_write_txn_post_commit_check_fires_every_call(tmp_path):
     conn.close()
 
 
-def test_connect_sets_delete_journal_mode(tmp_path):
-    """Kanban uses rollback journal even when SQLite defaults change."""
+def test_connect_uses_shared_safe_journal_policy(tmp_path):
+    """Kanban uses WAL only when the linked SQLite is safe for it."""
     from hermes_cli.kanban_db import connect
+    from hermes_state import is_sqlite_wal_reset_vulnerable
+
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
     mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-    assert mode.lower() == "delete"
+    expected = "delete" if is_sqlite_wal_reset_vulnerable() else "wal"
+    assert mode.lower() == expected
     conn.close()
 
 

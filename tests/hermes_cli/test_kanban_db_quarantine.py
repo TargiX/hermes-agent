@@ -175,7 +175,8 @@ def test_mock_connection_does_not_materialize_a_magicmock_write_lock(
     assert list(tmp_path.glob("*MagicMock*.write.lock")) == []
 
 
-def test_cold_connect_migrates_existing_wal_database_to_delete(tmp_path):
+def test_cold_connect_preserves_existing_wal_database(tmp_path):
+    """Never live-downgrade a WAL database while other openers may exist."""
     path = tmp_path / "kanban.db"
     raw = sqlite3.connect(path)
     assert raw.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
@@ -185,7 +186,7 @@ def test_cold_connect_migrates_existing_wal_database_to_delete(tmp_path):
     kb._INITIALIZED_PATHS.discard(str(path.resolve()))
 
     with kb.connect(path) as conn:
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
 
 
 def test_multiprocess_writers_preserve_integrity(db_path):
@@ -211,6 +212,9 @@ def test_multiprocess_writers_preserve_integrity(db_path):
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == (
             workers * tasks_per_worker
         )
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+        from hermes_state import is_sqlite_wal_reset_vulnerable
+
+        expected = "delete" if is_sqlite_wal_reset_vulnerable() else "wal"
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == expected
     finally:
         conn.close()
