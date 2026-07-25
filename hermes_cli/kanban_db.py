@@ -10164,6 +10164,23 @@ def ensure_triage_recovery_tasks(
             if latest_run is not None and latest_run["summary"]
             else "No machine-readable blocker summary was recorded."
         )
+        recent_comments = conn.execute(
+            """
+            SELECT author, body, created_at
+              FROM task_comments
+             WHERE task_id = ?
+             ORDER BY created_at DESC, id DESC
+             LIMIT 5
+            """,
+            (row["id"],),
+        ).fetchall()
+        recent_control_evidence = "\n".join(
+            f"- {comment['author']} @ {int(comment['created_at'])}: "
+            f"{str(comment['body']).strip()[:1200]}"
+            for comment in reversed(recent_comments)
+        )
+        if not recent_control_evidence:
+            recent_control_evidence = "- No original-task comments were recorded."
         original_title = str(row["title"]).strip()
         body = (
             "task_class: control_plane_recovery\n"
@@ -10175,6 +10192,13 @@ def ensure_triage_recovery_tasks(
             "Purpose: reconcile this repeated block-loop against current "
             "capability and current task truth.\n\n"
             f"Latest recorded blocker:\n{latest_summary}\n\n"
+            "Recent original-task control evidence (newest last):\n"
+            f"{recent_control_evidence}\n\n"
+            "Before choosing a disposition, inspect the current original task "
+            "and its comments read-only; this copied evidence is only a bounded "
+            "preflight. A newer quarantine, supersession, or do-not-retry "
+            "instruction outranks restored capability. Callback availability "
+            "alone is never proof that the original is still valid work.\n\n"
             "Required decision:\n"
             "1. If the original is superseded, historical, or falsified, add "
             "proof, then call kanban_recover_triage with "

@@ -3359,6 +3359,12 @@ def test_dispatch_creates_one_operator_recovery_for_triage_block_loop(
             title="Browser-backed product proof",
             assignee="worker",
         )
+        kb.add_comment(
+            conn,
+            original_id,
+            "lead",
+            "ROUTE_AUTHORITY_QUARANTINE_V1: archive this stale route proof.",
+        )
         assert kb.block_task(
             conn,
             original_id,
@@ -3391,6 +3397,8 @@ def test_dispatch_creates_one_operator_recovery_for_triage_block_loop(
         assert recovery.workspace_kind == "scratch"
         assert original_id in (recovery.body or "")
         assert "Do not blindly rerun" in (recovery.body or "")
+        assert "Callback availability alone is never proof" in (recovery.body or "")
+        assert "ROUTE_AUTHORITY_QUARANTINE_V1" in (recovery.body or "")
         assert any(
             relation.source_task_id == original_id
             and relation.target_task_id == recovery_id
