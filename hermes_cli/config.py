@@ -2990,6 +2990,13 @@ DEFAULT_CONFIG = {
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.
         "auto_decompose_per_tick": 3,
+        # Optional incident owner for true blockers that hit the repeated
+        # unblock-loop breaker and land in triage. When set, the dispatcher
+        # creates one idempotent scratch recovery card per incident instead of
+        # leaving it in an ownerless dead queue. Fresh intake is unaffected.
+        "triage_recovery_assignee": "",
+        # Max recovery cards created per dispatcher tick.
+        "triage_recovery_per_tick": 3,
         # Stale detection: running tasks that have exceeded this many
         # seconds without a heartbeat (since ``last_heartbeat_at``) are
         # auto-reclaimed to ``ready`` on the next dispatcher tick. The

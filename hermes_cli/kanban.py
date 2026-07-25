@@ -2542,6 +2542,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             if isinstance(raw_worktree_setup_commands, dict)
             else {}
         )
+        triage_recovery_assignee = (
+            _kanban_cfg.get("triage_recovery_assignee") or ""
+        ).strip() or None
+        triage_recovery_per_tick = _coerce_positive_int(
+            _kanban_cfg.get("triage_recovery_per_tick")
+        ) or 3
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
@@ -2556,6 +2562,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         worktree_shared_path_overlays = {}
         worktree_shared_path_source_overrides = {}
         worktree_setup_commands = {}
+        triage_recovery_assignee = None
+        triage_recovery_per_tick = 3
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
@@ -2573,6 +2581,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 worktree_shared_path_source_overrides
             ),
             worktree_setup_commands=worktree_setup_commands,
+            triage_recovery_assignee=triage_recovery_assignee,
+            triage_recovery_per_tick=triage_recovery_per_tick,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2582,6 +2592,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
+            "triage_recoveries_created": res.triage_recoveries_created,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
@@ -2609,6 +2620,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
     print(f"Promoted:     {res.promoted}")
+    print(f"Recoveries:   {len(res.triage_recoveries_created)}")
+    if res.triage_recoveries_created:
+        print(f"  {', '.join(res.triage_recoveries_created)}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""

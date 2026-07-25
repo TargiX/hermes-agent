@@ -3341,6 +3341,139 @@ def test_dispatch_worktree_setup_failure_blocks_before_worker_spawn(
     assert "worktree setup failed" in (task.last_failure_error or "")
 
 
+def test_dispatch_creates_one_operator_recovery_for_triage_block_loop(
+    kanban_home, monkeypatch
+):
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    spawned: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append((task.id, task.assignee))
+        return None
+
+    with kb.connect() as conn:
+        original_id = kb.create_task(
+            conn,
+            title="Browser-backed product proof",
+            assignee="worker",
+        )
+        assert kb.block_task(
+            conn,
+            original_id,
+            reason="browser broker unavailable",
+            kind="capability",
+        )
+        assert kb.unblock_task(conn, original_id)
+        assert kb.block_task(
+            conn,
+            original_id,
+            reason="browser broker still unavailable",
+            kind="capability",
+        )
+        assert kb.get_task(conn, original_id).status == "triage"
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            triage_recovery_assignee="operator",
+            triage_recovery_per_tick=3,
+        )
+        recovery_id = result.triage_recoveries_created[0]
+        recovery = kb.get_task(conn, recovery_id)
+        relations = kb.list_task_relations(conn, task_id=recovery_id)
+
+        assert result.triage_recoveries_created == [recovery_id]
+        assert spawned == [(recovery_id, "operator")]
+        assert recovery is not None
+        assert recovery.assignee == "operator"
+        assert recovery.workspace_kind == "scratch"
+        assert original_id in (recovery.body or "")
+        assert "Do not blindly rerun" in (recovery.body or "")
+        assert any(
+            relation.source_task_id == original_id
+            and relation.target_task_id == recovery_id
+            and relation.relation == "recovers"
+            for relation in relations
+        )
+
+        second = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            triage_recovery_assignee="operator",
+            triage_recovery_per_tick=3,
+        )
+        recovery_count = len(
+            [
+                task
+                for task in kb.list_tasks(conn)
+                if task.title.startswith("Recover triage incident:")
+            ]
+        )
+
+    assert second.triage_recoveries_created == []
+    assert recovery_count == 1
+
+
+def test_dispatch_does_not_recover_fresh_intake_triage(
+    kanban_home, monkeypatch
+):
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with kb.connect() as conn:
+        intake_id = kb.create_task(
+            conn,
+            title="Unspecified product idea",
+            assignee="planner",
+            triage=True,
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: None,
+            triage_recovery_assignee="operator",
+            triage_recovery_per_tick=3,
+        )
+        intake = kb.get_task(conn, intake_id)
+
+    assert result.triage_recoveries_created == []
+    assert intake is not None
+    assert intake.status == "triage"
+
+
+def test_triage_recovery_cap_advances_past_existing_incidents(kanban_home):
+    with kb.connect() as conn:
+        original_ids: list[str] = []
+        for index in range(4):
+            task_id = kb.create_task(
+                conn,
+                title=f"Capability incident {index}",
+                assignee="worker",
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'triage', block_kind = 'capability', "
+                "block_recurrences = ? WHERE id = ?",
+                (kb.BLOCK_RECURRENCE_LIMIT, task_id),
+            )
+            original_ids.append(task_id)
+
+        first = kb.ensure_triage_recovery_tasks(
+            conn,
+            assignee="operator",
+            max_new=2,
+        )
+        second = kb.ensure_triage_recovery_tasks(
+            conn,
+            assignee="operator",
+            max_new=2,
+        )
+
+    assert len(first) == 2
+    assert len(second) == 2
+    assert set(first).isdisjoint(second)
+
+
 def test_set_task_skills_repairs_blocked_worker_without_replacing_card(
     kanban_home,
 ):

@@ -47,6 +47,8 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
             "max_spawn": 5,
             "default_assignee": "default",
             "max_in_progress_per_profile": 2,
+            "triage_recovery_assignee": "operator",
+            "triage_recovery_per_tick": 4,
             "worktree_shared_paths": ["node_modules"],
             "worktree_shared_path_overlays": {"node_modules": [".cache"]},
             "worktree_shared_path_source_overrides": {
@@ -84,6 +86,8 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     )
     assert captured.get("default_assignee") == "default"
     assert captured.get("max_in_progress_per_profile") == 2
+    assert captured.get("triage_recovery_assignee") == "operator"
+    assert captured.get("triage_recovery_per_tick") == 4
     assert captured.get("worktree_shared_paths") == ["node_modules"]
     assert captured.get("worktree_shared_path_overlays") == {
         "node_modules": [".cache"]

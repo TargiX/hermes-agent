@@ -1021,6 +1021,31 @@ class GatewayKanbanWatchersMixin:
                 default_assignee,
             )
 
+        triage_recovery_assignee = (
+            kanban_cfg.get("triage_recovery_assignee") or ""
+        ).strip() or None
+        raw_triage_recovery_per_tick = kanban_cfg.get(
+            "triage_recovery_per_tick", 3
+        )
+        try:
+            triage_recovery_per_tick = max(
+                1, int(raw_triage_recovery_per_tick or 3)
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid "
+                "kanban.triage_recovery_per_tick=%r; using 3",
+                raw_triage_recovery_per_tick,
+            )
+            triage_recovery_per_tick = 3
+        if triage_recovery_assignee:
+            logger.info(
+                "kanban dispatcher: triage block-loop recovery routes to %r "
+                "(max %d new incident cards per tick)",
+                triage_recovery_assignee,
+                triage_recovery_per_tick,
+            )
+
         # Read kanban.max_in_progress_per_profile — per-profile concurrency
         # cap (#21582). When set, no single profile gets more than N
         # workers running at once, even if the global max_in_progress
@@ -1199,6 +1224,8 @@ class GatewayKanbanWatchersMixin:
                         worktree_shared_path_source_overrides
                     ),
                     worktree_setup_commands=worktree_setup_commands,
+                    triage_recovery_assignee=triage_recovery_assignee,
+                    triage_recovery_per_tick=triage_recovery_per_tick,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1417,10 +1444,11 @@ class GatewayKanbanWatchersMixin:
                         # Quiet by default — only log when something actually
                         # happened, so an idle gateway stays silent.
                         logger.info(
-                            "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
+                            "kanban dispatcher [%s]: spawned=%d recoveries=%d reclaimed=%d "
                             "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
                             slug,
                             len(res.spawned),
+                            len(res.triage_recoveries_created),
                             res.reclaimed,
                             len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
                             len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,

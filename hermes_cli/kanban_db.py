@@ -8437,6 +8437,13 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    triage_recoveries_created: list[str] = field(default_factory=list)
+    """Operator recovery cards created for block-loop incidents in triage.
+
+    Fresh intake triage is deliberately excluded: it belongs to the
+    specifier/decomposer, while a repeated capability/input loop needs a
+    bounded incident decision rather than task fan-out.
+    """
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -10058,6 +10065,123 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def ensure_triage_recovery_tasks(
+    conn: sqlite3.Connection,
+    *,
+    assignee: Optional[str],
+    max_new: int = 3,
+    dry_run: bool = False,
+    board: Optional[str] = None,
+) -> list[str]:
+    """Create bounded operator work for repeated block loops parked in triage.
+
+    ``triage`` serves two different lifecycle states: fresh underspecified
+    intake (``block_recurrences == 0``), owned by the specifier/decomposer, and
+    repeated true blockers routed there by :func:`block_task`. The latter need
+    an explicit recovery decision, not decomposition into more product work.
+
+    When an operator profile is configured, create one idempotent scratch
+    recovery card per incident. The worker may prove the capability restored
+    and force-promote the original, create one bounded repair, or archive a
+    superseded incident. It must never blindly rerun the stale original card.
+    """
+    recovery_assignee = _canonical_assignee(assignee)
+    if not recovery_assignee:
+        return []
+    try:
+        limit = max(1, int(max_new))
+    except (TypeError, ValueError):
+        limit = 3
+
+    incident_rows = conn.execute(
+        """
+        SELECT id, title, block_kind, block_recurrences, created_at
+          FROM tasks
+         WHERE status = 'triage'
+           AND block_recurrences >= ?
+           AND block_kind IS NOT NULL
+         ORDER BY created_at ASC
+        """,
+        (BLOCK_RECURRENCE_LIMIT,),
+    ).fetchall()
+    created: list[str] = []
+    for row in incident_rows:
+        if len(created) >= limit:
+            break
+        idempotency_key = (
+            "kanban-triage-recovery/v1:"
+            f"{row['id']}:{row['block_kind']}:{int(row['block_recurrences'])}"
+        )
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+        if existing is not None:
+            continue
+        if dry_run:
+            created.append(row["id"])
+            continue
+
+        latest_run = conn.execute(
+            """
+            SELECT summary
+              FROM task_runs
+             WHERE task_id = ? AND summary IS NOT NULL
+             ORDER BY id DESC
+             LIMIT 1
+            """,
+            (row["id"],),
+        ).fetchone()
+        latest_summary = (
+            str(latest_run["summary"]).strip()
+            if latest_run is not None and latest_run["summary"]
+            else "No machine-readable blocker summary was recorded."
+        )
+        original_title = str(row["title"]).strip()
+        body = (
+            "task_class: control_plane_recovery\n"
+            "implementation_authority: false\n"
+            f"original_task_id: {row['id']}\n"
+            f"original_block_kind: {row['block_kind']}\n"
+            f"original_block_recurrences: {int(row['block_recurrences'])}\n"
+            f"original_created_at: {int(row['created_at'])}\n\n"
+            "Purpose: reconcile this repeated block-loop against current "
+            "capability and current task truth.\n\n"
+            f"Latest recorded blocker:\n{latest_summary}\n\n"
+            "Required decision:\n"
+            "1. If the original is superseded, historical, or falsified, add "
+            "an audit comment and archive it.\n"
+            "2. If the named capability is now proven available, add proof and "
+            "force-promote the original. Use this recovery card's task id as "
+            "evidence_task_id.\n"
+            "3. If a bounded environment or adapter repair is still required, "
+            "create or identify exactly one repair card, relate it to the "
+            "original, and keep the original in triage.\n"
+            "4. If authority or user input is genuinely required, block this "
+            "recovery card with the exact missing action.\n\n"
+            "Do not blindly rerun the original task. Do not implement product "
+            "scope, open a PR, merge, deploy, spend, or weaken an evidence "
+            "contract. Close this recovery card only after one durable "
+            "disposition above is recorded."
+        )
+        recovery_id = create_task(
+            conn,
+            title=f"Recover triage incident: {original_title}"[:240],
+            body=body,
+            assignee=recovery_assignee,
+            created_by="triage-recovery-dispatcher",
+            workspace_kind="scratch",
+            priority=100,
+            relations=[(row["id"], "recovers")],
+            idempotency_key=idempotency_key,
+            max_runtime_seconds=900,
+            board=board,
+        )
+        created.append(recovery_id)
+    return created
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -10077,6 +10201,8 @@ def dispatch_once(
         dict[str, dict[str, str]]
     ] = None,
     worktree_setup_commands: Optional[dict[str, dict[str, Any]]] = None,
+    triage_recovery_assignee: Optional[str] = None,
+    triage_recovery_per_tick: int = 3,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -10117,6 +10243,8 @@ def dispatch_once(
                 worktree_shared_path_source_overrides
             ),
             worktree_setup_commands=worktree_setup_commands,
+            triage_recovery_assignee=triage_recovery_assignee,
+            triage_recovery_per_tick=triage_recovery_per_tick,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -10139,6 +10267,8 @@ def dispatch_once(
                 worktree_shared_path_source_overrides
             ),
             worktree_setup_commands=worktree_setup_commands,
+            triage_recovery_assignee=triage_recovery_assignee,
+            triage_recovery_per_tick=triage_recovery_per_tick,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -10165,6 +10295,8 @@ def _dispatch_once_locked(
         dict[str, dict[str, str]]
     ] = None,
     worktree_setup_commands: Optional[dict[str, dict[str, Any]]] = None,
+    triage_recovery_assignee: Optional[str] = None,
+    triage_recovery_per_tick: int = 3,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -10199,6 +10331,13 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    result.triage_recoveries_created = ensure_triage_recovery_tasks(
+        conn,
+        assignee=triage_recovery_assignee,
+        max_new=triage_recovery_per_tick,
+        dry_run=dry_run,
+        board=board,
+    )
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,

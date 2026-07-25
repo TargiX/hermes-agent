@@ -4034,6 +4034,23 @@ def generate_launchd_plist() -> str:
     <key>KeepAlive</key>
     <true/>
 
+    <!-- macOS launch agents otherwise inherit a soft 256-open-file ceiling.
+         The gateway owns the full worker/MCP/browser process tree, so a
+         browser-backed Nuxt worktree can exhaust that ceiling even when the
+         gateway itself uses few descriptors. Keep the worker tree at the
+         conventional developer-process limit instead of failing as EMFILE. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
     <!-- ThrottleInterval raises launchd's default 10s minimum respawn interval
          to 30s so a crash-looping gateway can't hammer launchd into a rapid
          respawn storm; ExitTimeOut gives the gateway 25s of graceful-drain
