@@ -3808,6 +3808,27 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+def _execution_lease_seconds(job: dict) -> float | None:
+    """Bound a durable cron fence beyond the nominal worker timeout.
+
+    A direct CLI owner can exit while a persistent app-server descendant still
+    has the turn open.  Two times the configured hard wall (and at least two
+    extra minutes) covers that bounded retirement window without making healthy
+    jobs wait: normal terminal closeout releases the ledger immediately.
+    """
+
+    raw = job.get("max_runtime_seconds")
+    if raw is None:
+        return None
+    try:
+        runtime = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if runtime <= 0:
+        return None
+    return max(runtime * 2, runtime + 120)
+
+
 def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -3825,7 +3846,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     """
     execution_id = job.get("execution_id")
     if not execution_id:
-        execution = claim_execution(job["id"], source="direct")
+        execution = claim_execution(
+            job["id"],
+            source="direct",
+            lease_seconds=_execution_lease_seconds(job),
+        )
         if execution is None:
             logger.info(
                 "Job '%s' already has a live execution — skipping duplicate direct fire",
@@ -4124,7 +4149,11 @@ def tick(
                     _running_job_ids.add(job_id)
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = claim_execution(job_id, source="builtin")
+            execution = claim_execution(
+                job_id,
+                source="builtin",
+                lease_seconds=_execution_lease_seconds(job),
+            )
             if execution is None:
                 if not had_local_marker:
                     with _running_lock:

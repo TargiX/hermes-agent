@@ -102,9 +102,16 @@ class CronScheduler(ABC):
         """
         from cron.jobs import claim_job_for_fire, get_job
         from cron.executions import claim_execution, finish_execution
-        from cron.scheduler import run_one_job
+        from cron.scheduler import _execution_lease_seconds, run_one_job
 
-        execution = claim_execution(job_id, source=self.name)
+        job = get_job(job_id)
+        if job is None:
+            return False
+        execution = claim_execution(
+            job_id,
+            source=self.name,
+            lease_seconds=_execution_lease_seconds(job),
+        )
         if execution is None:
             return False
         if not claim_job_for_fire(job_id):

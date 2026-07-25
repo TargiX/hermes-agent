@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,50 @@ def test_claim_execution_rejects_live_same_job_until_terminal(monkeypatch, tmp_p
     next_attempt = executions.claim_execution("single-lead", source="builtin")
     assert next_attempt is not None
     assert next_attempt["id"] != first["id"]
+
+
+def test_dead_owner_remains_fenced_until_execution_lease_expires(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    first = executions.claim_execution(
+        "leased-lead",
+        source="direct",
+        lease_seconds=300,
+    )
+    assert first is not None
+    assert first["lease_expires_at"]
+    monkeypatch.setattr(executions, "_owner_is_live", lambda *_args: False)
+
+    # The direct CLI shell may die while its persistent app-server child still
+    # has authority to emit side effects. Owner death alone must not admit a
+    # second scheduler during the declared run budget.
+    assert (
+        executions.claim_execution(
+            "leased-lead",
+            source="builtin",
+            lease_seconds=300,
+        )
+        is None
+    )
+    assert executions.latest_execution("leased-lead")["status"] == "claimed"
+
+    expired_now = datetime.fromisoformat(first["lease_expires_at"]) + timedelta(
+        seconds=1
+    )
+    monkeypatch.setattr(executions, "_hermes_now", lambda: expired_now)
+    replacement = executions.claim_execution(
+        "leased-lead",
+        source="builtin",
+        lease_seconds=300,
+    )
+
+    assert replacement is not None
+    records = executions.list_executions(job_id="leased-lead")
+    assert records[0]["id"] == replacement["id"]
+    assert records[1]["id"] == first["id"]
+    assert records[1]["status"] == "unknown"
 
 
 def test_execution_ledger_schema_enforces_one_live_row_per_job(monkeypatch, tmp_path):

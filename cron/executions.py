@@ -13,6 +13,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -49,11 +50,18 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              status TEXT NOT NULL CHECK(status IN
                ('claimed','running','completed','failed','unknown')),
              claimed_at TEXT NOT NULL,
+             lease_expires_at TEXT,
              started_at TEXT,
              finished_at TEXT,
              error TEXT
            )"""
     )
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(executions)").fetchall()
+    }
+    if "lease_expires_at" not in columns:
+        conn.execute("ALTER TABLE executions ADD COLUMN lease_expires_at TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -120,6 +128,34 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     return current is not None and current == started_at
 
 
+def _lease_expiry(lease_seconds: Optional[float]) -> Optional[str]:
+    if lease_seconds is None:
+        return None
+    try:
+        seconds = float(lease_seconds)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return (_hermes_now() + timedelta(seconds=seconds)).isoformat()
+
+
+def _lease_is_active(value: Any, *, now: datetime) -> bool:
+    if not value:
+        return False
+    try:
+        expiry = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        # A malformed durable fence must fail closed rather than admit an
+        # overlapping side-effecting scheduler.
+        return True
+    if expiry.tzinfo is None and now.tzinfo is not None:
+        expiry = expiry.replace(tzinfo=now.tzinfo)
+    if expiry.tzinfo is not None and now.tzinfo is None:
+        now = now.replace(tzinfo=expiry.tzinfo)
+    return expiry > now
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
     conn.execute(
@@ -152,7 +188,12 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     return _record(row)  # type: ignore[return-value]
 
 
-def claim_execution(job_id: str, *, source: str) -> Optional[Dict[str, Any]]:
+def claim_execution(
+    job_id: str,
+    *,
+    source: str,
+    lease_seconds: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
     """Atomically claim the only live execution slot for one cron job.
 
     The in-process scheduler guard cannot see a direct/manual fire running in
@@ -162,19 +203,27 @@ def claim_execution(job_id: str, *, source: str) -> Optional[Dict[str, Any]]:
     before a new claim; a live owner makes this a no-op.
     """
 
-    now = _hermes_now().isoformat()
+    now_value = _hermes_now()
+    now = now_value.isoformat()
+    lease_expires_at = _lease_expiry(lease_seconds)
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
     with _transaction() as conn:
         conn.execute("BEGIN IMMEDIATE")
         active = conn.execute(
-            """SELECT id, pid, process_started_at FROM executions
+            """SELECT id, pid, process_started_at, lease_expires_at FROM executions
                WHERE job_id=? AND status IN ('claimed','running')""",
             (str(job_id),),
         ).fetchall()
         live_owner = False
         for row in active:
             if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+                live_owner = True
+                continue
+            if _lease_is_active(row["lease_expires_at"], now=now_value):
+                # The shell owner can disappear before a persistent app-server
+                # child finishes. Its declared run lease fences the job until
+                # that bounded side-effect window closes.
                 live_owner = True
                 continue
             conn.execute(
@@ -193,8 +242,8 @@ def claim_execution(job_id: str, *, source: str) -> Optional[Dict[str, Any]]:
             conn.execute(
                 """INSERT INTO executions
                    (id, job_id, source, process_id, pid, process_started_at,
-                    status, claimed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+                    status, claimed_at, lease_expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
                 (
                     execution_id,
                     str(job_id),
@@ -203,6 +252,7 @@ def claim_execution(job_id: str, *, source: str) -> Optional[Dict[str, Any]]:
                     pid,
                     _process_start_time(pid),
                     now,
+                    lease_expires_at,
                 ),
             )
         except sqlite3.IntegrityError as exc:
@@ -258,13 +308,16 @@ def recover_interrupted_executions() -> int:
     changed = 0
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT id, process_id, pid, process_started_at FROM executions
+            """SELECT id, process_id, pid, process_started_at, lease_expires_at
+                 FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
         for row in rows:
             if row["process_id"] == _PROCESS_ID:
                 continue
             if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+                continue
+            if _lease_is_active(row["lease_expires_at"], now=_hermes_now()):
                 continue
             cur = conn.execute(
                 """UPDATE executions SET status='unknown', finished_at=?, error=?
