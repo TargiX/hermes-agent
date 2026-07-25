@@ -138,6 +138,12 @@ VALID_BLOCK_KINDS = {
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
+# A first ``transient`` block has no manual owner by definition, but retrying
+# it immediately can spin on the same outage. After this cooldown the
+# dispatcher creates one bounded operator decision card. If the same task is
+# retried and blocks again, BLOCK_RECURRENCE_LIMIT routes it through the
+# existing triage circuit breaker.
+TRANSIENT_RECOVERY_DELAY_SECONDS = 300
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 VALID_TASK_RELATIONS = {
     "informs",
@@ -10090,12 +10096,18 @@ def ensure_triage_recovery_tasks(
     dry_run: bool = False,
     board: Optional[str] = None,
 ) -> list[str]:
-    """Create bounded operator work for repeated block loops parked in triage.
+    """Create bounded operator work for stalled typed blockers.
 
     ``triage`` serves two different lifecycle states: fresh underspecified
     intake (``block_recurrences == 0``), owned by the specifier/decomposer, and
     repeated true blockers routed there by :func:`block_task`. The latter need
     an explicit recovery decision, not decomposition into more product work.
+
+    A first ``transient`` block is also unreachable without an operator:
+    recurrence two can never happen unless something first returns recurrence
+    one to the work pool. Once its cooldown elapses, create the same bounded
+    recovery card. The operator may retry it once; a repeated transient block
+    then reaches the ordinary triage circuit breaker.
 
     When an operator profile is configured, create one idempotent scratch
     recovery card per incident. The worker may prove the capability restored
@@ -10111,16 +10123,33 @@ def ensure_triage_recovery_tasks(
     except (TypeError, ValueError):
         limit = 3
 
+    transient_cutoff = int(time.time()) - TRANSIENT_RECOVERY_DELAY_SECONDS
     incident_rows = conn.execute(
         """
-        SELECT id, title, block_kind, block_recurrences, created_at
-          FROM tasks
-         WHERE status = 'triage'
-           AND block_recurrences >= ?
-           AND block_kind IS NOT NULL
+        SELECT id, title, status, block_kind, block_recurrences, created_at
+          FROM tasks AS task
+         WHERE (
+               task.status = 'triage'
+               AND task.block_recurrences >= ?
+               AND task.block_kind IS NOT NULL
+           )
+            OR (
+               task.status = 'blocked'
+               AND task.block_kind = 'transient'
+               AND task.block_recurrences = 1
+               AND COALESCE(
+                       (
+                           SELECT MAX(run.ended_at)
+                             FROM task_runs AS run
+                            WHERE run.task_id = task.id
+                              AND run.ended_at IS NOT NULL
+                       ),
+                       task.created_at
+                   ) <= ?
+           )
          ORDER BY created_at ASC
         """,
-        (BLOCK_RECURRENCE_LIMIT,),
+        (BLOCK_RECURRENCE_LIMIT, transient_cutoff),
     ).fetchall()
     created: list[str] = []
     for row in incident_rows:
@@ -10189,15 +10218,30 @@ def ensure_triage_recovery_tasks(
         if not recent_control_evidence:
             recent_control_evidence = "- No original-task comments were recorded."
         original_title = str(row["title"]).strip()
+        original_status = str(row["status"])
+        is_first_transient = (
+            original_status == "blocked"
+            and str(row["block_kind"]) == "transient"
+            and int(row["block_recurrences"]) == 1
+        )
+        purpose = (
+            "Purpose: decide whether this cooled-down first transient "
+            "block gets one bounded retry, is superseded, or needs a "
+            "different truthful recovery.\n\n"
+            if is_first_transient
+            else
+            "Purpose: reconcile this repeated block-loop against current "
+            "capability and current task truth.\n\n"
+        )
         body = (
             "task_class: control_plane_recovery\n"
             "implementation_authority: false\n"
             f"original_task_id: {row['id']}\n"
+            f"original_status: {original_status}\n"
             f"original_block_kind: {row['block_kind']}\n"
             f"original_block_recurrences: {int(row['block_recurrences'])}\n"
             f"original_created_at: {int(row['created_at'])}\n\n"
-            "Purpose: reconcile this repeated block-loop against current "
-            "capability and current task truth.\n\n"
+            f"{purpose}"
             f"Latest recorded blocker:\n{latest_summary}\n\n"
             "Recent original-task control evidence (newest last):\n"
             f"{recent_control_evidence}\n\n"
@@ -10230,7 +10274,13 @@ def ensure_triage_recovery_tasks(
         )
         recovery_id = create_task(
             conn,
-            title=f"Recover triage incident: {original_title}"[:240],
+            title=(
+                (
+                    f"Recover transient incident: {original_title}"
+                    if is_first_transient
+                    else f"Recover triage incident: {original_title}"
+                )[:240]
+            ),
             body=body,
             assignee=recovery_assignee,
             created_by="triage-recovery-dispatcher",

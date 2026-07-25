@@ -224,8 +224,9 @@ def _make_triage_recovery_worker(
     created_by: str = "triage-recovery-dispatcher",
     relation: bool = True,
     original_body: str | None = None,
+    blocked_transient: bool = False,
 ):
-    """Create one running recovery worker linked to one triage incident."""
+    """Create one running recovery worker linked to one stalled incident."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -244,11 +245,18 @@ def _make_triage_recovery_worker(
             body=original_body,
             assignee="test-worker",
         )
-        conn.execute(
-            "UPDATE tasks SET status='triage', block_kind='capability', "
-            "block_recurrences=2 WHERE id=?",
-            (original,),
-        )
+        if blocked_transient:
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='transient', "
+                "block_recurrences=1 WHERE id=?",
+                (original,),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET status='triage', block_kind='capability', "
+                "block_recurrences=2 WHERE id=?",
+                (original,),
+            )
         conn.commit()
         recovery = kb.create_task(
             conn,
@@ -2692,6 +2700,36 @@ def test_recovery_worker_can_promote_only_linked_triage(monkeypatch, tmp_path):
         assert task.block_kind is None
         assert task.block_recurrences == 0
         assert kb.get_task(conn, recovery).status == "running"
+    finally:
+        conn.close()
+
+
+def test_recovery_worker_can_retry_linked_first_transient_block(
+    monkeypatch, tmp_path
+):
+    """One audited retry makes a first transient block reachable again."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    original, _recovery = _make_triage_recovery_worker(
+        monkeypatch,
+        tmp_path,
+        blocked_transient=True,
+    )
+    result = json.loads(kt._handle_recover_triage({
+        "disposition": "ready",
+        "reason": "Cooldown elapsed; retry the same immutable task once.",
+    }))
+
+    assert result["ok"] is True
+    assert result["original_task_id"] == original
+    assert result["status"] == "ready"
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, original)
+        assert task.status == "ready"
+        assert task.block_kind == "transient"
+        assert task.block_recurrences == 1
     finally:
         conn.close()
 

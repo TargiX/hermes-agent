@@ -3424,6 +3424,81 @@ def test_dispatch_creates_one_operator_recovery_for_triage_block_loop(
     assert recovery_count == 1
 
 
+def test_dispatch_creates_one_recovery_for_stale_first_transient_block(
+    kanban_home, monkeypatch
+):
+    """A first transient block must not remain unreachable forever."""
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with kb.connect() as conn:
+        original_id = kb.create_task(
+            conn,
+            title="Temporary Obsidian timeout",
+            assignee="productideator",
+        )
+        assert kb.block_task(
+            conn,
+            original_id,
+            reason="Obsidian read timed out",
+            kind="transient",
+        )
+        conn.execute(
+            "UPDATE task_runs SET ended_at = ? WHERE task_id = ?",
+            (
+                int(time.time()) - kb.TRANSIENT_RECOVERY_DELAY_SECONDS - 1,
+                original_id,
+            ),
+        )
+
+        created = kb.ensure_triage_recovery_tasks(
+            conn,
+            assignee="operator",
+            max_new=3,
+        )
+        repeated = kb.ensure_triage_recovery_tasks(
+            conn,
+            assignee="operator",
+            max_new=3,
+        )
+        recovery = kb.get_task(conn, created[0])
+
+    assert len(created) == 1
+    assert repeated == []
+    assert recovery is not None
+    assert recovery.title.startswith("Recover transient incident:")
+    assert "original_status: blocked" in (recovery.body or "")
+    assert "one bounded retry" in (recovery.body or "")
+
+
+def test_dispatch_does_not_recover_fresh_first_transient_block(
+    kanban_home, monkeypatch
+):
+    """The cooldown keeps a currently clearing transient failure quiet."""
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with kb.connect() as conn:
+        original_id = kb.create_task(
+            conn,
+            title="Fresh temporary outage",
+            assignee="worker",
+        )
+        assert kb.block_task(
+            conn,
+            original_id,
+            reason="service may recover",
+            kind="transient",
+        )
+        created = kb.ensure_triage_recovery_tasks(
+            conn,
+            assignee="operator",
+            max_new=3,
+        )
+
+    assert created == []
+
+
 def test_dispatch_does_not_recover_fresh_intake_triage(
     kanban_home, monkeypatch
 ):

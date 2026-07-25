@@ -1932,10 +1932,16 @@ def _handle_recover_triage(args: dict, **kw) -> str:
             original = kb.get_task(conn, original_id)
             if original is None:
                 return tool_error(f"linked incident {original_id} does not exist")
-            if original.status != "triage":
+            is_first_transient_block = (
+                original.status == "blocked"
+                and original.block_kind == "transient"
+                and original.block_recurrences == 1
+            )
+            if original.status != "triage" and not is_first_transient_block:
                 return tool_error(
                     f"linked incident {original_id} is {original.status!r}; "
-                    "only current triage incidents may be recovered"
+                    "only current triage incidents or first transient blocks "
+                    "may be recovered"
                 )
 
             actor = os.environ.get("HERMES_PROFILE") or "triage-recovery-worker"
@@ -2857,14 +2863,16 @@ KANBAN_ARCHIVE_SCHEMA = {
 KANBAN_RECOVER_TRIAGE_SCHEMA = {
     "name": "kanban_recover_triage",
     "description": (
-        "Resolve the one triage incident machine-linked to this dispatcher-"
-        "created recovery task. Use disposition='archive' when current evidence "
-        "proves the incident historical, superseded, or falsified. Use "
-        "disposition='ready' only when the named capability is now proven "
-        "available. Use disposition='replace' only when the stale incident must "
-        "be archived and continued by exactly one bounded, non-implementation "
-        "scratch successor with the same assignee and contract signatures. This "
-        "tool cannot target an arbitrary task and does not complete the recovery "
+        "Resolve the one stalled incident machine-linked to this dispatcher-"
+        "created recovery task: either a repeated blocker parked in triage or "
+        "a cooled-down first transient block. Use disposition='archive' when "
+        "current evidence proves the incident historical, superseded, or "
+        "falsified. Use disposition='ready' only for one bounded transient "
+        "retry or when the named capability is now proven available. Use "
+        "disposition='replace' only when the stale incident must be archived "
+        "and continued by exactly one bounded, non-implementation scratch "
+        "successor with the same assignee and contract signatures. This tool "
+        "cannot target an arbitrary task and does not complete the recovery "
         "card; call kanban_complete after recording the disposition and receipt."
     ),
     "parameters": {
@@ -2874,7 +2882,7 @@ KANBAN_RECOVER_TRIAGE_SCHEMA = {
                 "type": "string",
                 "enum": ["archive", "ready", "replace"],
                 "description": (
-                    "Audited disposition for the exactly linked triage incident."
+                    "Audited disposition for the exactly linked stalled incident."
                 ),
             },
             "reason": {
