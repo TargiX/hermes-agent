@@ -22,7 +22,7 @@ Scope (what we expose):
   - text_to_speech                       — TTS
   - kanban_* (complete/block/comment/    — kanban worker + orchestrator
     heartbeat/show/list/create/            handoff (stateless: read env var,
-    unblock/link)                          write ~/.hermes/kanban.db)
+    unblock/recover/link)                  write ~/.hermes/kanban.db)
 
 What we DO NOT expose:
   - terminal / shell                     — codex's own shell tool
@@ -137,6 +137,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_block",
     "kanban_comment",
     "kanban_heartbeat",
+    "kanban_recover_triage",
     "kanban_show",
     "kanban_list",
     # NOTE: kanban_create / kanban_unblock / kanban_reassign / kanban_link are orchestrator-

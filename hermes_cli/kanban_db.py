@@ -10151,10 +10151,10 @@ def ensure_triage_recovery_tasks(
             f"Latest recorded blocker:\n{latest_summary}\n\n"
             "Required decision:\n"
             "1. If the original is superseded, historical, or falsified, add "
-            "an audit comment and archive it.\n"
+            "proof, then call kanban_recover_triage with "
+            "disposition='archive'.\n"
             "2. If the named capability is now proven available, add proof and "
-            "force-promote the original. Use this recovery card's task id as "
-            "evidence_task_id.\n"
+            "call kanban_recover_triage with disposition='ready'.\n"
             "3. If a bounded environment or adapter repair is still required, "
             "create or identify exactly one repair card, relate it to the "
             "original, and keep the original in triage.\n"
@@ -10163,7 +10163,8 @@ def ensure_triage_recovery_tasks(
             "Do not blindly rerun the original task. Do not implement product "
             "scope, open a PR, merge, deploy, spend, or weaken an evidence "
             "contract. Close this recovery card only after one durable "
-            "disposition above is recorded."
+            "disposition above is recorded. The recovery tool can mutate only "
+            "the one machine-linked incident; it cannot target arbitrary work."
         )
         recovery_id = create_task(
             conn,

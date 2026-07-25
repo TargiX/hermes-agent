@@ -216,6 +216,61 @@ def worker_env(monkeypatch, tmp_path):
     return tid
 
 
+def _make_triage_recovery_worker(
+    monkeypatch,
+    tmp_path,
+    *,
+    created_by: str = "triage-recovery-dispatcher",
+    relation: bool = True,
+):
+    """Create one running recovery worker linked to one triage incident."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "agencyoperator")
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        original = kb.create_task(
+            conn,
+            title="historical triage incident",
+            assignee="test-worker",
+        )
+        conn.execute(
+            "UPDATE tasks SET status='triage', block_kind='capability', "
+            "block_recurrences=2 WHERE id=?",
+            (original,),
+        )
+        conn.commit()
+        recovery = kb.create_task(
+            conn,
+            title="recover historical triage incident",
+            assignee="agencyoperator",
+            created_by=created_by,
+            relations=[(original, "recovers")] if relation else (),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=?",
+            (recovery,),
+        )
+        conn.commit()
+        claimed = kb.claim_task(conn, recovery)
+        assert claimed is not None
+        run = kb.latest_run(conn, recovery)
+        assert run is not None
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", recovery)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    return original, recovery
+
+
 def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_show({})
@@ -2515,6 +2570,97 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     conn = kb.connect()
     try:
         assert kb.get_task(conn, other).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_recovery_worker_can_archive_only_linked_triage(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    original, recovery = _make_triage_recovery_worker(monkeypatch, tmp_path)
+    assert kt._check_triage_recovery_mode() is True
+
+    result = json.loads(kt._handle_recover_triage({
+        "disposition": "archive",
+        "reason": "Live PR no longer exists and current master supersedes it.",
+    }))
+    assert result == {
+        "ok": True,
+        "recovery_task_id": recovery,
+        "original_task_id": original,
+        "disposition": "archive",
+        "status": "archived",
+    }
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, original).status == "archived"
+        assert kb.get_task(conn, recovery).status == "running"
+        comments = kb.list_comments(conn, original)
+        assert comments
+        assert recovery in comments[-1].body
+    finally:
+        conn.close()
+
+
+def test_recovery_worker_can_promote_only_linked_triage(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    original, recovery = _make_triage_recovery_worker(monkeypatch, tmp_path)
+    result = json.loads(kt._handle_recover_triage({
+        "disposition": "ready",
+        "reason": "Direct current browser proof confirms the capability works.",
+    }))
+    assert result["ok"] is True
+    assert result["original_task_id"] == original
+    assert result["status"] == "ready"
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, original)
+        assert task.status == "ready"
+        assert task.block_kind is None
+        assert task.block_recurrences == 0
+        assert kb.get_task(conn, recovery).status == "running"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("created_by", "relation", "expected"),
+    [
+        ("ordinary-worker", True, "not created by"),
+        ("triage-recovery-dispatcher", False, "exactly one inbound"),
+    ],
+)
+def test_recovery_disposition_rejects_unowned_or_unlinked_worker(
+    monkeypatch,
+    tmp_path,
+    created_by,
+    relation,
+    expected,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    original, _recovery = _make_triage_recovery_worker(
+        monkeypatch,
+        tmp_path,
+        created_by=created_by,
+        relation=relation,
+    )
+    result = json.loads(kt._handle_recover_triage({
+        "disposition": "archive",
+        "reason": "attempted foreign mutation",
+    }))
+    assert result.get("ok") is not True
+    assert expected in result["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, original).status == "triage"
     finally:
         conn.close()
 

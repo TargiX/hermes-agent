@@ -149,6 +149,44 @@ def _check_kanban_create_mode() -> bool:
     return _check_kanban_mode() and _worker_fanout_allowed()
 
 
+def _check_triage_recovery_mode() -> bool:
+    """Expose the narrow recovery disposition only to its recovery worker.
+
+    The dispatcher creates these cards itself and links exactly one triage
+    incident with a ``recovers`` relation. Keeping this out of every other
+    worker's schema avoids turning a one-purpose escape hatch into a general
+    cross-task mutation surface.
+    """
+    recovery_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not recovery_id or not _check_kanban_mode():
+        return False
+    try:
+        kb, conn = _connect()
+        try:
+            recovery = kb.get_task(conn, recovery_id)
+            if (
+                recovery is None
+                or recovery.created_by != "triage-recovery-dispatcher"
+                or recovery.status != "running"
+            ):
+                return False
+            linked = conn.execute(
+                """
+                SELECT source_task_id
+                  FROM task_relations
+                 WHERE target_task_id = ?
+                   AND relation = 'recovers'
+                """,
+                (recovery_id,),
+            ).fetchall()
+            return len(linked) == 1
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("triage recovery tool gate failed", exc_info=True)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -1747,6 +1785,118 @@ def _handle_unblock(args: dict, **kw) -> str:
         return tool_error(f"kanban_unblock: {e}")
 
 
+def _handle_recover_triage(args: dict, **kw) -> str:
+    """Apply one audited disposition to the incident linked to this worker."""
+    delegated_err = _reject_delegated_child_mutation("kanban_recover_triage")
+    if delegated_err:
+        return delegated_err
+    recovery_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not recovery_id:
+        return tool_error(
+            "kanban_recover_triage is available only inside a dispatched "
+            "triage-recovery task"
+        )
+    disposition = str(args.get("disposition") or "").strip().casefold()
+    if disposition not in {"archive", "ready"}:
+        return tool_error("disposition must be 'archive' or 'ready'")
+    reason = str(args.get("reason") or "").strip()
+    if not reason:
+        return tool_error("reason is required for the recovery audit")
+    reason = redact_sensitive_text(reason, force=True)
+
+    try:
+        kb, conn = _connect()
+        try:
+            recovery = kb.get_task(conn, recovery_id)
+            if recovery is None:
+                return tool_error(f"unknown recovery task {recovery_id}")
+            if recovery.created_by != "triage-recovery-dispatcher":
+                return tool_error(
+                    f"task {recovery_id} was not created by the triage "
+                    "recovery dispatcher"
+                )
+            if recovery.status != "running":
+                return tool_error(
+                    f"recovery task {recovery_id} must be running, not "
+                    f"{recovery.status!r}"
+                )
+            expected_run_id = _worker_run_id(recovery_id)
+            if (
+                expected_run_id is not None
+                and recovery.current_run_id != expected_run_id
+            ):
+                return tool_error(
+                    f"stale recovery worker run {expected_run_id}; current run "
+                    f"is {recovery.current_run_id}"
+                )
+
+            linked = conn.execute(
+                """
+                SELECT source_task_id
+                  FROM task_relations
+                 WHERE target_task_id = ?
+                   AND relation = 'recovers'
+                 ORDER BY source_task_id
+                """,
+                (recovery_id,),
+            ).fetchall()
+            if len(linked) != 1:
+                return tool_error(
+                    f"recovery task {recovery_id} must have exactly one inbound "
+                    f"'recovers' relation; found {len(linked)}"
+                )
+            original_id = str(linked[0]["source_task_id"])
+            original = kb.get_task(conn, original_id)
+            if original is None:
+                return tool_error(f"linked incident {original_id} does not exist")
+            if original.status != "triage":
+                return tool_error(
+                    f"linked incident {original_id} is {original.status!r}; "
+                    "only current triage incidents may be recovered"
+                )
+
+            actor = os.environ.get("HERMES_PROFILE") or "triage-recovery-worker"
+            audit = (
+                f"Triage recovery {disposition} by {actor} via "
+                f"{recovery_id}: {reason}"
+            )
+            if disposition == "archive":
+                kb.add_comment(conn, original_id, actor, audit)
+                if not kb.archive_task(conn, original_id):
+                    return tool_error(
+                        f"linked incident {original_id} changed before archive"
+                    )
+                status = "archived"
+            else:
+                ok, error = kb.promote_task(
+                    conn,
+                    original_id,
+                    actor=actor,
+                    reason=reason,
+                    force=True,
+                    evidence_task_id=recovery_id,
+                )
+                if not ok:
+                    return tool_error(
+                        f"could not recover triage task {original_id}: {error}"
+                    )
+                kb.add_comment(conn, original_id, actor, audit)
+                status = "ready"
+            return _ok(
+                recovery_task_id=recovery_id,
+                original_task_id=original_id,
+                disposition=disposition,
+                status=status,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_recover_triage: {e}")
+    except Exception as e:
+        logger.exception("kanban_recover_triage failed")
+        return tool_error(f"kanban_recover_triage: {e}")
+
+
 def _handle_reassign(args: dict, **kw) -> str:
     """Move one existing card to a different profile with an audit reason."""
     guard = _require_orchestrator_tool("kanban_reassign")
@@ -2505,6 +2655,40 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_RECOVER_TRIAGE_SCHEMA = {
+    "name": "kanban_recover_triage",
+    "description": (
+        "Resolve the one triage incident machine-linked to this dispatcher-"
+        "created recovery task. Use disposition='archive' when current evidence "
+        "proves the incident historical, superseded, or falsified. Use "
+        "disposition='ready' only when the named capability is now proven "
+        "available. This tool cannot target an arbitrary task and does not "
+        "complete the recovery card; call kanban_complete after recording the "
+        "disposition and receipt."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "disposition": {
+                "type": "string",
+                "enum": ["archive", "ready"],
+                "description": (
+                    "Audited disposition for the exactly linked triage incident."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Concrete current evidence for archiving or re-enabling the "
+                    "incident. Name the falsifier, superseding state, or proven "
+                    "restored capability."
+                ),
+            },
+        },
+        "required": ["disposition", "reason"],
+    },
+}
+
 KANBAN_REASSIGN_SCHEMA = {
     "name": "kanban_reassign",
     "description": (
@@ -2665,6 +2849,15 @@ registry.register(
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
+)
+
+registry.register(
+    name="kanban_recover_triage",
+    toolset="kanban",
+    schema=KANBAN_RECOVER_TRIAGE_SCHEMA,
+    handler=_handle_recover_triage,
+    check_fn=_check_triage_recovery_mode,
+    emoji="🛟",
 )
 
 registry.register(
