@@ -10099,8 +10099,9 @@ def ensure_triage_recovery_tasks(
 
     When an operator profile is configured, create one idempotent scratch
     recovery card per incident. The worker may prove the capability restored
-    and force-promote the original, create one bounded repair, or archive a
-    superseded incident. It must never blindly rerun the stale original card.
+    and force-promote the original, replace a stale contract with one bounded
+    non-implementation successor, or archive a superseded incident. It must
+    never blindly rerun the stale original card.
     """
     recovery_assignee = _canonical_assignee(assignee)
     if not recovery_assignee:
@@ -10211,10 +10212,15 @@ def ensure_triage_recovery_tasks(
             "disposition='archive'.\n"
             "2. If the named capability is now proven available, add proof and "
             "call kanban_recover_triage with disposition='ready'.\n"
-            "3. If a bounded environment or adapter repair is still required, "
-            "create or identify exactly one repair card, relate it to the "
-            "original, and keep the original in triage.\n"
-            "4. If authority or user input is genuinely required, block this "
+            "3. If the intent remains valid but its stale adapter or evidence "
+            "contract must change, call kanban_recover_triage with "
+            "disposition='replace', one bounded successor title/body, "
+            "implementation_authority: false, the exact original "
+            "supersedes_task_id, and unchanged task_class/selection_signature. "
+            "The tool creates exactly one same-assignee scratch successor and "
+            "archives the original.\n"
+            "4. If an environment repair, authority, or user input is genuinely "
+            "required, block this "
             "recovery card with the exact missing action.\n\n"
             "Do not blindly rerun the original task. Do not implement product "
             "scope, open a PR, merge, deploy, spend, or weaken an evidence "

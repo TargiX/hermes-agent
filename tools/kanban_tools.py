@@ -1786,7 +1786,13 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 
 def _handle_recover_triage(args: dict, **kw) -> str:
-    """Apply one audited disposition to the incident linked to this worker."""
+    """Apply one audited disposition to the incident linked to this worker.
+
+    ``replace`` is deliberately narrower than worker fan-out: it may create
+    exactly one non-implementation scratch successor for the linked incident,
+    preserves its assignee and selection contract, and then archives the stale
+    original. Recovery workers never receive general ``kanban_create`` power.
+    """
     delegated_err = _reject_delegated_child_mutation("kanban_recover_triage")
     if delegated_err:
         return delegated_err
@@ -1797,12 +1803,23 @@ def _handle_recover_triage(args: dict, **kw) -> str:
             "triage-recovery task"
         )
     disposition = str(args.get("disposition") or "").strip().casefold()
-    if disposition not in {"archive", "ready"}:
-        return tool_error("disposition must be 'archive' or 'ready'")
+    if disposition not in {"archive", "ready", "replace"}:
+        return tool_error("disposition must be 'archive', 'ready', or 'replace'")
     reason = str(args.get("reason") or "").strip()
     if not reason:
         return tool_error("reason is required for the recovery audit")
     reason = redact_sensitive_text(reason, force=True)
+    replacement_title = str(args.get("replacement_title") or "").strip()
+    replacement_body = str(args.get("replacement_body") or "").strip()
+    if disposition == "replace":
+        if not replacement_title:
+            return tool_error("replacement_title is required for replace")
+        if len(replacement_title) > 240:
+            return tool_error("replacement_title must be at most 240 characters")
+        if not replacement_body:
+            return tool_error("replacement_body is required for replace")
+        replacement_title = redact_sensitive_text(replacement_title, force=True)
+        replacement_body = redact_sensitive_text(replacement_body, force=True)
 
     try:
         kb, conn = _connect()
@@ -1856,11 +1873,92 @@ def _handle_recover_triage(args: dict, **kw) -> str:
                 )
 
             actor = os.environ.get("HERMES_PROFILE") or "triage-recovery-worker"
+            replacement_id = None
+            if disposition == "replace":
+                if not original.assignee:
+                    return tool_error(
+                        "linked incident has no assignee; replacement would be "
+                        "undispatchable and requires orchestrator reconciliation"
+                    )
+                if not re.search(
+                    r"(?mi)^\s*implementation_authority\s*:\s*false\s*$",
+                    replacement_body,
+                ):
+                    return tool_error(
+                        "replacement_body must declare exactly "
+                        "'implementation_authority: false'"
+                    )
+                supersedes_matches = re.findall(
+                    r"(?mi)^\s*supersedes_task_id\s*:\s*(\S+)\s*$",
+                    replacement_body,
+                )
+                if supersedes_matches != [original_id]:
+                    return tool_error(
+                        "replacement_body must contain exactly one "
+                        f"'supersedes_task_id: {original_id}' line"
+                    )
+
+                def _contract_values(body: Optional[str], key: str) -> list[str]:
+                    if not body:
+                        return []
+                    return [
+                        value.strip()
+                        for value in re.findall(
+                            rf"(?mi)^\s*(?:-\s*)?{re.escape(key)}"
+                            r"\s*:\s*(.+?)\s*$",
+                            body,
+                        )
+                    ]
+
+                for contract_key in ("task_class", "selection_signature"):
+                    original_values = _contract_values(original.body, contract_key)
+                    if len(original_values) > 1:
+                        return tool_error(
+                            f"linked incident has ambiguous {contract_key}; "
+                            "manual reconciliation is required"
+                        )
+                    if not original_values:
+                        continue
+                    replacement_values = _contract_values(
+                        replacement_body,
+                        contract_key,
+                    )
+                    if replacement_values != original_values:
+                        return tool_error(
+                            f"replacement_body must preserve the exact "
+                            f"{contract_key}: {original_values[0]}"
+                        )
+
+                # Create first, archive second. The deterministic key makes a
+                # retry converge on the same successor; if creation fails the
+                # original remains safely parked in triage.
+                replacement_id = kb.create_task(
+                    conn,
+                    title=replacement_title,
+                    body=replacement_body,
+                    assignee=original.assignee,
+                    created_by=recovery_id,
+                    workspace_kind="scratch",
+                    tenant=original.tenant,
+                    priority=original.priority,
+                    relations=[(original_id, "continues")],
+                    idempotency_key=f"triage-replacement/v1:{original_id}",
+                    max_runtime_seconds=min(
+                        original.max_runtime_seconds or 900,
+                        900,
+                    ),
+                )
             audit = (
                 f"Triage recovery {disposition} by {actor} via "
-                f"{recovery_id}: {reason}"
+                f"{recovery_id}"
+                + (
+                    f"; successor {replacement_id}"
+                    if replacement_id is not None
+                    else ""
+                )
+                + f": {reason}"
             )
-            if disposition == "archive":
+            if disposition in {"archive", "replace"}:
                 kb.add_comment(conn, original_id, actor, audit)
                 if not kb.archive_task(conn, original_id):
                     return tool_error(
@@ -1887,6 +1985,11 @@ def _handle_recover_triage(args: dict, **kw) -> str:
                 original_task_id=original_id,
                 disposition=disposition,
                 status=status,
+                **(
+                    {"replacement_task_id": replacement_id}
+                    if replacement_id is not None
+                    else {}
+                ),
             )
         finally:
             conn.close()
@@ -2662,16 +2765,18 @@ KANBAN_RECOVER_TRIAGE_SCHEMA = {
         "created recovery task. Use disposition='archive' when current evidence "
         "proves the incident historical, superseded, or falsified. Use "
         "disposition='ready' only when the named capability is now proven "
-        "available. This tool cannot target an arbitrary task and does not "
-        "complete the recovery card; call kanban_complete after recording the "
-        "disposition and receipt."
+        "available. Use disposition='replace' only when the stale incident must "
+        "be archived and continued by exactly one bounded, non-implementation "
+        "scratch successor with the same assignee and contract signatures. This "
+        "tool cannot target an arbitrary task and does not complete the recovery "
+        "card; call kanban_complete after recording the disposition and receipt."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "disposition": {
                 "type": "string",
-                "enum": ["archive", "ready"],
+                "enum": ["archive", "ready", "replace"],
                 "description": (
                     "Audited disposition for the exactly linked triage incident."
                 ),
@@ -2682,6 +2787,22 @@ KANBAN_RECOVER_TRIAGE_SCHEMA = {
                     "Concrete current evidence for archiving or re-enabling the "
                     "incident. Name the falsifier, superseding state, or proven "
                     "restored capability."
+                ),
+            },
+            "replacement_title": {
+                "type": "string",
+                "description": (
+                    "Required only for disposition='replace'. Title for the "
+                    "single bounded successor."
+                ),
+            },
+            "replacement_body": {
+                "type": "string",
+                "description": (
+                    "Required only for disposition='replace'. Must declare "
+                    "implementation_authority: false and the exact linked "
+                    "supersedes_task_id, and must preserve any task_class and "
+                    "selection_signature from the original incident."
                 ),
             },
         },

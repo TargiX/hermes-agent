@@ -222,6 +222,7 @@ def _make_triage_recovery_worker(
     *,
     created_by: str = "triage-recovery-dispatcher",
     relation: bool = True,
+    original_body: str | None = None,
 ):
     """Create one running recovery worker linked to one triage incident."""
     home = tmp_path / ".hermes"
@@ -239,6 +240,7 @@ def _make_triage_recovery_worker(
         original = kb.create_task(
             conn,
             title="historical triage incident",
+            body=original_body,
             assignee="test-worker",
         )
         conn.execute(
@@ -2624,6 +2626,136 @@ def test_recovery_worker_can_promote_only_linked_triage(monkeypatch, tmp_path):
         assert task.block_kind is None
         assert task.block_recurrences == 0
         assert kb.get_task(conn, recovery).status == "running"
+    finally:
+        conn.close()
+
+
+def test_recovery_worker_can_replace_linked_triage_with_bounded_successor(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    original, recovery = _make_triage_recovery_worker(
+        monkeypatch,
+        tmp_path,
+        original_body=(
+            "- task_class: evidence\n"
+            "implementation_authority: false\n"
+            "- selection_signature: phosphene:analytics:activation\n"
+        ),
+    )
+    replacement_body = (
+        "task_class: evidence\n"
+        "implementation_authority: false\n"
+        f"supersedes_task_id: {original}\n"
+        "selection_signature: phosphene:analytics:activation\n\n"
+        "Use the newly proven bounded aggregate adapter. Do not inspect raw "
+        "events or modify product state."
+    )
+    result = json.loads(kt._handle_recover_triage({
+        "disposition": "replace",
+        "reason": (
+            "The old broad analytics adapter is superseded by the proven "
+            "bounded aggregate adapter."
+        ),
+        "replacement_title": "Continue activation evidence with bounded adapter",
+        "replacement_body": replacement_body,
+    }))
+
+    assert result["ok"] is True
+    assert result["recovery_task_id"] == recovery
+    assert result["original_task_id"] == original
+    assert result["disposition"] == "replace"
+    assert result["status"] == "archived"
+    replacement = result["replacement_task_id"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, original).status == "archived"
+        successor = kb.get_task(conn, replacement)
+        assert successor is not None
+        assert successor.status == "ready"
+        assert successor.assignee == "test-worker"
+        assert successor.workspace_kind == "scratch"
+        assert successor.workspace_path is None
+        assert successor.project_id is None
+        assert successor.body == replacement_body
+        relation_row = conn.execute(
+            "SELECT relation FROM task_relations "
+            "WHERE source_task_id = ? AND target_task_id = ?",
+            (original, replacement),
+        ).fetchone()
+        assert relation_row is not None
+        assert relation_row["relation"] == "continues"
+        comments = kb.list_comments(conn, original)
+        assert replacement in comments[-1].body
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("replacement_body", "expected"),
+    [
+        (
+            "implementation_authority: true\n",
+            "implementation_authority: false",
+        ),
+        (
+            "implementation_authority: false\n"
+            "supersedes_task_id: wrong-task\n"
+            "selection_signature: phosphene:analytics:activation\n",
+            "supersedes_task_id",
+        ),
+        (
+            "task_class: evidence\n"
+            "implementation_authority: false\n"
+            "{original_line}\n"
+            "selection_signature: phosphene:analytics:other\n",
+            "selection_signature",
+        ),
+    ],
+)
+def test_recovery_replacement_rejects_authority_or_continuity_drift(
+    monkeypatch,
+    tmp_path,
+    replacement_body,
+    expected,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    original, _recovery = _make_triage_recovery_worker(
+        monkeypatch,
+        tmp_path,
+        original_body=(
+            "task_class: evidence\n"
+            "implementation_authority: false\n"
+            "selection_signature: phosphene:analytics:activation\n"
+        ),
+    )
+    replacement_body = replacement_body.format(
+        original_line=f"supersedes_task_id: {original}",
+    )
+    result = json.loads(kt._handle_recover_triage({
+        "disposition": "replace",
+        "reason": "attempted replacement",
+        "replacement_title": "unsafe continuation",
+        "replacement_body": replacement_body,
+    }))
+
+    assert result.get("ok") is not True
+    assert expected in result["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, original).status == "triage"
+        continuation_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM task_relations "
+            "WHERE source_task_id = ? AND relation = 'continues'",
+            (original,),
+        ).fetchone()["count"]
+        assert continuation_count == 0
     finally:
         conn.close()
 
