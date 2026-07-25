@@ -443,6 +443,60 @@ def _latest_running_activity_notes(
     return notes
 
 
+def _positive_epoch(raw: Any) -> Optional[int]:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _running_activity_pulse(
+    conn: sqlite3.Connection,
+) -> dict[str, dict[str, Any]]:
+    """Return the liveness signals that separate a busy worker from a hung one.
+
+    A worker authors a prose note only occasionally — one note in ten heartbeats
+    is normal — so the note alone freezes on screen and a reader cannot tell
+    "still thinking" from "died". Heartbeats fire on a fixed cadence whether or
+    not the worker has anything to say, which makes beat age the honest progress
+    signal. Elapsed time against the card's own runtime budget shows how much
+    room is left before the dispatcher reclaims it.
+    """
+
+    pulse: dict[str, dict[str, Any]] = {}
+    now = int(time.time())
+    rows = conn.execute(
+        """
+        SELECT t.id                  AS task_id,
+               t.started_at          AS started_at,
+               t.last_heartbeat_at   AS last_heartbeat_at,
+               t.max_runtime_seconds AS max_runtime_seconds,
+               (SELECT COUNT(*) FROM task_events e
+                 WHERE e.task_id = t.id AND e.kind = 'heartbeat') AS beats,
+               (SELECT MAX(e2.created_at) FROM task_events e2
+                 WHERE e2.task_id = t.id
+                   AND e2.kind = 'heartbeat'
+                   AND e2.payload IS NOT NULL) AS last_note_at
+          FROM tasks t
+         WHERE t.status = 'running'
+        """
+    ).fetchall()
+    for row in rows:
+        started = _positive_epoch(row["started_at"])
+        beat_at = _positive_epoch(row["last_heartbeat_at"])
+        note_at = _positive_epoch(row["last_note_at"])
+        budget = _positive_epoch(row["max_runtime_seconds"])
+        pulse[str(row["task_id"])] = {
+            "elapsed_seconds": (now - started) if started else None,
+            "budget_seconds": budget,
+            "heartbeat_count": int(row["beats"] or 0),
+            "heartbeat_age_seconds": (now - beat_at) if beat_at else None,
+            "note_age_seconds": (now - note_at) if note_at else None,
+        }
+    return pulse
+
+
 def _controller_timestamp(raw: Any) -> int | None:
     if not raw:
         return None
@@ -1094,9 +1148,36 @@ def _factory_artifact_from_runs(
         }
 
     if task.status == "done":
+        # "Completed result" plus three drawn lines tells a reader nothing about
+        # what actually happened. The receipt already carries the verdict and a
+        # one-line handoff; surface those instead of decorating an empty box.
+        verdict = None
+        detail = None
+        for row, metadata in parsed:
+            if verdict is None:
+                candidate = str(
+                    metadata.get("outcome") or row["outcome"] or ""
+                ).strip()
+                if candidate and candidate.lower() not in {"completed", "done"}:
+                    verdict = candidate[:48]
+            if detail is None:
+                for key in (
+                    "lead_handoff",
+                    "engineering_handoff",
+                    "rationale",
+                    "summary",
+                ):
+                    text = " ".join(str(metadata.get(key) or "").split())
+                    if text:
+                        detail = text[:180]
+                        break
+            if verdict and detail:
+                break
         return {
             "kind": "result",
             "label": "Completed result",
+            "outcome": verdict,
+            "outcome_detail": detail,
             "run_id": int(parsed[0][0]["id"]) if parsed else None,
         }
     return None
@@ -1824,6 +1905,7 @@ def get_board(
         # preview here — the full text is available via /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
         activity_notes = _latest_running_activity_notes(conn)
+        activity_pulse = _running_activity_pulse(conn)
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -1832,6 +1914,7 @@ def get_board(
             )
             d = _task_dict(t, latest_summary=preview)
             d["live_activity_note"] = activity_notes.get(t.id)
+            d["live_activity_pulse"] = activity_pulse.get(t.id)
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -1929,6 +2012,7 @@ def get_agency_overview():
             open_ids = {task.id for task in tasks}
             summary_map = kanban_db.latest_summaries(conn, list(open_ids))
             activity_notes = _latest_running_activity_notes(conn)
+            activity_pulse = _running_activity_pulse(conn)
             for task in tasks:
                 summary = summary_map.get(task.id)
                 item = _task_dict(
@@ -1938,6 +2022,7 @@ def get_agency_overview():
                     ),
                 )
                 item["live_activity_note"] = activity_notes.get(task.id)
+                item["live_activity_pulse"] = activity_pulse.get(task.id)
                 item["board_slug"] = slug
                 item["board_name"] = name
                 column = task.status if task.status in columns else "todo"

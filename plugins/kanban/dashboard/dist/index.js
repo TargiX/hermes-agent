@@ -1951,14 +1951,61 @@
     return null;
   }
 
+  // A worker authors a prose note only occasionally — one note in ten heartbeats
+  // is normal — so the note alone freezes on screen and a reader cannot tell
+  // "still thinking" from "died". Heartbeats fire on a fixed cadence whether or
+  // not the worker has anything to say, which makes beat age the honest signal.
+  const YARD_STALE_BEAT_SECONDS = 180;
+
+  function yardShortDuration(seconds) {
+    if (seconds === null || seconds === undefined) return null;
+    const total = Math.round(Number(seconds));
+    if (!Number.isFinite(total) || total < 0) return null;
+    if (total < 60) return `${total}s`;
+    const minutes = Math.floor(total / 60);
+    if (minutes < 60) {
+      const rest = total % 60;
+      return rest ? `${minutes}m${String(rest).padStart(2, "0")}s` : `${minutes}m`;
+    }
+    return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
+  }
+
+  function yardActivityPulse(pulse) {
+    if (!pulse) return null;
+    const beatAge = pulse.heartbeat_age_seconds;
+    const stale =
+      beatAge !== null &&
+      beatAge !== undefined &&
+      Number(beatAge) > YARD_STALE_BEAT_SECONDS;
+    const parts = [];
+    if (stale) {
+      parts.push(`no beat ${yardShortDuration(beatAge)}`);
+    } else if (pulse.heartbeat_count) {
+      parts.push(`beat ${pulse.heartbeat_count}`);
+    }
+    const elapsed = yardShortDuration(pulse.elapsed_seconds);
+    const budget = yardShortDuration(pulse.budget_seconds);
+    if (elapsed) parts.push(budget ? `${elapsed}/${budget}` : elapsed);
+    const noteAge = yardShortDuration(pulse.note_age_seconds);
+    if (noteAge) parts.push(`note ${noteAge} ago`);
+    if (!parts.length) return null;
+    return { text: parts.join(" · "), stale: stale };
+  }
+
   function yardAgentActivity(agent) {
     if (agent.focus) {
+      const pulse = yardActivityPulse(agent.focus.live_activity_pulse);
       const heartbeat = yardCondenseActivity(
         agent.focus.live_activity_note,
         104,
       );
       if (heartbeat) {
-        return { label: "LIVE UPDATE", text: heartbeat, source: "heartbeat" };
+        return {
+          label: "LIVE UPDATE",
+          text: heartbeat,
+          source: "heartbeat",
+          pulse: pulse,
+        };
       }
       return {
         label: "ACTIVE TASK",
@@ -1967,6 +2014,7 @@
           88,
         ),
         source: "assignment",
+        pulse: pulse,
       };
     }
     const controller = (agent.activeControllers || [])[0];
@@ -2475,7 +2523,9 @@
     const bob = Math.sin(phase * 3 + x * 0.01) * 2;
     const drawY = y + bob;
     const centerY = drawY - 82;
-    const height = 50;
+    // The pulse line needs its own row; without it a frozen note reads as
+    // frozen work, which is the exact confusion this bubble caused before.
+    const height = activity.pulse ? 62 : 50;
     const left = bubbleX - bubbleWidth / 2;
     const top = centerY - height / 2;
     ctx.save();
@@ -2510,18 +2560,26 @@
     ctx.textAlign = "center";
     ctx.fillStyle = color;
     ctx.font = "800 6px ui-monospace, monospace";
-    ctx.fillText(activity.label, bubbleX, centerY - 11);
+    const labelY = activity.pulse ? centerY - 17 : centerY - 11;
+    ctx.fillText(activity.label, bubbleX, labelY);
     ctx.fillStyle = YARD_CANVAS_COLORS.ink;
     ctx.font = "650 8px ui-sans-serif, system-ui, sans-serif";
     yardDrawWrapped(
       ctx,
       activity.text,
       bubbleX,
-      centerY + 3,
+      labelY + 14,
       bubbleWidth - 16,
       10,
       2,
     );
+    if (activity.pulse) {
+      ctx.font = "700 6px ui-monospace, monospace";
+      ctx.fillStyle = activity.pulse.stale
+        ? YARD_CANVAS_COLORS.coral
+        : "rgba(30,42,38,0.58)";
+      ctx.fillText(activity.pulse.text, bubbleX, centerY + 22);
+    }
     ctx.restore();
   }
 
@@ -2783,13 +2841,20 @@
       ctx.stroke();
       ctx.fillStyle = YARD_CANVAS_COLORS.mint;
       ctx.font = "800 7px ui-monospace, monospace";
-      ctx.fillText("RESULT", x, y - 9);
-      ctx.strokeStyle = "rgba(234,240,236,0.34)";
-      for (const lineY of [0, 8, 16]) {
-        ctx.beginPath();
-        ctx.moveTo(x - 22, y + lineY);
-        ctx.lineTo(x + 22, y + lineY);
-        ctx.stroke();
+      ctx.fillText(artifact.outcome || "RESULT", x, y - 12);
+      if (artifact.outcome_detail) {
+        // What happened, in words. Three drawn lines said nothing.
+        ctx.fillStyle = YARD_CANVAS_COLORS.fog;
+        ctx.font = "600 7px ui-sans-serif, system-ui, sans-serif";
+        yardDrawWrapped(ctx, artifact.outcome_detail, x, y, 62, 8, 3);
+      } else {
+        ctx.strokeStyle = "rgba(234,240,236,0.34)";
+        for (const lineY of [0, 8, 16]) {
+          ctx.beginPath();
+          ctx.moveTo(x - 22, y + lineY);
+          ctx.lineTo(x + 22, y + lineY);
+          ctx.stroke();
+        }
       }
     } else if (blocker) {
       ctx.strokeStyle = YARD_CANVAS_COLORS.coral;
@@ -2996,7 +3061,11 @@
     const missionHeight = top + rows * rowHeight + 72;
     const visibleFactoryCount = Math.min(factoryCount, compact ? 4 : 6);
     const factoryRowHeight = compact ? 118 : 112;
-    const factoryTop = missionHeight + (visibleFactoryCount ? 62 : 0);
+    // The band above the first row has to hold the section header, the stage
+    // labels, and a two-line row title before the stage boxes start at y-27.
+    // At 62px they interleaved: the stage labels landed between the title's two
+    // lines and the two overwrote each other.
+    const factoryTop = missionHeight + (visibleFactoryCount ? 84 : 0);
     const factoryHeight = visibleFactoryCount
       ? factoryTop + visibleFactoryCount * factoryRowHeight + 42
       : missionHeight;
@@ -3884,7 +3953,7 @@
         });
 
         if (layout.visibleFactoryCount > 0) {
-          const headerY = layout.factoryTop - 54;
+          const headerY = layout.factoryTop - 76;
           ctx.save();
           ctx.fillStyle = YARD_CANVAS_COLORS.amber;
           ctx.font = "800 8px ui-monospace, monospace";
@@ -3908,7 +3977,7 @@
           ctx.fillStyle = "rgba(234,240,236,0.46)";
           ctx.textAlign = "center";
           stageLabels.forEach(function (label, index) {
-            ctx.fillText(label, layout.factoryStageXs[index], headerY + 19);
+            ctx.fillText(label, layout.factoryStageXs[index], headerY + 18);
           });
           ctx.restore();
 

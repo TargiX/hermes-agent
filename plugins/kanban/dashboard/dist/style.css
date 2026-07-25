@@ -9,6 +9,50 @@
   width: 100%;
 }
 
+/* ---- Typography ownership (theme-immune default) --------------------- *
+ *
+ * The plugin declared a family only on its monospace surfaces and let
+ * everything else inherit from the page. That inheritance is not a neutral
+ * sans: the shipped bundle carries brand display faces (Collapse, Mondwest,
+ * Rules Compressed/Expanded) and a theme is free to route
+ * ``--theme-font-sans`` / ``--theme-font-display`` at any of them. The
+ * result was a high-contrast serif on every heading, stat label, and body
+ * line of the board — and switching the dashboard theme did not fix it,
+ * because the board never owned the decision in the first place.
+ *
+ * Same reasoning as the code/pre reset below: rather than chase whichever
+ * theme is active, the board states its own reading face once, here.
+ * Themes keep full control of colour, spacing, and radius; only the text
+ * surface is pinned, because a dense operational board is scanned rather
+ * than read, and a display serif at 11px is unreadable at a glance.
+ *
+ * ``--hermes-kanban-sans`` stays overridable for anyone who deliberately
+ * wants a different face on the board specifically.
+ */
+.hermes-kanban {
+  --hermes-kanban-sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  font-family: var(--hermes-kanban-sans);
+  font-size: 0.938rem;
+  line-height: 1.5;
+}
+
+/* Headings are where the serif entered most visibly: they resolve the theme
+ * display face unless told otherwise. */
+.hermes-kanban h1,
+.hermes-kanban h2,
+.hermes-kanban h3,
+.hermes-kanban h4,
+.hermes-kanban h5,
+.hermes-kanban h6,
+.hermes-kanban p,
+.hermes-kanban button,
+.hermes-kanban label,
+.hermes-kanban strong,
+.hermes-kanban em {
+  font-family: inherit;
+}
+
 /* ---- Code/pre reset (theme-immune default) --------------------------- *
  *
  * Themes (shipped AND user-installable) routinely paint every <code> and
@@ -114,7 +158,7 @@
 .hermes-kanban-column-count {
   font-variant-numeric: tabular-nums;
   color: var(--color-muted-foreground);
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   font-weight: 500;
 }
 
@@ -136,7 +180,7 @@
 
 .hermes-kanban-column-sub {
   padding: 0 0.25rem 0.5rem;
-  font-size: 0.7rem;
+  font-size: 0.743rem;
   color: var(--color-muted-foreground);
   border-bottom: 1px solid color-mix(in srgb, var(--color-border) 60%, transparent);
   margin-bottom: 0.5rem;
@@ -155,7 +199,7 @@
 .hermes-kanban-empty {
   padding: 1.5rem 0.5rem;
   text-align: center;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   color: var(--color-muted-foreground);
   border: 1px dashed color-mix(in srgb, var(--color-border) 70%, transparent);
   border-radius: var(--radius-sm, 0.25rem);
@@ -182,7 +226,7 @@
 
 .hermes-kanban-progress {
   font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 0.62rem;
+  font-size: 0.707rem;
   padding: 0.05rem 0.35rem;
   border-radius: 999px;
   background: color-mix(in srgb, var(--color-foreground) 8%, transparent);
@@ -213,7 +257,7 @@
   display: flex;
   align-items: center;
   gap: 0.4rem;
-  font-size: 0.65rem;
+  font-size: 0.721rem;
   /* Assignee/profile names are case-sensitive. Do not visually uppercase
    * lane headers, otherwise a valid `analyst` profile appears as `ANALYST`
    * in the WebUI and users may copy the wrong casing back into edits. */
@@ -260,7 +304,7 @@
 
 .hermes-kanban-card-id {
   font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 0.65rem;
+  font-size: 0.721rem;
   color: var(--color-muted-foreground);
   letter-spacing: 0.03em;
 }
@@ -274,13 +318,13 @@
 }
 
 .hermes-kanban-card-meta {
-  font-size: 0.7rem;
+  font-size: 0.743rem;
   color: var(--color-muted-foreground);
   gap: 0.55rem;
 }
 
 .hermes-kanban-priority {
-  font-size: 0.6rem !important;
+  font-size: 0.698rem !important;
   padding: 0.05rem 0.3rem !important;
   background: color-mix(in srgb, var(--color-ring) 18%, transparent);
   color: var(--color-foreground);
@@ -288,12 +332,12 @@
 }
 
 .hermes-kanban-tag {
-  font-size: 0.6rem !important;
+  font-size: 0.698rem !important;
   padding: 0.05rem 0.3rem !important;
 }
 
 .hermes-kanban-needs-assignee {
-  font-size: 0.6rem !important;
+  font-size: 0.698rem !important;
   padding: 0.05rem 0.3rem !important;
   background: color-mix(in srgb, var(--color-warning, #d4b348) 16%, transparent);
   border-color: color-mix(in srgb, var(--color-warning, #d4b348) 45%, var(--color-border));
@@ -506,7 +550,7 @@
 }
 
 .hermes-kanban-section-head {
-  font-size: 0.72rem;
+  font-size: 0.753rem;
   font-weight: 600;
   letter-spacing: 0.07em;
   color: var(--color-muted-foreground);
@@ -537,7 +581,7 @@
 .hermes-kanban-comment-head {
   display: flex;
   gap: 0.5rem;
-  font-size: 0.7rem;
+  font-size: 0.743rem;
 }
 .hermes-kanban-comment-author {
   font-weight: 600;
@@ -550,7 +594,7 @@
 .hermes-kanban-event {
   display: flex;
   gap: 0.5rem;
-  font-size: 0.7rem;
+  font-size: 0.743rem;
   color: var(--color-muted-foreground);
   font-family: var(--font-mono, ui-monospace, monospace);
 }
@@ -632,7 +676,7 @@
 }
 .hermes-kanban-bulk-count {
   font-weight: 600;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   padding-right: 0.25rem;
 }
 
@@ -640,7 +684,7 @@
 .hermes-kanban-bulk-reassign > button {
   height: 1.7rem !important;
   padding: 0 0.5rem !important;
-  font-size: 0.7rem !important;
+  font-size: 0.743rem !important;
   border: 1px solid var(--color-border);
   cursor: pointer;
 }
@@ -665,7 +709,7 @@
   margin-bottom: 0.4rem;
 }
 .hermes-kanban-deps-label {
-  font-size: 0.68rem;
+  font-size: 0.734rem;
   letter-spacing: 0.08em;
   color: var(--color-muted-foreground);
   min-width: 4rem;
@@ -677,7 +721,7 @@
   flex: 1;
 }
 .hermes-kanban-deps-empty {
-  font-size: 0.7rem;
+  font-size: 0.743rem;
   color: var(--color-muted-foreground);
   font-style: italic;
 }
@@ -690,7 +734,7 @@
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm, 0.25rem);
   font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 0.68rem;
+  font-size: 0.734rem;
   color: var(--color-foreground);
 }
 .hermes-kanban-dep-chip-x {
@@ -744,7 +788,7 @@
   background: transparent;
   border: 0;
   color: var(--color-muted-foreground);
-  font-size: 0.7rem;
+  font-size: 0.743rem;
   letter-spacing: 0.05em;
   cursor: pointer;
   padding: 0;
@@ -891,7 +935,7 @@
 
 .hermes-kanban-description-ledger-head small {
   color: var(--color-muted-foreground);
-  font-size: 0.67rem;
+  font-size: 0.73rem;
   line-height: 1.35;
 }
 
@@ -929,14 +973,14 @@
 
 .hermes-kanban-description-field dt {
   color: var(--color-muted-foreground);
-  font: 650 0.67rem/1.45 var(--font-mono, ui-monospace, monospace);
+  font: 650 0.73rem/1.45 var(--font-mono, ui-monospace, monospace);
   word-break: break-word;
 }
 
 .hermes-kanban-description-field dd {
   border-left: 1px solid color-mix(in srgb, var(--color-border) 64%, transparent);
   color: var(--color-foreground);
-  font-size: 0.73rem;
+  font-size: 0.757rem;
   line-height: 1.45;
 }
 
@@ -955,7 +999,7 @@
 .hermes-kanban-description-value.is-outcome,
 .hermes-kanban-description-value.is-number {
   font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 0.68rem;
+  font-size: 0.734rem;
 }
 
 .hermes-kanban-description-value.is-identity {
@@ -979,7 +1023,7 @@
 .hermes-kanban-description-value.is-effort {
   border-color: color-mix(in srgb, var(--color-ring) 34%, transparent);
   background: color-mix(in srgb, var(--color-ring) 9%, transparent);
-  font: 700 0.68rem/1.35 var(--font-mono, ui-monospace, monospace);
+  font: 700 0.734rem/1.35 var(--font-mono, ui-monospace, monospace);
 }
 
 .hermes-kanban-description-value.is-flag[data-value="false"] {
@@ -1001,14 +1045,14 @@
 .hermes-kanban-description-subhead strong,
 .hermes-kanban-description-section-title {
   color: var(--color-foreground);
-  font: 700 0.72rem/1.3 var(--font-mono, ui-monospace, monospace);
+  font: 700 0.753rem/1.3 var(--font-mono, ui-monospace, monospace);
   letter-spacing: 0.035em;
 }
 
 .hermes-kanban-description-subhead span,
 .hermes-kanban-description-subhead small {
   color: var(--color-muted-foreground);
-  font-size: 0.67rem;
+  font-size: 0.73rem;
 }
 
 .hermes-kanban-description-section-title {
@@ -1076,12 +1120,12 @@
 
 .hermes-kanban-description-callout-copy > strong {
   color: var(--color-foreground);
-  font-size: 0.72rem;
+  font-size: 0.753rem;
   line-height: 1.3;
 }
 
 .hermes-kanban-description-callout-copy .hermes-kanban-md {
-  font-size: 0.72rem;
+  font-size: 0.753rem;
   line-height: 1.45;
 }
 
@@ -1106,7 +1150,7 @@
   border-radius: 0.28rem;
   background: color-mix(in srgb, var(--color-primary) 10%, transparent) !important;
   color: var(--color-foreground);
-  font: 700 0.64rem/1.35 var(--font-mono, ui-monospace, monospace);
+  font: 700 0.716rem/1.35 var(--font-mono, ui-monospace, monospace);
   overflow-wrap: anywhere;
 }
 
@@ -1202,7 +1246,7 @@
   display: flex;
   align-items: center;
   gap: 0.6rem;
-  font-size: 0.7rem;
+  font-size: 0.743rem;
 }
 .hermes-kanban-run-outcome {
   font-family: var(--font-mono, ui-monospace, monospace);
@@ -1228,7 +1272,7 @@
   color: var(--color-foreground);
 }
 .hermes-kanban-run-error {
-  font-size: 0.7rem;
+  font-size: 0.743rem;
   color: var(--color-destructive, #d14a4a);
   padding: 0.15rem 0 0;
   font-family: var(--font-mono, ui-monospace, monospace);
@@ -1256,7 +1300,7 @@
 .hermes-kanban-run-meta-block > summary.hermes-kanban-run-meta-label::before {
   content: "▶ ";
   display: inline-block;
-  font-size: 0.6rem;
+  font-size: 0.698rem;
   margin-right: 0.25rem;
   transition: transform 120ms ease;
 }
@@ -1264,7 +1308,7 @@
   transform: rotate(90deg);
 }
 .hermes-kanban-run-meta-label {
-  font-size: 0.65rem;
+  font-size: 0.721rem;
   font-weight: 600;
   letter-spacing: 0.06em;
   color: var(--color-muted-foreground);
@@ -1274,7 +1318,7 @@
   display: block;
   max-height: 8.5rem;
   overflow: auto;
-  font-size: 0.72rem;
+  font-size: 0.753rem;
   line-height: 1.5;
   padding: 0;
   color: var(--color-muted-foreground);
@@ -1313,7 +1357,7 @@
   width: 1.5rem;
   height: 1.5rem;
   border-radius: 9999px;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   font-weight: 600;
   line-height: 1;
   color: var(--color-muted-foreground, rgba(180, 180, 200, 0.8));
@@ -1373,7 +1417,7 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   color: #ff9e3b;
   margin-left: 0.25rem;
   cursor: help;
@@ -1391,7 +1435,7 @@
   align-items: center;
   gap: 0.5rem;
   padding: 0.4rem 0.75rem;
-  font-size: 0.8125rem;
+  font-size: 0.812rem;
 }
 .hermes-kanban-attention-icon { color: #ff9e3b; font-size: 1rem; }
 .hermes-kanban-attention-text { flex: 1; }
@@ -1402,7 +1446,7 @@
   border: 1px solid rgba(120, 120, 140, 0.3);
   border-radius: 0.3rem;
   padding: 0.15rem 0.55rem;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   color: inherit;
   cursor: pointer;
 }
@@ -1420,14 +1464,14 @@
   align-items: center;
   gap: 0.5rem;
   padding: 0.3rem 0.75rem;
-  font-size: 0.8125rem;
+  font-size: 0.812rem;
 }
 .hermes-kanban-attention-row:hover {
   background: rgba(255, 158, 59, 0.08);
 }
 .hermes-kanban-attention-row-id {
   font-family: ui-monospace, SFMono-Regular, monospace;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   color: var(--color-muted-foreground, #888);
   min-width: 7rem;
 }
@@ -1438,7 +1482,7 @@
   text-overflow: ellipsis;
 }
 .hermes-kanban-attention-row-meta {
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   color: var(--color-muted-foreground, #888);
 }
 
@@ -1460,7 +1504,7 @@
 .hermes-kanban-event-warning-label {
   color: #ff6b6b;
   font-weight: 600;
-  font-size: 0.8125rem;
+  font-size: 0.812rem;
 }
 .hermes-kanban-event-phantom-row {
   display: flex;
@@ -1471,12 +1515,12 @@
   padding-left: 1.35rem;
 }
 .hermes-kanban-event-phantom-label {
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   color: var(--color-muted-foreground, #999);
 }
 .hermes-kanban-event-phantom-chip {
   font-family: ui-monospace, SFMono-Regular, monospace;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   padding: 0.1rem 0.4rem;
   background: rgba(255, 107, 107, 0.15);
   border: 1px solid rgba(255, 107, 107, 0.3);
@@ -1496,7 +1540,7 @@
   border: 1px solid rgba(120, 120, 140, 0.3);
   border-radius: 0.3rem;
   padding: 0.15rem 0.55rem;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   color: inherit;
   cursor: pointer;
 }
@@ -1513,10 +1557,10 @@
 }
 .hermes-kanban-recovery-title {
   font-weight: 600;
-  font-size: 0.8125rem;
+  font-size: 0.812rem;
 }
 .hermes-kanban-recovery-hint {
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   color: var(--color-muted-foreground, #888);
   line-height: 1.35;
 }
@@ -1526,13 +1570,13 @@
   gap: 0.35rem;
 }
 .hermes-kanban-recovery-label {
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   color: var(--color-muted-foreground, #888);
 }
 .hermes-kanban-recovery-input,
 .hermes-kanban-recovery-select {
   padding: 0.25rem 0.4rem;
-  font-size: 0.8125rem;
+  font-size: 0.812rem;
   background: rgba(0, 0, 0, 0.15);
   border: 1px solid rgba(120, 120, 140, 0.3);
   border-radius: 0.3rem;
@@ -1546,18 +1590,18 @@
   flex-wrap: wrap;
 }
 .hermes-kanban-recovery-action-label {
-  font-size: 0.8125rem;
+  font-size: 0.812rem;
   font-weight: 600;
   min-width: 8rem;
 }
 .hermes-kanban-recovery-action-desc {
   flex: 1;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   color: var(--color-muted-foreground, #888);
 }
 .hermes-kanban-recovery-btn {
   padding: 0.25rem 0.7rem;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   background: rgba(255, 158, 59, 0.15);
   border: 1px solid rgba(255, 158, 59, 0.4);
   border-radius: 0.3rem;
@@ -1578,7 +1622,7 @@
   flex-wrap: wrap;
 }
 .hermes-kanban-recovery-checkbox {
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
@@ -1591,7 +1635,7 @@
 }
 .hermes-kanban-recovery-cmd {
   font-family: ui-monospace, SFMono-Regular, monospace;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   padding: 0.2rem 0.5rem;
   background: rgba(0, 0, 0, 0.2);
   border: 1px solid rgba(120, 120, 140, 0.3);
@@ -1602,7 +1646,7 @@
   white-space: nowrap;
 }
 .hermes-kanban-recovery-msg {
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   padding: 0.35rem 0.5rem;
   border-radius: 0.3rem;
 }
@@ -1704,7 +1748,7 @@
   font-size: 0.875rem;
 }
 .hermes-kanban-diag-detail {
-  font-size: 0.8125rem;
+  font-size: 0.812rem;
   color: var(--color-foreground, #ccc);
   line-height: 1.4;
 }
@@ -1712,7 +1756,7 @@
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
 }
 .hermes-kanban-diag-data-row {
   display: flex;
@@ -1731,7 +1775,7 @@
   display: flex;
   align-items: center;
   gap: 0.4rem;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
 }
 .hermes-kanban-diag-reassign-label {
   color: var(--color-muted-foreground, #888);
@@ -1744,7 +1788,7 @@
 }
 .hermes-kanban-diag-action-btn {
   padding: 0.25rem 0.6rem;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   background: rgba(0, 0, 0, 0.2);
   border: 1px solid rgba(120, 120, 140, 0.3);
   border-radius: 0.3rem;
@@ -1772,7 +1816,7 @@
   cursor: default;
 }
 .hermes-kanban-diag-msg {
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   padding: 0.35rem 0.5rem;
   border-radius: 0.3rem;
 }
@@ -1831,7 +1875,7 @@
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
-  font-size: 0.7rem;
+  font-size: 0.743rem;
   cursor: pointer;
 }
 
@@ -1848,7 +1892,7 @@
   border-radius: var(--radius);
   background: color-mix(in srgb, var(--color-card) 85%, transparent);
   color: var(--color-muted-foreground);
-  font-size: 0.75rem;
+  font-size: 0.766rem;
   min-height: 80px;
   opacity: 0.5;
   transition: opacity 120ms ease, border-color 120ms ease, background-color 120ms ease;
@@ -1899,7 +1943,7 @@
   border-radius: 0.45rem;
   background: transparent;
   color: var(--color-muted-foreground);
-  font: 600 0.75rem/1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 600 0.766rem/1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
   cursor: pointer;
   transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
 }
@@ -1983,7 +2027,7 @@
   gap: 0.45rem;
   margin-bottom: 0.38rem;
   color: color-mix(in srgb, var(--yard-mint) 86%, white);
-  font: 700 0.64rem/1.2 var(--font-mono, ui-monospace, monospace);
+  font: 700 0.716rem/1.2 var(--font-mono, ui-monospace, monospace);
   letter-spacing: 0.15em;
 }
 
@@ -2025,7 +2069,7 @@
   border-radius: 0.45rem;
   background: color-mix(in srgb, var(--yard-fog) 5%, transparent);
   color: var(--yard-fog);
-  font: 650 0.68rem/1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 650 0.734rem/1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
   cursor: pointer;
 }
 
@@ -2074,7 +2118,7 @@
 .hermes-yard-metric-label {
   overflow: hidden;
   color: color-mix(in srgb, var(--yard-fog) 66%, transparent);
-  font: 600 0.64rem/1.15 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 600 0.716rem/1.15 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2090,7 +2134,7 @@
 
 .hermes-agency-health--loading {
   color: color-mix(in srgb, var(--yard-fog) 58%, transparent);
-  font: 600 0.68rem/1.4 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 600 0.734rem/1.4 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 }
 
 .hermes-agency-health-head,
@@ -2109,7 +2153,7 @@
 .hermes-agency-health-kicker {
   margin-bottom: 0.2rem;
   color: color-mix(in srgb, var(--yard-control) 78%, white);
-  font: 700 0.55rem/1.1 var(--font-mono, ui-monospace, monospace);
+  font: 700 0.675rem/1.1 var(--font-mono, ui-monospace, monospace);
   letter-spacing: 0.12em;
 }
 
@@ -2126,7 +2170,7 @@
   border-radius: 999px;
   color: color-mix(in srgb, var(--yard-fog) 72%, transparent);
   background: color-mix(in srgb, var(--yard-fog) 5%, transparent);
-  font: 700 0.54rem/1 var(--font-mono, ui-monospace, monospace);
+  font: 700 0.67rem/1 var(--font-mono, ui-monospace, monospace);
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
@@ -2182,7 +2226,7 @@
 
 .hermes-agency-health-metric-label {
   color: color-mix(in srgb, var(--yard-fog) 58%, transparent);
-  font: 650 0.57rem/1.1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 650 0.684rem/1.1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 }
 
 .hermes-agency-health-metric-reading {
@@ -2199,7 +2243,7 @@
 .hermes-agency-health-metric-reading span,
 .hermes-agency-health-metric-compare {
   color: color-mix(in srgb, var(--yard-fog) 48%, transparent);
-  font: 650 0.52rem/1.1 var(--font-mono, ui-monospace, monospace);
+  font: 650 0.661rem/1.1 var(--font-mono, ui-monospace, monospace);
 }
 
 .hermes-agency-health-metric--improving .hermes-agency-health-metric-reading span {
@@ -2270,7 +2314,7 @@
 .hermes-agency-health-day > span {
   overflow: hidden;
   color: color-mix(in srgb, var(--yard-fog) 42%, transparent);
-  font: 600 0.46rem/1 var(--font-mono, ui-monospace, monospace);
+  font: 600 0.634rem/1 var(--font-mono, ui-monospace, monospace);
   text-align: center;
   text-overflow: clip;
   white-space: nowrap;
@@ -2300,13 +2344,13 @@
 
 .hermes-agency-health-details strong {
   color: color-mix(in srgb, var(--yard-fog) 82%, white);
-  font: 650 0.59rem/1.2 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 650 0.693rem/1.2 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 }
 
 .hermes-agency-health-details span {
   margin-top: 0.18rem;
   color: color-mix(in srgb, var(--yard-fog) 46%, transparent);
-  font: 560 0.52rem/1.2 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 560 0.661rem/1.2 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 }
 
 .hermes-agency-health-legend {
@@ -2314,7 +2358,7 @@
   gap: 0.62rem;
   margin-top: 0.5rem;
   color: color-mix(in srgb, var(--yard-fog) 48%, transparent);
-  font: 560 0.5rem/1.2 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 560 0.652rem/1.2 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 }
 
 .hermes-agency-health-legend span {
@@ -2377,7 +2421,7 @@
 
 .hermes-canvas-idle-truth span {
   color: var(--yard-amber);
-  font: 760 0.56rem/1 var(--font-mono, ui-monospace, monospace);
+  font: 760 0.679rem/1 var(--font-mono, ui-monospace, monospace);
   letter-spacing: 0.12em;
 }
 
@@ -2390,7 +2434,7 @@
 .hermes-canvas-idle-truth small {
   margin-top: 0.28rem;
   color: color-mix(in srgb, var(--yard-fog) 56%, transparent);
-  font: 560 0.59rem/1.3 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 560 0.693rem/1.3 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 }
 
 .hermes-agency-canvas {
@@ -2435,7 +2479,7 @@
   border-radius: 0.58rem 0.58rem 0.22rem 0.22rem;
   color: #fff;
   background: color-mix(in srgb, var(--tooltip-tone) 62%, #0a1d25);
-  font: 760 0.65rem/1 var(--font-mono, ui-monospace, monospace);
+  font: 760 0.721rem/1 var(--font-mono, ui-monospace, monospace);
 }
 
 .hermes-canvas-tooltip-heading {
@@ -2448,14 +2492,14 @@
 
 .hermes-canvas-tooltip-heading strong {
   color: #fff;
-  font: 690 0.76rem/1.32 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 690 0.771rem/1.32 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
   overflow-wrap: anywhere;
 }
 
 .hermes-canvas-tooltip-kicker,
 .hermes-canvas-tooltip-section-label {
   color: color-mix(in srgb, var(--tooltip-tone) 72%, white);
-  font: 720 0.48rem/1.2 var(--font-mono, ui-monospace, monospace);
+  font: 720 0.643rem/1.2 var(--font-mono, ui-monospace, monospace);
   letter-spacing: 0.12em;
 }
 
@@ -2466,20 +2510,20 @@
   border-radius: 999px;
   color: color-mix(in srgb, var(--tooltip-status) 78%, white);
   background: color-mix(in srgb, var(--tooltip-status) 12%, transparent);
-  font: 680 0.5rem/1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 680 0.652rem/1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
   white-space: nowrap;
 }
 
 .hermes-canvas-tooltip-model {
   margin-top: 0.42rem;
   color: color-mix(in srgb, var(--yard-fog) 62%, transparent);
-  font: 620 0.57rem/1.3 var(--font-mono, ui-monospace, monospace);
+  font: 620 0.684rem/1.3 var(--font-mono, ui-monospace, monospace);
 }
 
 .hermes-canvas-tooltip-description {
   margin: 0.58rem 0 0;
   color: color-mix(in srgb, var(--yard-fog) 72%, transparent);
-  font: 430 0.63rem/1.48 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 430 0.711rem/1.48 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 }
 
 .hermes-canvas-tooltip-description.is-muted {
@@ -2512,7 +2556,7 @@
 .hermes-canvas-tooltip-facts small {
   overflow: hidden;
   color: color-mix(in srgb, var(--yard-fog) 40%, transparent);
-  font: 680 0.43rem/1.2 var(--font-mono, ui-monospace, monospace);
+  font: 680 0.62rem/1.2 var(--font-mono, ui-monospace, monospace);
   letter-spacing: 0.06em;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2521,7 +2565,7 @@
 .hermes-canvas-tooltip-facts strong {
   overflow: hidden;
   color: #fff;
-  font: 700 0.65rem/1.2 var(--font-mono, ui-monospace, monospace);
+  font: 700 0.721rem/1.2 var(--font-mono, ui-monospace, monospace);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2535,18 +2579,18 @@
 
 .hermes-canvas-tooltip-current > strong {
   color: #fff;
-  font: 640 0.64rem/1.4 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 640 0.716rem/1.4 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 }
 
 .hermes-canvas-tooltip-current code,
 .hermes-canvas-tooltip-task code {
   color: color-mix(in srgb, var(--yard-fog) 42%, transparent);
-  font: 520 0.48rem/1.28 var(--font-mono, ui-monospace, monospace);
+  font: 520 0.643rem/1.28 var(--font-mono, ui-monospace, monospace);
 }
 
 .hermes-canvas-tooltip-current.is-idle {
   color: color-mix(in srgb, var(--yard-fog) 54%, transparent);
-  font: 520 0.58rem/1.42 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 520 0.689rem/1.42 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 }
 
 .hermes-canvas-tooltip-factory-focus {
@@ -2565,7 +2609,7 @@
   margin: 0;
   overflow: hidden;
   color: color-mix(in srgb, var(--yard-fog) 86%, white);
-  font: 560 0.63rem/1.5 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 560 0.711rem/1.5 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
@@ -2587,7 +2631,7 @@
   border-left: 2px solid var(--agent-tone);
   color: color-mix(in srgb, var(--yard-fog) 70%, transparent);
   background: color-mix(in srgb, var(--agent-tone) 10%, transparent);
-  font: 610 0.5rem/1.2 var(--font-mono, ui-monospace, monospace);
+  font: 610 0.652rem/1.2 var(--font-mono, ui-monospace, monospace);
 }
 
 .hermes-canvas-tooltip-task-list {
@@ -2622,14 +2666,14 @@
 
 .hermes-canvas-tooltip-task strong {
   color: color-mix(in srgb, var(--yard-fog) 82%, white);
-  font: 570 0.57rem/1.35 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 570 0.684rem/1.35 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
   overflow-wrap: anywhere;
 }
 
 .hermes-canvas-tooltip-more,
 .hermes-canvas-tooltip-foot {
   color: color-mix(in srgb, var(--yard-fog) 40%, transparent);
-  font: 540 0.5rem/1.35 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 540 0.652rem/1.35 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 }
 
 .hermes-canvas-tooltip-foot {
@@ -2651,7 +2695,7 @@
   background: color-mix(in srgb, #07171d 84%, transparent);
   box-shadow: 0 8px 20px color-mix(in srgb, #061216 34%, transparent);
   backdrop-filter: blur(10px);
-  font: 560 0.56rem/1.4 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 560 0.679rem/1.4 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 }
 
 .hermes-canvas-hint {
@@ -2676,13 +2720,13 @@
 
 .hermes-canvas-selection-copy strong {
   color: #fff;
-  font-size: 0.64rem;
+  font-size: 0.716rem;
 }
 
 .hermes-canvas-selection-copy span {
   overflow: hidden;
   color: color-mix(in srgb, var(--yard-mint) 72%, white);
-  font: 620 0.54rem/1.2 var(--font-mono, ui-monospace, monospace);
+  font: 620 0.67rem/1.2 var(--font-mono, ui-monospace, monospace);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2700,7 +2744,7 @@
   border-radius: 0.35rem;
   color: var(--yard-fog);
   background: color-mix(in srgb, var(--yard-fog) 7%, transparent);
-  font: 650 0.55rem/1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 650 0.675rem/1 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
   cursor: pointer;
 }
 
@@ -2719,7 +2763,7 @@
   padding-top: 0.75rem;
   border-top: 1px solid color-mix(in srgb, var(--yard-fog) 10%, transparent);
   color: color-mix(in srgb, var(--yard-fog) 48%, transparent);
-  font: 550 0.58rem/1.4 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font: 550 0.689rem/1.4 var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 }
 
 .hermes-yard-legend span {
@@ -2754,7 +2798,7 @@
   border-radius: 0.7rem;
   color: color-mix(in srgb, var(--yard-fog) 52%, transparent);
   text-align: center;
-  font-size: 0.75rem;
+  font-size: 0.766rem;
 }
 
 @keyframes hermes-yard-live {
