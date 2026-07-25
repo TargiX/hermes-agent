@@ -571,6 +571,11 @@ def test_block_rejects_incomplete_declared_implementation_receipt(worker_env):
                     "diff_sha256": "a" * 64,
                     "diff_fingerprint": "a" * 64,
                     "changed_files": ["feature.ts"],
+                    "diff_fingerprint_details": {
+                        "diff_sha256": "a" * 64,
+                        "patch_bytes": 128,
+                        "changed_files": ["feature.ts"],
+                    },
                     "next_owner": "agencyreviewer",
                 },
             }

@@ -146,6 +146,9 @@ VALID_TASK_RELATIONS = {
     "publishes",
     "recovers",
     "continues",
+    "challenges",
+    "revises",
+    "promotes",
 }
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -2882,6 +2885,11 @@ def create_task(
             "phosphene implementation admission blocked: "
             + implementation_admission_issue
         )
+    receipt_declaration_issue = validate_required_receipt_declaration(body)
+    if receipt_declaration_issue:
+        raise ValueError(
+            "lifecycle receipt admission blocked: " + receipt_declaration_issue
+        )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -5016,6 +5024,31 @@ def validate_phosphene_implementation_admission(
             )
         if not isinstance(entry.get("pr_owned_files"), list):
             return f"open_pr_path_clearance_json[{index}].pr_owned_files must be a list"
+    return None
+
+
+def validate_required_receipt_declaration(body: Optional[str]) -> Optional[str]:
+    """Reject lifecycle cards that would silently bypass handoff validation.
+
+    ``validate_declared_handoff`` intentionally keys off ``required_receipt``.
+    A card that declares the same contract under the narrative ``receipt``
+    alias looks constrained to the worker but is unconstrained at the database
+    boundary. Fail that typo at admission instead of accepting a terminal
+    receipt with incompatible field names.
+    """
+
+    task_class = str(_declared_contract_value(body, "task_class") or "")
+    if task_class not in {"implementation", "correction", "integration", "review"}:
+        return None
+    required_receipt = _declared_contract_value(body, "required_receipt")
+    if required_receipt:
+        return None
+    receipt_alias = str(_declared_contract_value(body, "receipt") or "")
+    if receipt_alias.endswith(("-implementation/v1", "-review/v1")):
+        return (
+            "required_receipt is required for lifecycle handoff validation; "
+            "receipt is not a machine-enforced alias"
+        )
     return None
 
 
@@ -7295,9 +7328,12 @@ def _prepare_worktree_shared_paths(
     For ordinary non-bare repositories that directory is ``<repo>/.git``;
     its parent is therefore the only trusted source root. Missing sources are
     a no-op so one global opt-in can span heterogeneous repositories. Existing
-    destinations fail closed and are never replaced, except that a legacy
-    symlink pointing at the exact configured source may be migrated to a
-    declared shallow overlay before the worker starts.
+    unmanaged destinations fail closed and are never replaced, except that a
+    legacy symlink pointing at the exact configured source may be migrated to a
+    declared shallow overlay before the worker starts. Inside an already
+    marker-verified overlay, a source-owned child that a package manager
+    materialized as a local file or directory is quarantined outside the
+    repository and its canonical symlink is restored before spawn.
     """
     if not shared_paths:
         return
@@ -7341,6 +7377,30 @@ def _prepare_worktree_shared_paths(
         )
 
     marker_name = ".hermes-worktree-overlay.json"
+
+    def _quarantine_materialized_overlay_entry(
+        destination_entry: Path,
+        relative_text: str,
+    ) -> Path:
+        workspace_key = hashlib.sha256(
+            str(workspace_root).encode("utf-8")
+        ).hexdigest()[:16]
+        relative_key = hashlib.sha256(
+            relative_text.encode("utf-8")
+        ).hexdigest()[:12]
+        recovery_root = (
+            kanban_home()
+            / "runtime"
+            / "worktree-overlay-recovery"
+            / workspace_key
+            / relative_key
+        )
+        recovery_root.mkdir(parents=True, exist_ok=True)
+        recovery_target = recovery_root / (
+            f"{destination_entry.name}-{time.time_ns()}-{secrets.token_hex(4)}"
+        )
+        shutil.move(str(destination_entry), str(recovery_target))
+        return recovery_target
 
     def _overlay_children(relative_text: str) -> tuple[str, ...]:
         raw_children = overlays.get(relative_text, [])
@@ -7444,9 +7504,15 @@ def _prepare_worktree_shared_paths(
             destination_entry = root / entry.name
             if os.path.lexists(destination_entry):
                 if not destination_entry.is_symlink():
-                    raise RuntimeError(
-                        f"worktree shared overlay entry is not a symlink: {destination_entry}"
+                    _quarantine_materialized_overlay_entry(
+                        destination_entry,
+                        relative_text,
                     )
+                    destination_entry.symlink_to(
+                        entry.resolve(strict=True),
+                        target_is_directory=entry.is_dir(),
+                    )
+                    continue
                 try:
                     matches = destination_entry.resolve(strict=True) == entry.resolve(
                         strict=True

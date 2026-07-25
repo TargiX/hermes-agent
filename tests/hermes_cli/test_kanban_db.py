@@ -55,6 +55,40 @@ def test_init_db_is_idempotent(kanban_home):
     assert tasks[0].title == "persisted"
 
 
+@pytest.mark.parametrize(
+    ("task_class", "receipt"),
+    [
+        ("implementation", "phosphene-implementation/v1"),
+        ("review", "phosphene-review/v1"),
+        ("review", "portfolio-review/v1"),
+    ],
+)
+def test_create_rejects_unenforced_lifecycle_receipt_alias(
+    kanban_home, task_class, receipt
+):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="required_receipt is required"):
+            kb.create_task(
+                conn,
+                title="invalid lifecycle card",
+                body=f"task_class: {task_class}\nreceipt: {receipt}\n",
+            )
+
+
+def test_create_accepts_machine_enforced_lifecycle_receipt(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="valid review card",
+            body=(
+                "task_class: review\n"
+                "required_receipt: phosphene-review/v1\n"
+                "implementation_task_id: t_impl1234\n"
+            ),
+        )
+    assert task_id
+
+
 def test_init_creates_expected_tables(kanban_home):
     with kb.connect() as conn:
         rows = conn.execute(
@@ -3248,6 +3282,61 @@ def test_worktree_shared_path_overlay_migrates_matching_legacy_link_and_reuses_i
     ).resolve(strict=True)
 
 
+def test_worktree_shared_path_overlay_quarantines_materialized_source_child(
+    kanban_home,
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    shared_dependencies = repo / "node_modules"
+    (shared_dependencies / ".cache").mkdir(parents=True)
+    (shared_dependencies / ".pnpm").mkdir()
+    (shared_dependencies / ".pnpm" / "shared.txt").write_text(
+        "shared\n", encoding="utf-8"
+    )
+    workspace = repo / ".worktrees" / "materialized"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "-b",
+            "wt/materialized",
+            str(workspace),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    kb._prepare_worktree_shared_paths(
+        workspace,
+        ["node_modules"],
+        {"node_modules": [".cache"]},
+    )
+    materialized = workspace / "node_modules" / ".pnpm"
+    materialized.unlink()
+    materialized.mkdir()
+    (materialized / "local.txt").write_text("local\n", encoding="utf-8")
+
+    kb._prepare_worktree_shared_paths(
+        workspace,
+        ["node_modules"],
+        {"node_modules": [".cache"]},
+    )
+
+    assert materialized.is_symlink()
+    assert materialized.resolve(strict=True) == (
+        shared_dependencies / ".pnpm"
+    ).resolve(strict=True)
+    recovery_root = kanban_home / "runtime" / "worktree-overlay-recovery"
+    recovered = list(recovery_root.rglob("local.txt"))
+    assert len(recovered) == 1
+    assert recovered[0].read_text(encoding="utf-8") == "local\n"
+
+
 @pytest.mark.parametrize("unsafe_child", ["", ".", "../cache", "/tmp/cache", "a/b"])
 def test_dispatch_worktree_rejects_unsafe_shared_path_overlay_child(
     kanban_home, tmp_path, monkeypatch, unsafe_child
@@ -4007,6 +4096,37 @@ def test_semantic_task_relation_is_machine_readable_and_does_not_gate(kanban_hom
         assert relations[0].target_task_id == review
         assert relations[0].relation == "reviews"
         assert relations[0].created_by == "lead"
+
+
+def test_product_pipeline_relations_are_machine_readable_and_do_not_gate(kanban_home):
+    with closing(kb.connect()) as conn:
+        idea = kb.create_task(
+            conn,
+            title="persistent product idea",
+            assignee="productideator",
+            initial_status="blocked",
+        )
+        previous = idea
+        for relation, title in (
+            ("challenges", "independent product critique"),
+            ("revises", "revised idea"),
+            ("promotes", "lead candidate gate"),
+            ("implements", "ranked implementation"),
+        ):
+            current = kb.create_task(
+                conn,
+                title=title,
+                assignee="worker",
+                relations=[(previous, relation)],
+                created_by="phosphenelead",
+            )
+            assert kb.get_task(conn, current).status == "ready"
+            assert kb.parent_ids(conn, current) == []
+            edge = kb.list_task_relations(conn, current)[0]
+            assert edge.source_task_id == previous
+            assert edge.target_task_id == current
+            assert edge.relation == relation
+            previous = current
 
 
 def test_session_id_filters_listings(kanban_home):
