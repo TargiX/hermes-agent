@@ -141,3 +141,29 @@ class TestCronjobRunExecutesImmediately:
         assert "live execution" in res["error"]
         m_schedule_claim.assert_not_called()
         m_run.assert_not_called()
+
+    def test_execute_job_now_claims_with_the_runtime_lease(self):
+        """A wake/manual run must fence descendants for the full run budget."""
+        job = dict(_JOB, max_runtime_seconds=300)
+        ran = dict(job, last_status="ok", last_error=None)
+        with patch(
+            "cron.executions.claim_execution",
+            return_value={"id": "exec-leased"},
+        ) as m_execution_claim, patch(
+            "tools.cronjob_tools.claim_job_for_fire",
+            return_value=True,
+        ), patch(
+            "cron.scheduler.run_one_job",
+            return_value=True,
+        ), patch(
+            "tools.cronjob_tools.get_job",
+            return_value=ran,
+        ):
+            res = _execute_job_now(job)
+
+        assert res["claimed"] is True
+        m_execution_claim.assert_called_once_with(
+            "job-run-1",
+            source="direct",
+            lease_seconds=600,
+        )
