@@ -2743,6 +2743,11 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
+    active_pool = _load_auth_store().get("credential_pool")
+    active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
+    reading_global_fallback = bool(raw_entries) and not (
+        isinstance(active_entries, list) and active_entries
+    )
     disk_ids = {
         entry.get("id")
         for entry in raw_entries
@@ -2767,9 +2772,7 @@ def load_pool(provider: str) -> CredentialPool:
         # A profile may be reading this provider from the global-root fallback.
         # Keep that fallback read-only: only the store that owns these rows may
         # rewrite them. Loading the default/root profile will heal global rows.
-        active_pool = _load_auth_store().get("credential_pool")
-        active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
-        raw_needs_auth_normalization = bool(active_entries)
+        raw_needs_auth_normalization = not reading_global_fallback
 
     if provider.startswith(CUSTOM_POOL_PREFIX):
         # Custom endpoint pool — seed from custom_providers config and model config
@@ -2796,7 +2799,7 @@ def load_pool(provider: str) -> CredentialPool:
         )
         changed |= _normalize_pool_priorities(provider, entries)
 
-    if changed:
+    if changed and not reading_global_fallback:
         new_ids = {entry.id for entry in entries}
         write_credential_pool(
             provider,

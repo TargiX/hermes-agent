@@ -128,6 +128,14 @@ def test_profile_global_fallback_normalizes_in_memory_without_writing(tmp_path, 
             }],
         },
     }))
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_hermes_oauth_credentials",
+        lambda: None,
+    )
 
     from agent.credential_pool import load_pool
 
@@ -136,3 +144,53 @@ def test_profile_global_fallback_normalizes_in_memory_without_writing(tmp_path, 
     assert entry.auth_type == AUTH_TYPE_OAUTH
     assert persisted["credential_pool"]["anthropic"][0]["auth_type"] == AUTH_TYPE_API_KEY
     assert not (profile_home / "auth.json").exists()
+
+
+def test_profile_global_fallback_stays_read_only_when_singleton_is_discovered(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    global_root = tmp_path / ".hermes"
+    global_root.mkdir()
+    profile_home = global_root / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    global_auth = global_root / "auth.json"
+    global_auth.write_text(json.dumps({
+        "version": 1,
+        "credential_pool": {
+            "anthropic": [{
+                "id": "global-oat",
+                "label": "Global setup token",
+                "auth_type": AUTH_TYPE_API_KEY,
+                "priority": 0,
+                "source": "manual",
+                "access_token": "sk-ant-oat-global-fallback",
+            }],
+        },
+    }))
+    monkeypatch.setattr(
+        "hermes_cli.auth.is_provider_explicitly_configured",
+        lambda _provider: True,
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_hermes_oauth_credentials",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        lambda: {
+            "accessToken": "sk-ant-oat-discovered",
+            "refreshToken": "refresh-discovered",
+            "expiresAt": 4_102_444_800_000,
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    entries = load_pool("anthropic").entries()
+
+    assert {entry.source for entry in entries} == {"manual", "claude_code"}
+    assert not (profile_home / "auth.json").exists()
+    persisted = json.loads(global_auth.read_text())
+    assert persisted["credential_pool"]["anthropic"][0]["auth_type"] == AUTH_TYPE_API_KEY
