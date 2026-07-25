@@ -20,6 +20,7 @@ Scope (what we expose):
   - image_generate                       — image generation
   - skill_view, skills_list              — Hermes' skill library
   - text_to_speech                       — TTS
+  - posthog_aggregate_readonly            — bounded aggregate analytics
   - kanban_* (complete/block/comment/    — kanban worker + orchestrator
     heartbeat/show/list/create/            handoff (stateless: read env var,
     unblock/recover/link)                  write ~/.hermes/kanban.db)
@@ -127,6 +128,10 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "skill_view",
     "skills_list",
     "text_to_speech",
+    # Narrow analytics surface for unattended workers. Unlike the broad
+    # third-party PostHog `exec` adapter, this only accepts aggregate SELECTs
+    # over events with explicit time bounds and no raw identifiers/content.
+    "posthog_aggregate_readonly",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
     # in the callback, a worker spawned with openai_runtime=codex_app_server

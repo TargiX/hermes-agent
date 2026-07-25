@@ -12,6 +12,7 @@ import inspect
 from typing import get_args
 
 from agent.transports.hermes_tools_mcp_server import (
+    EXPOSED_TOOLS,
     _signature_from_schema,
 )
 
@@ -217,6 +218,12 @@ class TestModuleSurface:
             assert orch_tool in EXPOSED_TOOLS, (
                 f"{orch_tool!r} missing from codex callback"
             )
+
+    def test_bounded_posthog_aggregate_is_exposed(self):
+        """Unattended workers get only the constrained analytics surface,
+        never a broad write-capable PostHog exec proxy."""
+        assert "posthog_aggregate_readonly" in EXPOSED_TOOLS
+        assert "posthog_exec" not in EXPOSED_TOOLS
 
 
 class TestMain:
