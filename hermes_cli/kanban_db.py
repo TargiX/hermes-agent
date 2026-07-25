@@ -8141,6 +8141,103 @@ def _prepare_worktree_shared_paths(
         destination.symlink_to(source.resolve(strict=True), target_is_directory=source.is_dir())
 
 
+def _run_worktree_setup_command(
+    task: Task,
+    workspace: Path,
+    setup_commands: Optional[dict[str, dict[str, Any]]],
+    *,
+    dispatch_stage: str,
+) -> None:
+    """Run a repo-owned environment bootstrap after materialization.
+
+    Commands are repo-scoped and argv-only; shell interpolation is deliberately
+    unsupported. The command runs before the model starts, while project
+    adapters own idempotency because only they know which environment
+    artifacts make a workspace ready.
+    """
+    if not setup_commands:
+        return
+    if not isinstance(setup_commands, dict):
+        raise ValueError("worktree setup commands must be a mapping")
+
+    common_dir = _git_common_dir(workspace)
+    if common_dir is None or common_dir.name != ".git":
+        raise RuntimeError(
+            f"cannot resolve primary checkout for worktree setup at {workspace}"
+        )
+    repo_root = common_dir.parent.resolve(strict=True)
+    raw_config = setup_commands.get(str(repo_root))
+    if raw_config is None:
+        return
+    if not isinstance(raw_config, dict):
+        raise ValueError(
+            f"worktree setup command for {repo_root} must be a mapping"
+        )
+
+    raw_command = raw_config.get("command")
+    if (
+        not isinstance(raw_command, list)
+        or not raw_command
+        or any(not isinstance(part, str) or not part for part in raw_command)
+    ):
+        raise ValueError(
+            f"worktree setup command for {repo_root} must be a non-empty argv list"
+        )
+    raw_timeout = raw_config.get("timeout_seconds", 900)
+    try:
+        timeout_seconds = int(raw_timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"worktree setup timeout for {repo_root} must be an integer"
+        ) from exc
+    if timeout_seconds < 1 or timeout_seconds > 3600:
+        raise ValueError(
+            f"worktree setup timeout for {repo_root} must be between 1 and 3600 seconds"
+        )
+
+    task_class_match = re.search(
+        r"(?mi)^\s*task_class\s*:\s*([a-z0-9_-]+)\s*$",
+        task.body or "",
+    )
+    task_class = task_class_match.group(1).lower() if task_class_match else ""
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HERMES_WORKTREE_TASK_ID": task.id,
+            "HERMES_WORKTREE_TASK_CLASS": task_class,
+            "HERMES_WORKTREE_DISPATCH_STAGE": dispatch_stage,
+            "HERMES_WORKTREE_REPO_ROOT": str(repo_root),
+            "HERMES_WORKTREE_PATH": str(workspace.resolve(strict=True)),
+        }
+    )
+    try:
+        completed = subprocess.run(
+            list(raw_command),
+            cwd=workspace,
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"worktree setup timed out after {timeout_seconds}s for task {task.id}"
+        ) from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        detail = re.sub(r"(://[^:/\s]+:)[^@\s]+@", r"\1***@", detail)
+        if len(detail) > 2000:
+            detail = detail[-2000:]
+        raise RuntimeError(
+            f"worktree setup failed for task {task.id} with exit "
+            f"code {completed.returncode}"
+            + (f": {detail}" if detail else "")
+        )
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -9979,6 +10076,7 @@ def dispatch_once(
     worktree_shared_path_source_overrides: Optional[
         dict[str, dict[str, str]]
     ] = None,
+    worktree_setup_commands: Optional[dict[str, dict[str, Any]]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -10018,6 +10116,7 @@ def dispatch_once(
             worktree_shared_path_source_overrides=(
                 worktree_shared_path_source_overrides
             ),
+            worktree_setup_commands=worktree_setup_commands,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -10039,6 +10138,7 @@ def dispatch_once(
             worktree_shared_path_source_overrides=(
                 worktree_shared_path_source_overrides
             ),
+            worktree_setup_commands=worktree_setup_commands,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -10064,6 +10164,7 @@ def _dispatch_once_locked(
     worktree_shared_path_source_overrides: Optional[
         dict[str, dict[str, str]]
     ] = None,
+    worktree_setup_commands: Optional[dict[str, dict[str, Any]]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -10315,6 +10416,12 @@ def _dispatch_once_locked(
                     worktree_shared_path_overlays,
                     worktree_shared_path_source_overrides,
                 )
+                _run_worktree_setup_command(
+                    claimed,
+                    workspace,
+                    worktree_setup_commands,
+                    dispatch_stage="execution",
+                )
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -10407,6 +10514,18 @@ def _dispatch_once_locked(
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                _prepare_worktree_shared_paths(
+                    workspace,
+                    worktree_shared_paths,
+                    worktree_shared_path_overlays,
+                    worktree_shared_path_source_overrides,
+                )
+                _run_worktree_setup_command(
+                    claimed,
+                    workspace,
+                    worktree_setup_commands,
+                    dispatch_stage="review",
+                )
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:

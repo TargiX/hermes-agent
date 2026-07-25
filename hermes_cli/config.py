@@ -2972,6 +2972,15 @@ DEFAULT_CONFIG = {
         # checkout while retaining the same destination inside each worktree.
         # Example: {"/repo": {"node_modules": "/runtime/deps/node_modules"}}.
         "worktree_shared_path_source_overrides": {},
+        # Optional repo-scoped command executed after a linked worktree and
+        # shared paths are ready, but before its worker starts. This is the
+        # deterministic place for project-owned environment bootstrap (for
+        # example an isolated database and local auth fixtures). Keys are
+        # absolute primary-checkout paths. Each value is a mapping with a
+        # non-empty argv-style ``command`` list and optional
+        # ``timeout_seconds`` (default 900). The command runs on every spawn;
+        # project adapters should make it idempotent with their own receipt.
+        "worktree_setup_commands": {},
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or

@@ -52,6 +52,12 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
             "worktree_shared_path_source_overrides": {
                 "/repo": {"node_modules": "/dependency-host/node_modules"}
             },
+            "worktree_setup_commands": {
+                "/repo": {
+                    "command": ["python3", "/runtime/bootstrap.py"],
+                    "timeout_seconds": 120,
+                }
+            },
         }
     }
     monkeypatch.setattr(
@@ -84,6 +90,12 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     }
     assert captured.get("worktree_shared_path_source_overrides") == {
         "/repo": {"node_modules": "/dependency-host/node_modules"}
+    }
+    assert captured.get("worktree_setup_commands") == {
+        "/repo": {
+            "command": ["python3", "/runtime/bootstrap.py"],
+            "timeout_seconds": 120,
+        }
     }
 
 

@@ -2534,6 +2534,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             if isinstance(raw_worktree_shared_path_source_overrides, dict)
             else {}
         )
+        raw_worktree_setup_commands = _kanban_cfg.get(
+            "worktree_setup_commands", {}
+        )
+        worktree_setup_commands = (
+            dict(raw_worktree_setup_commands)
+            if isinstance(raw_worktree_setup_commands, dict)
+            else {}
+        )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
@@ -2547,6 +2555,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         worktree_shared_paths = []
         worktree_shared_path_overlays = {}
         worktree_shared_path_source_overrides = {}
+        worktree_setup_commands = {}
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
@@ -2563,6 +2572,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             worktree_shared_path_source_overrides=(
                 worktree_shared_path_source_overrides
             ),
+            worktree_setup_commands=worktree_setup_commands,
         )
     if getattr(args, "json", False):
         print(json.dumps({

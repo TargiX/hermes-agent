@@ -3223,6 +3223,124 @@ def test_dispatch_worktree_uses_repo_scoped_shared_path_source_override(
     }
 
 
+def test_dispatch_worktree_runs_repo_setup_before_worker_spawn(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    setup_script = tmp_path / "setup.py"
+    setup_script.write_text(
+        """
+import json
+import os
+from pathlib import Path
+
+Path("environment-receipt.json").write_text(
+    json.dumps(
+        {
+            "task_id": os.environ["HERMES_WORKTREE_TASK_ID"],
+            "task_class": os.environ["HERMES_WORKTREE_TASK_CLASS"],
+            "dispatch_stage": os.environ["HERMES_WORKTREE_DISPATCH_STAGE"],
+            "repo_root": os.environ["HERMES_WORKTREE_REPO_ROOT"],
+            "workspace": os.environ["HERMES_WORKTREE_PATH"],
+        },
+        sort_keys=True,
+    ),
+    encoding="utf-8",
+)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    kb.create_board("worktree-setup-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    observed: dict[str, object] = {}
+
+    def fake_spawn(task, workspace, board=None):
+        receipt = Path(workspace) / "environment-receipt.json"
+        observed.update(json.loads(receipt.read_text(encoding="utf-8")))
+        return None
+
+    with kb.connect(board="worktree-setup-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            body="task_class: implementation",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="worktree-setup-board",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            board="worktree-setup-board",
+            worktree_setup_commands={
+                str(repo.resolve()): {
+                    "command": [sys.executable, str(setup_script)],
+                    "timeout_seconds": 30,
+                }
+            },
+        )
+
+    expected = repo / ".worktrees" / tid
+    assert result.spawned == [(tid, "sentinel", str(expected))]
+    assert observed == {
+        "task_id": tid,
+        "task_class": "implementation",
+        "dispatch_stage": "execution",
+        "repo_root": str(repo.resolve()),
+        "workspace": str(expected.resolve()),
+    }
+
+
+def test_dispatch_worktree_setup_failure_blocks_before_worker_spawn(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    setup_script = tmp_path / "setup-fails.py"
+    setup_script.write_text("raise SystemExit(9)\n", encoding="utf-8")
+    kb.create_board("worktree-setup-failure-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    spawned: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return None
+
+    with kb.connect(board="worktree-setup-failure-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            body="task_class: implementation",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="worktree-setup-failure-board",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            board="worktree-setup-failure-board",
+            failure_limit=1,
+            worktree_setup_commands={
+                str(repo.resolve()): {
+                    "command": [sys.executable, str(setup_script)],
+                    "timeout_seconds": 30,
+                }
+            },
+        )
+        task = kb.get_task(conn, tid)
+
+    assert spawned == []
+    assert result.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+    assert "worktree setup failed" in (task.last_failure_error or "")
+
+
 def test_set_task_skills_repairs_blocked_worker_without_replacing_card(
     kanban_home,
 ):

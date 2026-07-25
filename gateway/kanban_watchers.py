@@ -1087,6 +1087,18 @@ class GatewayKanbanWatchersMixin:
                 raw_worktree_shared_path_source_overrides,
             )
             worktree_shared_path_source_overrides = {}
+        raw_worktree_setup_commands = kanban_cfg.get(
+            "worktree_setup_commands", {}
+        )
+        if isinstance(raw_worktree_setup_commands, dict):
+            worktree_setup_commands = dict(raw_worktree_setup_commands)
+        else:
+            logger.warning(
+                "kanban dispatcher: invalid "
+                "kanban.worktree_setup_commands=%r; ignoring",
+                raw_worktree_setup_commands,
+            )
+            worktree_setup_commands = {}
 
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
@@ -1186,6 +1198,7 @@ class GatewayKanbanWatchersMixin:
                     worktree_shared_path_source_overrides=(
                         worktree_shared_path_source_overrides
                     ),
+                    worktree_setup_commands=worktree_setup_commands,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
