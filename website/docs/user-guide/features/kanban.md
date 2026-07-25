@@ -305,7 +305,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. | `title`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. | `parent_id`, `child_id` |
-| `kanban_unblock` | (Orchestrators) move a blocked task to `ready` when all parents are done, or `todo` while any parent remains open. | `task_id` |
+| `kanban_unblock` | (Orchestrators) move blocked work to `ready` when all parents are done, or `todo` while any parent remains open. A deliberately re-authorized same-card continuation may recover `done` with `force=true` and an audit reason. | `task_id` |
 
 A typical worker turn looks like:
 

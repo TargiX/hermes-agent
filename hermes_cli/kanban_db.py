@@ -6892,15 +6892,18 @@ def promote_task(
     evidence_task_id: Optional[str] = None,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    """Manually promote a recoverable task to `ready`.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
     entry. Refuses to promote if any parent dep is not in a terminal
-    state (`done`/`archived`) unless ``force=True``. Does NOT change
-    assignee or claim state. Returns ``(True, None)`` on success and
-    ``(False, reason)`` if refused. ``dry_run=True`` validates the
-    promotion would succeed without mutating state.
+    state (`done`/`archived`) unless ``force=True``. A terminal ``done``
+    task may be re-queued only with both ``force=True`` and a non-empty
+    reason; this is the audited same-card recovery path after authority
+    changes without accepted mutation. Does NOT change assignee. Returns
+    ``(True, None)`` on success and ``(False, reason)`` if refused.
+    ``dry_run=True`` validates the promotion would succeed without
+    mutating state.
     """
     row = conn.execute(
         "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -6916,10 +6919,16 @@ def promote_task(
             return False, "triage recovery requires a non-empty audit reason"
         if not str(evidence_task_id or "").strip():
             return False, "triage recovery requires evidence_task_id"
+    elif cur_status == "done":
+        if not force:
+            return False, "done-task recovery requires force=True"
+        if not str(reason or "").strip():
+            return False, "done-task recovery requires a non-empty audit reason"
     elif cur_status not in ("todo", "blocked"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo'/'blocked', or 'triage' with force and evidence"
+            f"'todo'/'blocked', 'done' with force and reason, or 'triage' "
+            f"with force and evidence"
         )
 
     if not force:
@@ -6957,8 +6966,17 @@ def promote_task(
             )
         else:
             upd = conn.execute(
-                "UPDATE tasks SET status = 'ready' "
-                "WHERE id = ? AND status IN ('todo', 'blocked')",
+                """
+                UPDATE tasks
+                   SET status = 'ready',
+                       current_run_id = NULL,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL,
+                       consecutive_failures = 0,
+                       last_failure_error = NULL
+                 WHERE id = ? AND status IN ('todo', 'blocked', 'done')
+                """,
                 (task_id,),
             )
         if upd.rowcount != 1:
@@ -6975,6 +6993,34 @@ def promote_task(
                 "evidence_task_id": evidence_task_id,
             },
         )
+        if cur_status == "done":
+            # Reopening a completed parent invalidates ready children whose
+            # dependency gate was satisfied by that terminal state. Mirror
+            # the dashboard's direct done->ready transition so every surface
+            # preserves the same dependency invariant.
+            child_rows = conn.execute(
+                "SELECT child_id FROM task_links "
+                "WHERE parent_id = ? ORDER BY child_id",
+                (task_id,),
+            ).fetchall()
+            for child in child_rows:
+                child_id = child["child_id"]
+                demoted = conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
+                if demoted.rowcount == 1:
+                    _append_event(
+                        conn,
+                        child_id,
+                        "status",
+                        {
+                            "status": "todo",
+                            "reason": "parent_reopened",
+                            "parent": task_id,
+                        },
+                    )
 
     return True, None
 
@@ -9996,7 +10042,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'promoted_manual', "
+            "'unblocked', 'reclaimed') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()

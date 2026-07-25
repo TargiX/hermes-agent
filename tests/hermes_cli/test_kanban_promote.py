@@ -208,6 +208,38 @@ def test_promote_blocked_task_works(conn):
     assert kb.get_task(conn, tid).status == "ready"
 
 
+def test_promote_done_recovery_requires_force_reason_and_respawns(conn):
+    tid = kb.create_task(conn, title="resume preserved artifact", assignee="worker")
+    assert kb.claim_task(conn, tid) is not None
+    assert kb.complete_task(conn, tid, summary="stopped on moved authority")
+
+    ok, err = kb.promote_task(conn, tid, actor="lead")
+    assert ok is False and "force=True" in str(err)
+    ok, err = kb.promote_task(conn, tid, actor="lead", force=True)
+    assert ok is False and "audit reason" in str(err)
+
+    ok, err = kb.promote_task(
+        conn,
+        tid,
+        actor="lead",
+        force=True,
+        reason="fresh disjoint authority revalidated",
+    )
+
+    assert ok and err is None
+    assert kb.get_task(conn, tid).status == "ready"
+    assert kb.check_respawn_guard(conn, tid) is None
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? "
+        "AND kind='promoted_manual' ORDER BY id DESC LIMIT 1",
+        (tid,),
+    ).fetchone()
+    payload = json.loads(event["payload"])
+    assert payload["from_status"] == "done"
+    assert payload["forced"] is True
+    assert payload["reason"] == "fresh disjoint authority revalidated"
+
+
 # ---------------------------------------------------------------------------
 # CLI `_cmd_promote` — bulk via `--ids` (the issue's anti-respawn use case:
 # promote all children of a closed parent in one command).

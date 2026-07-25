@@ -602,6 +602,7 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `block <id> "<reason>"` | Mark task blocked for human input. Also appends the reason as a comment. |
 | `schedule <id> "<reason>"` | Park time-delay/follow-up work in `scheduled` so it is not shown as a human blocker. |
 | `unblock <id>` | Return a blocked or scheduled task to ready (or `todo` if dependencies are still open). |
+| `promote <id> [reason]` | Deliberately move `todo`/`blocked` work to `ready`. `--force` bypasses open parents; `done` recovery additionally requires `--force` and a non-empty audit reason. Triage recovery also requires `--evidence-task-id`. |
 | `archive <id>` | Hide from default list. `gc` will remove scratch workspaces. |
 | `tail <id>` | Follow a task's event stream. |
 | `dispatch` | One dispatcher pass on the active board. Flags: `--dry-run`, `--max N`, `--failure-limit N`, `--json`. |

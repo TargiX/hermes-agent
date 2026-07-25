@@ -1680,7 +1680,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
 
 def _handle_unblock(args: dict, **kw) -> str:
-    """Transition blocked work to ready/todo, or recover triage with proof."""
+    """Recover blocked, triage, or explicitly re-authorized done work."""
     delegated_err = _reject_delegated_child_mutation("kanban_unblock")
     if delegated_err:
         return delegated_err
@@ -1700,6 +1700,31 @@ def _handle_unblock(args: dict, **kw) -> str:
             task = kb.get_task(conn, str(tid))
             if task is None:
                 return tool_error(f"could not unblock {tid} (unknown task)")
+            if task.status == "done":
+                force, bool_error = _parse_bool_arg(args, "force")
+                if bool_error:
+                    return tool_error(bool_error)
+                reason = str(args.get("reason") or "").strip()
+                if not force or not reason:
+                    return tool_error(
+                        "done-task recovery requires force=true and a "
+                        "non-empty audit reason"
+                    )
+                reason = redact_sensitive_text(reason, force=True)
+                ok, err = kb.promote_task(
+                    conn,
+                    str(tid),
+                    actor=os.environ.get("HERMES_PROFILE") or "orchestrator",
+                    reason=reason,
+                    force=True,
+                )
+                if not ok:
+                    return tool_error(f"could not recover done task {tid}: {err}")
+                return _ok(
+                    task_id=str(tid),
+                    status="ready",
+                    recovered_from="done",
+                )
             if task.status == "triage":
                 force = bool(args.get("force", False))
                 reason = str(args.get("reason") or "").strip()
@@ -2792,6 +2817,9 @@ KANBAN_UNBLOCK_SCHEMA = {
         "are done, or todo while any parent remains open. A triage task can "
         "return to ready only with force=true, an audit reason, and a done "
         "approved evidence task whose receipt explicitly authorizes the target. "
+        "A done task can return to ready only with force=true and a non-empty "
+        "audit reason after an orchestrator has re-authorized that exact "
+        "same-card continuation. "
         "Orchestrator-only — only "
         "profiles with the kanban toolset can unblock routed work; "
         "dispatcher-spawned task workers never see this tool."
@@ -2806,15 +2834,17 @@ KANBAN_UNBLOCK_SCHEMA = {
             "force": {
                 "type": "boolean",
                 "description": (
-                    "Required and true only for audited triage recovery. "
-                    "Ignored for ordinary blocked/scheduled tasks."
+                    "Required and true for audited triage recovery or an "
+                    "explicitly re-authorized done-task continuation. Ignored "
+                    "for ordinary blocked/scheduled tasks."
                 ),
             },
             "reason": {
                 "type": "string",
                 "description": (
-                    "Required audit reason for triage recovery. Name the "
-                    "resolved blocker and why the evidence changes it."
+                    "Required audit reason for triage or done-task recovery. "
+                    "Name the resolved blocker/authority change and why the "
+                    "same card may execute again."
                 ),
             },
             "evidence_task_id": {

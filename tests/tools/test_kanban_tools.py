@@ -2282,6 +2282,56 @@ def test_unblock_rejects_non_blocked_task(monkeypatch, worker_env):
     assert json.loads(out).get("error")
 
 
+def test_unblock_force_recovers_done_task_with_audit_reason(
+    monkeypatch, worker_env,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "phosphenelead")
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="preserved implementation", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.complete_task(conn, tid, summary="moved PR head collision")
+    finally:
+        conn.close()
+
+    rejected = json.loads(
+        kt._handle_unblock({"task_id": tid, "force": True})
+    )
+    assert "reason" in rejected["error"]
+
+    recovered = json.loads(
+        kt._handle_unblock(
+            {
+                "task_id": tid,
+                "force": True,
+                "reason": "collision run 12 revalidated against current manifests",
+            }
+        )
+    )
+
+    assert recovered == {
+        "ok": True,
+        "task_id": tid,
+        "status": "ready",
+        "recovered_from": "done",
+    }
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "ready"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='promoted_manual' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert json.loads(event["payload"])["reason"].startswith("collision run 12")
+    finally:
+        conn.close()
+
+
 def test_worker_lifecycle_through_tools(worker_env):
     """Drive the full claim -> heartbeat -> comment -> complete lifecycle
     exclusively through the tools, then verify the DB state matches what
