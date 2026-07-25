@@ -2647,6 +2647,28 @@ def test_dir_workspace_honors_given_path(kanban_home, tmp_path):
     assert ws.exists()
 
 
+def test_missing_dir_workspace_cannot_masquerade_as_linked_worktree(
+    kanban_home, tmp_path
+):
+    target = tmp_path / "repo" / ".worktrees" / "t_source"
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="inspect another task",
+            workspace_kind="dir",
+            workspace_path=str(target),
+        )
+        task = kb.get_task(conn, t)
+        assert task is not None
+        with pytest.raises(
+            RuntimeError,
+            match=r"workspace_kind=dir at missing linked-worktree path",
+        ):
+            kb.resolve_workspace(task)
+
+    assert not target.exists()
+
+
 def test_worktree_workspace_repo_root_anchor_materializes_linked_worktree(kanban_home, tmp_path):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
@@ -3659,6 +3681,53 @@ def test_worktree_shared_path_overlay_migrates_matching_legacy_link_and_reuses_i
     assert (destination / "nuxt").resolve(strict=True) == (
         shared_dependencies / "nuxt"
     ).resolve(strict=True)
+
+
+def test_worktree_shared_path_overlay_quarantines_unmanaged_legacy_root(
+    kanban_home,
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    shared_dependencies = repo / "node_modules"
+    (shared_dependencies / ".cache").mkdir(parents=True)
+    (shared_dependencies / "next").mkdir()
+    workspace = repo / ".worktrees" / "legacy-local-install"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "-b",
+            "wt/legacy-local-install",
+            str(workspace),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    destination = workspace / "node_modules"
+    (destination / "legacy-package").mkdir(parents=True)
+    (destination / ".package-lock.json").write_text(
+        '{"lockfileVersion": 3}\n',
+        encoding="utf-8",
+    )
+
+    kb._prepare_worktree_shared_paths(
+        workspace,
+        ["node_modules"],
+        {"node_modules": [".cache"]},
+    )
+
+    assert (destination / ".hermes-worktree-overlay.json").is_file()
+    assert (destination / "next").is_symlink()
+    assert not (destination / "legacy-package").exists()
+    recovery_root = kanban_home / "runtime" / "worktree-overlay-recovery"
+    recovered = list(recovery_root.rglob(".package-lock.json"))
+    assert len(recovered) == 1
+    assert recovered[0].read_text(encoding="utf-8") == '{"lockfileVersion": 3}\n'
 
 
 def test_worktree_shared_path_overlay_quarantines_materialized_source_child(

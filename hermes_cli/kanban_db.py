@@ -8057,13 +8057,15 @@ def _prepare_worktree_shared_paths(
     For ordinary non-bare repositories that directory is ``<repo>/.git``;
     its parent is therefore the only trusted source root. Missing sources are
     a no-op so one global opt-in can span heterogeneous repositories. Existing
-    unmanaged destinations fail closed and are never replaced, except that a
-    legacy symlink pointing at the exact configured source may be migrated to a
-    declared shallow overlay before the worker starts. Inside an already
-    marker-verified overlay, a source-owned child that a package manager
-    materialized as a local file or directory is quarantined outside the
-    repository and its canonical symlink is restored before spawn. A
-    repository setup hook may deliberately materialize the complete path and
+    symlink or non-directory destinations fail closed. A legacy symlink
+    pointing at the exact configured source may be migrated to a declared
+    shallow overlay before the worker starts. An unmarked legacy directory is
+    quarantined whole before Hermes creates a fresh managed root; its bytes are
+    preserved but never trusted. Inside an already marker-verified overlay, a
+    source-owned child that a package manager materialized as a local file or
+    directory is likewise quarantined outside the repository and its canonical
+    symlink is restored before spawn. A repository setup hook may deliberately
+    materialize the complete path and
     advance the marker to version 2 with ``mode: isolated``. An exact v2 marker
     preserves that hook-owned runtime across retries; mismatched markers still
     fail closed. An overlay entry owned by neither Hermes nor the shared source
@@ -8184,43 +8186,51 @@ def _prepare_worktree_shared_paths(
         }
         marker = root / marker_name
         if root.exists():
-            if root.is_symlink() or not root.is_dir() or not marker.is_file():
+            if root.is_symlink() or not root.is_dir():
                 raise RuntimeError(
                     f"worktree shared path overlay destination is not managed: {root}"
                 )
-            try:
-                actual_marker = json.loads(marker.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    f"invalid worktree shared path overlay marker: {marker}"
-                ) from exc
-            if actual_marker == expected_isolated_marker:
-                return
-            if actual_marker != expected_marker:
-                can_migrate_source = (
-                    isinstance(actual_marker, dict)
-                    and actual_marker.get("version") == 1
-                    and actual_marker.get("local_children")
-                    == list(local_children)
-                    and isinstance(actual_marker.get("source"), str)
-                )
-                if not can_migrate_source:
-                    raise RuntimeError(
-                        f"worktree shared path overlay marker mismatch: {marker}"
-                    )
-                for existing in root.iterdir():
-                    if existing.name in set(local_children) | {marker_name}:
-                        continue
-                    if not existing.is_symlink():
-                        raise RuntimeError(
-                            "worktree shared path source migration found an "
-                            f"unmanaged entry: {existing}"
-                        )
-                    existing.unlink()
+            if not marker.is_file():
+                _quarantine_materialized_overlay_entry(root, relative_text)
+                root.mkdir(parents=True)
                 marker.write_text(
                     json.dumps(expected_marker, sort_keys=True) + "\n",
                     encoding="utf-8",
                 )
+            else:
+                try:
+                    actual_marker = json.loads(marker.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(
+                        f"invalid worktree shared path overlay marker: {marker}"
+                    ) from exc
+                if actual_marker == expected_isolated_marker:
+                    return
+                if actual_marker != expected_marker:
+                    can_migrate_source = (
+                        isinstance(actual_marker, dict)
+                        and actual_marker.get("version") == 1
+                        and actual_marker.get("local_children")
+                        == list(local_children)
+                        and isinstance(actual_marker.get("source"), str)
+                    )
+                    if not can_migrate_source:
+                        raise RuntimeError(
+                            f"worktree shared path overlay marker mismatch: {marker}"
+                        )
+                    for existing in root.iterdir():
+                        if existing.name in set(local_children) | {marker_name}:
+                            continue
+                        if not existing.is_symlink():
+                            raise RuntimeError(
+                                "worktree shared path source migration found an "
+                                f"unmanaged entry: {existing}"
+                            )
+                        existing.unlink()
+                    marker.write_text(
+                        json.dumps(expected_marker, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
         else:
             root.mkdir(parents=True)
             marker.write_text(
@@ -8508,6 +8518,13 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"task {task.id} has non-absolute workspace_path "
                 f"{task.workspace_path!r}; use an absolute path "
                 f"(relative paths are ambiguous against the dispatcher's CWD)"
+            )
+        if not p.exists() and p.parent.name == ".worktrees":
+            raise RuntimeError(
+                f"task {task.id} points workspace_kind=dir at missing "
+                f"linked-worktree path {p}; refusing to recreate it as an "
+                "empty directory. Recreate the source worktree from its branch "
+                "or give this task its own workspace_kind=worktree checkout."
             )
         p.mkdir(parents=True, exist_ok=True)
         return p
