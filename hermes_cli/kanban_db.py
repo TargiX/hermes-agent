@@ -7862,7 +7862,11 @@ def _prepare_worktree_shared_paths(
     declared shallow overlay before the worker starts. Inside an already
     marker-verified overlay, a source-owned child that a package manager
     materialized as a local file or directory is quarantined outside the
-    repository and its canonical symlink is restored before spawn.
+    repository and its canonical symlink is restored before spawn. A
+    repository setup hook may deliberately materialize the complete path and
+    advance the marker to version 2 with ``mode: isolated``. An exact v2 marker
+    preserves that hook-owned runtime across retries; mismatched markers still
+    fail closed.
     """
     if not shared_paths:
         return
@@ -7971,6 +7975,11 @@ def _prepare_worktree_shared_paths(
             "source": str(source.resolve(strict=True)),
             "local_children": list(local_children),
         }
+        expected_isolated_marker = {
+            **expected_marker,
+            "version": 2,
+            "mode": "isolated",
+        }
         marker = root / marker_name
         if root.exists():
             if root.is_symlink() or not root.is_dir() or not marker.is_file():
@@ -7983,6 +7992,8 @@ def _prepare_worktree_shared_paths(
                 raise RuntimeError(
                     f"invalid worktree shared path overlay marker: {marker}"
                 ) from exc
+            if actual_marker == expected_isolated_marker:
+                return
             if actual_marker != expected_marker:
                 can_migrate_source = (
                     isinstance(actual_marker, dict)

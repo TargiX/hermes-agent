@@ -3633,6 +3633,64 @@ def test_worktree_shared_path_overlay_quarantines_materialized_source_child(
     assert recovered[0].read_text(encoding="utf-8") == "local\n"
 
 
+def test_worktree_shared_path_overlay_preserves_hook_owned_isolated_runtime(
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    shared_dependencies = repo / "node_modules"
+    (shared_dependencies / ".cache").mkdir(parents=True)
+    (shared_dependencies / "nuxt").mkdir()
+    workspace = repo / ".worktrees" / "isolated"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "-b",
+            "wt/isolated",
+            str(workspace),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    kb._prepare_worktree_shared_paths(
+        workspace,
+        ["node_modules"],
+        {"node_modules": [".cache"]},
+    )
+    destination = workspace / "node_modules"
+    local_nuxt = destination / "nuxt"
+    local_nuxt.unlink()
+    local_nuxt.mkdir()
+    (local_nuxt / "isolated.txt").write_text("local\n", encoding="utf-8")
+    marker = destination / ".hermes-worktree-overlay.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "mode": "isolated",
+                "source": str(shared_dependencies.resolve()),
+                "local_children": [".cache"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    kb._prepare_worktree_shared_paths(
+        workspace,
+        ["node_modules"],
+        {"node_modules": [".cache"]},
+    )
+
+    assert not local_nuxt.is_symlink()
+    assert (local_nuxt / "isolated.txt").read_text(encoding="utf-8") == "local\n"
+
+
 @pytest.mark.parametrize("unsafe_child", ["", ".", "../cache", "/tmp/cache", "a/b"])
 def test_dispatch_worktree_rejects_unsafe_shared_path_overlay_child(
     kanban_home, tmp_path, monkeypatch, unsafe_child
