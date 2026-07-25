@@ -198,6 +198,21 @@ def test_on_session_end_ingests_clean_messages(provider):
     assert provider._session_turns == []
 
 
+def test_on_session_end_respects_disabled_auto_capture(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"auto_capture": False}, str(tmp_path))
+    provider = SupermemoryMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), platform="cli")
+
+    provider.on_session_end([
+        {"role": "user", "content": "private session content"},
+        {"role": "assistant", "content": "must not be captured"},
+    ])
+
+    assert provider._client.ingest_calls == []
+
+
 def test_merge_metadata_stamps_sm_source():
     # sm_source routes Hermes writes into the "Hermes" Space in the Supermemory
     # app (functional routing, not telemetry) — must always be present.
@@ -439,6 +454,38 @@ def test_client_passes_custom_base_url_to_sdk(monkeypatch):
 
     assert client._base_url == "http://localhost:6767"
     assert captured["base_url"] == "http://localhost:6767"
+
+
+def test_client_maps_local_document_chunks_into_memory_text():
+    """The local server returns document search text as ``chunk``."""
+    from types import SimpleNamespace
+
+    from plugins.memory.supermemory import _SupermemoryClient
+
+    client = _SupermemoryClient.__new__(_SupermemoryClient)
+    client._container_tag = "shared_agency_working"
+    client._search_mode = "hybrid"
+    client._client = SimpleNamespace(
+        search=SimpleNamespace(
+            memories=lambda **kwargs: SimpleNamespace(
+                results=[
+                    SimpleNamespace(
+                        id="chunk-result",
+                        chunk="Canonical product direction from the local document index.",
+                        similarity=0.9,
+                        metadata={"canonical": True},
+                        updated_at=None,
+                    )
+                ]
+            )
+        )
+    )
+
+    result = client.search_memories("product direction")
+
+    assert result[0]["memory"] == (
+        "Canonical product direction from the local document index."
+    )
 
 
 @pytest.mark.parametrize(
