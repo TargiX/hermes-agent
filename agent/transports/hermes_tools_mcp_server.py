@@ -145,11 +145,13 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_recover_triage",
     "kanban_show",
     "kanban_list",
-    # NOTE: kanban_create / kanban_unblock / kanban_reassign / kanban_link are orchestrator-
-    # only — the kanban tool gates them on HERMES_KANBAN_TASK being unset.
+    # NOTE: kanban_create / kanban_archive / kanban_unblock / kanban_reassign /
+    # kanban_link are orchestrator-only — the kanban tool gates them on
+    # HERMES_KANBAN_TASK being unset.
     # They're exposed here for orchestrator agents running on the codex
     # runtime that need to dispatch new tasks.
     "kanban_create",
+    "kanban_archive",
     "kanban_unblock",
     "kanban_reassign",
     "kanban_link",

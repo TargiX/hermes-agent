@@ -153,11 +153,12 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
     kanban = {n for n in names if n and n.startswith("kanban_")}
     assert {
         "kanban_list",
+        "kanban_archive",
         "kanban_unblock",
         "kanban_reassign",
     }.isdisjoint(kanban), (
         f"Board-routing tools leaked into worker schema: "
-        f"{kanban & {'kanban_list', 'kanban_unblock', 'kanban_reassign'}}"
+        f"{kanban & {'kanban_list', 'kanban_archive', 'kanban_unblock', 'kanban_reassign'}}"
     )
 
 
@@ -181,7 +182,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
-        "kanban_unblock", "kanban_reassign",
+        "kanban_archive", "kanban_unblock", "kanban_reassign",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -2574,6 +2575,71 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
         assert kb.get_task(conn, other).status == "blocked"
     finally:
         conn.close()
+
+
+def test_orchestrator_archive_records_reason_and_hides_terminal_task(
+    monkeypatch, tmp_path
+):
+    """An orchestrator can archive a named non-running task with an audit reason."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-lead")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="already merged", assignee="publisher")
+        kb.block_task(conn, task_id, reason="external merge", kind="review_required")
+    finally:
+        conn.close()
+
+    result = json.loads(
+        kt._handle_archive(
+            {
+                "task_id": task_id,
+                "reason": "Exact published head is already merged.",
+            }
+        )
+    )
+
+    assert result == {
+        "ok": True,
+        "task_id": task_id,
+        "status": "archived",
+        "already_archived": False,
+    }
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, task_id).status == "archived"
+        comments = kb.list_comments(conn, task_id)
+        assert comments[-1].author == "test-lead"
+        assert comments[-1].body == (
+            "KANBAN_ARCHIVE_V1: Exact published head is already merged."
+        )
+    finally:
+        conn.close()
+
+
+def test_worker_cannot_archive_even_its_own_task(worker_env):
+    """Archive is an orchestrator lifecycle tool, never a worker closeout alias."""
+    from tools import kanban_tools as kt
+
+    result = json.loads(
+        kt._handle_archive(
+            {
+                "task_id": worker_env,
+                "reason": "worker tried to hide its own run",
+            }
+        )
+    )
+
+    assert "orchestrator-only" in result["error"]
 
 
 def test_recovery_worker_can_archive_only_linked_triage(monkeypatch, tmp_path):

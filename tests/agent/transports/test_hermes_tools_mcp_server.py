@@ -211,6 +211,7 @@ class TestModuleSurface:
             "kanban_create",
             "kanban_show",
             "kanban_list",
+            "kanban_archive",
             "kanban_unblock",
             "kanban_reassign",
             "kanban_link",

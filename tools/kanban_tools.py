@@ -1785,6 +1785,72 @@ def _handle_unblock(args: dict, **kw) -> str:
         return tool_error(f"kanban_unblock: {e}")
 
 
+def _handle_archive(args: dict, **kw) -> str:
+    """Archive one named terminal/superseded task with an audit reason.
+
+    Archiving removes historical work from ordinary active-board views without
+    deleting its task, runs, comments, relations, or receipts. It is kept
+    orchestrator-only because workers must close their own run with
+    ``kanban_complete`` or ``kanban_block``. A running task is deliberately
+    rejected: the orchestrator must first reconcile/reclaim live ownership
+    instead of silently terminating a worker.
+    """
+    delegated_err = _reject_delegated_child_mutation("kanban_archive")
+    if delegated_err:
+        return delegated_err
+    guard = _require_orchestrator_tool("kanban_archive")
+    if guard:
+        return guard
+    tid = str(args.get("task_id") or "").strip()
+    if not tid:
+        return tool_error("task_id is required")
+    reason = str(args.get("reason") or "").strip()
+    if not reason:
+        return tool_error("reason is required")
+    reason = redact_sensitive_text(reason, force=True)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"could not archive {tid} (unknown task)")
+            if task.status == "archived":
+                return _ok(
+                    task_id=tid,
+                    status="archived",
+                    already_archived=True,
+                )
+            if task.status == "running":
+                return tool_error(
+                    f"cannot archive running task {tid}; reconcile or reclaim "
+                    "its active worker first"
+                )
+            actor = os.environ.get("HERMES_PROFILE") or "orchestrator"
+            kb.add_comment(
+                conn,
+                tid,
+                author=actor,
+                body=f"KANBAN_ARCHIVE_V1: {reason}",
+            )
+            if not kb.archive_task(conn, tid):
+                return tool_error(
+                    f"could not archive {tid} (task changed concurrently)"
+                )
+            return _ok(
+                task_id=tid,
+                status="archived",
+                already_archived=False,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_archive: {e}")
+    except Exception as e:
+        logger.exception("kanban_archive failed")
+        return tool_error(f"kanban_archive: {e}")
+
+
 def _handle_recover_triage(args: dict, **kw) -> str:
     """Apply one audited disposition to the incident linked to this worker.
 
@@ -2758,6 +2824,36 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_ARCHIVE_SCHEMA = {
+    "name": "kanban_archive",
+    "description": (
+        "Archive one exact non-running Kanban task after its work is proven "
+        "terminal, historical, falsified, or superseded. Archiving hides it "
+        "from ordinary active-board views but preserves its full task, run, "
+        "comment, relation, and receipt history. Requires a concrete audit "
+        "reason. Orchestrator-only; workers must use kanban_complete or "
+        "kanban_block for their own run."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Exact non-running task id to archive.",
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Concrete terminal or supersession evidence recorded as "
+                    "KANBAN_ARCHIVE_V1 before the task is archived."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "reason"],
+    },
+}
+
 KANBAN_RECOVER_TRIAGE_SCHEMA = {
     "name": "kanban_recover_triage",
     "description": (
@@ -2961,6 +3057,15 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_create_mode,
     emoji="➕",
+)
+
+registry.register(
+    name="kanban_archive",
+    toolset="kanban",
+    schema=KANBAN_ARCHIVE_SCHEMA,
+    handler=_handle_archive,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🗄",
 )
 
 registry.register(
