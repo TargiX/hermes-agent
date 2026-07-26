@@ -240,6 +240,35 @@ def test_promote_done_recovery_requires_force_reason_and_respawns(conn):
     assert payload["reason"] == "fresh disjoint authority revalidated"
 
 
+def test_promote_archived_recovery_requires_force_reason(conn):
+    tid = kb.create_task(conn, title="incorrectly archived artifact", assignee="worker")
+    assert kb.archive_task(conn, tid)
+
+    ok, err = kb.promote_task(conn, tid, actor="lead")
+    assert ok is False and "force=True" in str(err)
+    ok, err = kb.promote_task(conn, tid, actor="lead", force=True)
+    assert ok is False and "audit reason" in str(err)
+
+    ok, err = kb.promote_task(
+        conn,
+        tid,
+        actor="lead",
+        force=True,
+        reason="false lifecycle reconciliation reversed",
+    )
+
+    assert ok and err is None
+    assert kb.get_task(conn, tid).status == "ready"
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? "
+        "AND kind='promoted_manual' ORDER BY id DESC LIMIT 1",
+        (tid,),
+    ).fetchone()
+    payload = json.loads(event["payload"])
+    assert payload["from_status"] == "archived"
+    assert payload["forced"] is True
+
+
 # ---------------------------------------------------------------------------
 # CLI `_cmd_promote` — bulk via `--ids` (the issue's anti-respawn use case:
 # promote all children of a closed parent in one command).

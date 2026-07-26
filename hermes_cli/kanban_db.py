@@ -7050,7 +7050,8 @@ def promote_task(
     reason; this is the audited same-card recovery path after authority
     changes without accepted mutation. Does NOT change assignee. Returns
     ``(True, None)`` on success and ``(False, reason)`` if refused.
-    ``dry_run=True`` validates the promotion would succeed without
+    An archived task follows the same audited force+reason recovery contract as
+    a done task. ``dry_run=True`` validates the promotion would succeed without
     mutating state.
     """
     row = conn.execute(
@@ -7067,15 +7068,17 @@ def promote_task(
             return False, "triage recovery requires a non-empty audit reason"
         if not str(evidence_task_id or "").strip():
             return False, "triage recovery requires evidence_task_id"
-    elif cur_status == "done":
+    elif cur_status in ("done", "archived"):
         if not force:
-            return False, "done-task recovery requires force=True"
+            return False, f"{cur_status}-task recovery requires force=True"
         if not str(reason or "").strip():
-            return False, "done-task recovery requires a non-empty audit reason"
+            return False, (
+                f"{cur_status}-task recovery requires a non-empty audit reason"
+            )
     elif cur_status not in ("todo", "blocked"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo'/'blocked', 'done' with force and reason, or 'triage' "
+            f"'todo'/'blocked', terminal recovery with force and reason, or 'triage' "
             f"with force and evidence"
         )
 
@@ -7123,7 +7126,7 @@ def promote_task(
                        worker_pid = NULL,
                        consecutive_failures = 0,
                        last_failure_error = NULL
-                 WHERE id = ? AND status IN ('todo', 'blocked', 'done')
+                 WHERE id = ? AND status IN ('todo', 'blocked', 'done', 'archived')
                 """,
                 (task_id,),
             )
@@ -7141,7 +7144,7 @@ def promote_task(
                 "evidence_task_id": evidence_task_id,
             },
         )
-        if cur_status == "done":
+        if cur_status in ("done", "archived"):
             # Reopening a completed parent invalidates ready children whose
             # dependency gate was satisfied by that terminal state. Mirror
             # the dashboard's direct done->ready transition so every surface
