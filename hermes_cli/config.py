@@ -2953,6 +2953,11 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Optional independent concurrency pools keyed by operator-defined
+        # role names. Each value contains ``profiles`` and
+        # ``max_in_progress``. A saturated worker pool must not consume the
+        # slots reserved for leads, reviewers, ideators, or control profiles.
+        "capacity_pools": {},
         # Explicit repo-root paths to expose inside dispatcher-created linked
         # worktrees before the worker starts. Each entry must be a safe
         # relative path (for example ``node_modules``). The dispatcher creates

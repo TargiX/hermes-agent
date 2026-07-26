@@ -8775,6 +8775,14 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_capacity_pool_capped: list[tuple[str, str, str, int, int]] = field(
+        default_factory=list
+    )
+    """Tasks deferred by an independent role pool.
+
+    Entries are ``(task_id, assignee, pool, current, limit)``. Saturating one
+    pool never consumes another pool's reserved concurrency.
+    """
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -10591,6 +10599,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    capacity_pools: Optional[dict[str, Any]] = None,
     worktree_shared_paths: Optional[list[str]] = None,
     worktree_shared_path_overlays: Optional[dict[str, list[str]]] = None,
     worktree_shared_path_source_overrides: Optional[
@@ -10633,6 +10642,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            capacity_pools=capacity_pools,
             worktree_shared_paths=worktree_shared_paths,
             worktree_shared_path_overlays=worktree_shared_path_overlays,
             worktree_shared_path_source_overrides=(
@@ -10657,6 +10667,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            capacity_pools=capacity_pools,
             worktree_shared_paths=worktree_shared_paths,
             worktree_shared_path_overlays=worktree_shared_path_overlays,
             worktree_shared_path_source_overrides=(
@@ -10685,6 +10696,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    capacity_pools: Optional[dict[str, Any]] = None,
     worktree_shared_paths: Optional[list[str]] = None,
     worktree_shared_path_overlays: Optional[dict[str, list[str]]] = None,
     worktree_shared_path_source_overrides: Optional[
@@ -10812,6 +10824,46 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+
+    # Independent role pools. Invalid entries are ignored rather than making
+    # the whole dispatcher unavailable; duplicate profile membership is also
+    # ignored because an ambiguous reservation cannot be enforced truthfully.
+    _pool_by_profile: dict[str, str] = {}
+    _pool_limits: dict[str, int] = {}
+    _ambiguous_profiles: set[str] = set()
+    for pool_name, raw_pool in (capacity_pools or {}).items():
+        if not isinstance(pool_name, str) or not isinstance(raw_pool, dict):
+            continue
+        try:
+            pool_limit = int(raw_pool.get("max_in_progress"))
+        except (TypeError, ValueError):
+            continue
+        profiles = raw_pool.get("profiles")
+        if pool_limit < 1 or not isinstance(profiles, list):
+            continue
+        normalized_profiles = {
+            str(profile).strip() for profile in profiles if str(profile).strip()
+        }
+        if not normalized_profiles:
+            continue
+        _pool_limits[pool_name] = pool_limit
+        for profile in normalized_profiles:
+            if profile in _pool_by_profile:
+                _ambiguous_profiles.add(profile)
+            else:
+                _pool_by_profile[profile] = pool_name
+    for profile in _ambiguous_profiles:
+        _pool_by_profile.pop(profile, None)
+    _pool_running = {pool_name: 0 for pool_name in _pool_limits}
+    if _pool_limits:
+        for prow in conn.execute(
+            "SELECT assignee, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "GROUP BY assignee"
+        ):
+            pool_name = _pool_by_profile.get(str(prow["assignee"]))
+            if pool_name is not None:
+                _pool_running[pool_name] += int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -10911,6 +10963,21 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        pool_name = _pool_by_profile.get(str(row_assignee))
+        if pool_name is not None:
+            current_pool = _pool_running[pool_name]
+            pool_limit = _pool_limits[pool_name]
+            if current_pool >= pool_limit:
+                result.skipped_capacity_pool_capped.append(
+                    (
+                        row["id"],
+                        row_assignee,
+                        pool_name,
+                        current_pool,
+                        pool_limit,
+                    )
+                )
+                continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -10930,6 +10997,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -10938,6 +11006,8 @@ def _dispatch_once_locked(
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
+            if pool_name is not None:
+                _pool_running[pool_name] += 1
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -11005,6 +11075,8 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+            if pool_name is not None:
+                _pool_running[pool_name] += 1
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -11040,8 +11112,38 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        review_assignee = str(row["assignee"])
+        if _per_profile_cap is not None:
+            current = _per_profile_running.get(review_assignee, 0)
+            if current >= _per_profile_cap:
+                result.skipped_per_profile_capped.append(
+                    (row["id"], review_assignee, current)
+                )
+                continue
+        review_pool_name = _pool_by_profile.get(review_assignee)
+        if review_pool_name is not None:
+            current_pool = _pool_running[review_pool_name]
+            pool_limit = _pool_limits[review_pool_name]
+            if current_pool >= pool_limit:
+                result.skipped_capacity_pool_capped.append(
+                    (
+                        row["id"],
+                        review_assignee,
+                        review_pool_name,
+                        current_pool,
+                        pool_limit,
+                    )
+                )
+                continue
         if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
+            result.spawned.append((row["id"], review_assignee, ""))
+            spawned += 1
+            if _per_profile_cap is not None:
+                _per_profile_running[review_assignee] = (
+                    _per_profile_running.get(review_assignee, 0) + 1
+                )
+            if review_pool_name is not None:
+                _pool_running[review_pool_name] += 1
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -11098,6 +11200,12 @@ def _dispatch_once_locked(
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            if _per_profile_cap is not None and claimed.assignee:
+                _per_profile_running[claimed.assignee] = (
+                    _per_profile_running.get(claimed.assignee, 0) + 1
+                )
+            if review_pool_name is not None:
+                _pool_running[review_pool_name] += 1
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),

@@ -2512,6 +2512,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = _coerce_positive_int(
             _kanban_cfg.get("max_in_progress_per_profile")
         )
+        raw_capacity_pools = _kanban_cfg.get("capacity_pools", {})
+        capacity_pools = (
+            dict(raw_capacity_pools)
+            if isinstance(raw_capacity_pools, dict)
+            else {}
+        )
         raw_worktree_shared_paths = _kanban_cfg.get("worktree_shared_paths", [])
         worktree_shared_paths = (
             list(raw_worktree_shared_paths)
@@ -2558,6 +2564,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
+        capacity_pools = {}
         worktree_shared_paths = []
         worktree_shared_path_overlays = {}
         worktree_shared_path_source_overrides = {}
@@ -2575,6 +2582,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            capacity_pools=capacity_pools,
             worktree_shared_paths=worktree_shared_paths,
             worktree_shared_path_overlays=worktree_shared_path_overlays,
             worktree_shared_path_source_overrides=(
@@ -2602,6 +2610,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
+            ],
+            "skipped_capacity_pool_capped": [
+                {
+                    "task_id": tid,
+                    "assignee": who,
+                    "pool": pool,
+                    "current": current,
+                    "limit": limit,
+                }
+                for (tid, who, pool, current, limit)
+                in res.skipped_capacity_pool_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
@@ -2638,6 +2657,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         for tid, who, current in res.skipped_per_profile_capped:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
+            )
+    if res.skipped_capacity_pool_capped:
+        for tid, who, pool, current, limit in res.skipped_capacity_pool_capped:
+            print(
+                f"Deferred ({pool} pool full, {current}/{limit}; {who}): {tid}"
             )
     if res.skipped_nonspawnable:
         print(

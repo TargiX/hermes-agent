@@ -1075,6 +1075,23 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        raw_capacity_pools = kanban_cfg.get("capacity_pools", {})
+        capacity_pools = (
+            dict(raw_capacity_pools)
+            if isinstance(raw_capacity_pools, dict)
+            else {}
+        )
+        if raw_capacity_pools and not capacity_pools:
+            logger.warning(
+                "kanban dispatcher: invalid kanban.capacity_pools=%r; ignoring",
+                raw_capacity_pools,
+            )
+        elif capacity_pools:
+            logger.info(
+                "kanban dispatcher: independent capacity pools=%s",
+                sorted(capacity_pools),
+            )
+
         raw_worktree_shared_paths = kanban_cfg.get("worktree_shared_paths", [])
         if isinstance(raw_worktree_shared_paths, list):
             worktree_shared_paths = list(raw_worktree_shared_paths)
@@ -1218,6 +1235,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    capacity_pools=capacity_pools,
                     worktree_shared_paths=worktree_shared_paths,
                     worktree_shared_path_overlays=worktree_shared_path_overlays,
                     worktree_shared_path_source_overrides=(
