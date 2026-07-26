@@ -2281,6 +2281,18 @@
     triage: "needs re-triage",
   };
 
+  function shelfWaitLabel(task) {
+    return task.floor_wait_label || SHELF_WAIT[task.status] || task.status;
+  }
+
+  function shelfKind(task) {
+    const lifecycleKinds = {
+      review: { key: "review", label: "Review" },
+      publication: { key: "publish", label: "Publish" },
+    };
+    return lifecycleKinds[task.floor_lifecycle_stage] || laneKind(task.body);
+  }
+
   function TaskShelf(props) {
     const tasks = Array.isArray(props.tasks) ? props.tasks : [];
     if (tasks.length === 0) return null;
@@ -2290,7 +2302,7 @@
         `Полка задач · ${tasks.length} ${tasks.length === 1 ? "ждёт" : "ждут"}`),
       h("div", { className: "hermes-shelf-rack" },
         shown.map(function (task) {
-          const kind = laneKind(task.body);
+          const kind = shelfKind(task);
           return h("div", {
             key: task.id,
             className: cn("hermes-shelf-card", `hermes-lane--${kind.key}`,
@@ -2305,7 +2317,7 @@
             h("span", { className: "hermes-shelf-title" }, task.title || "Без названия"),
             h("span", { className: "hermes-shelf-wait" },
               task.assignee ? `@${task.assignee} · ` : "",
-              SHELF_WAIT[task.status] || task.status),
+              shelfWaitLabel(task)),
           );
         }),
       ),
@@ -2457,7 +2469,7 @@
     });
 
     const shelf = (scene.shelfTasks || []).slice(0, 12).map(function (task) {
-      const kind = laneKind(task.body);
+      const kind = shelfKind(task);
       return {
         id: task.id,
         kind: kind.key,
@@ -2465,8 +2477,8 @@
         intent: task.intent || "",
         title: task.title || "Без названия",
         wait: task.assignee
-          ? `@${task.assignee} · ${SHELF_WAIT[task.status] || task.status}`
-          : (SHELF_WAIT[task.status] || task.status),
+          ? `@${task.assignee} · ${shelfWaitLabel(task)}`
+          : shelfWaitLabel(task),
         // The bench needs the same words the card carries, or a task docked
         // at a bench renders as "no title" — which is what shipped.
       };
@@ -3389,6 +3401,41 @@
     }, 0);
 
     const docks = [];
+    const shelfTasks = allTasks.filter(function (task) {
+      return task.status === "ready"
+        || task.status === "todo"
+        || task.status === "triage";
+    });
+    const shelfTaskIds = new Set(shelfTasks.map(function (task) {
+      return task.id;
+    }));
+    for (const object of factoryObjects) {
+      const lifecycle = object.lifecycle || {};
+      const task = object.task || null;
+      if (
+        lifecycle.visibility !== "waiting"
+        || !task
+        || !task.id
+        || shelfTaskIds.has(task.id)
+      ) {
+        continue;
+      }
+      // A handoff is still the same physical work object. Keep it on the
+      // shelf while no worker owns it instead of making it disappear between
+      // implementation, review, and correction runs.
+      shelfTasks.push(Object.assign({}, task, {
+        floor_wait_label: lifecycle.label || "Waiting for next stage",
+        floor_lifecycle_stage: lifecycle.stage || "",
+      }));
+      shelfTaskIds.add(task.id);
+    }
+    shelfTasks.sort(function (a, b) {
+      const rank = { ready: 1, todo: 2, triage: 3 };
+      const rankA = a.floor_wait_label ? 0 : (rank[a.status] || 9);
+      const rankB = b.floor_wait_label ? 0 : (rank[b.status] || 9);
+      if (rankA !== rankB) return rankA - rankB;
+      return (b.priority || 0) - (a.priority || 0);
+    });
 
     return {
       roster,
@@ -3418,18 +3465,7 @@
       // shelf too, but they are not waiting for a worker — they are waiting
       // for the Lead, and the shelf says so rather than implying a agent will
       // wander over and take one.
-      shelfTasks: allTasks
-        .filter(function (task) {
-          return task.status === "ready"
-            || task.status === "todo"
-            || task.status === "triage";
-        })
-        .sort(function (a, b) {
-          const rank = { ready: 0, todo: 1, triage: 2 };
-          const byStatus = (rank[a.status] || 9) - (rank[b.status] || 9);
-          if (byStatus !== 0) return byStatus;
-          return (b.priority || 0) - (a.priority || 0);
-        }),
+      shelfTasks,
       factoryObjects,
       factoryWindowSeconds: Number(factoryFlow.window_seconds || 0),
       factoryOutcomeGraceSeconds: Number(
