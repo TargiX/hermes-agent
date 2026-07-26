@@ -447,6 +447,51 @@ def test_review_complete_cannot_bypass_declared_receipt_through_db(
         )
 
 
+def test_publication_complete_requires_exact_pr_identity_through_db(
+    kanban_home: Path,
+) -> None:
+    """A published receipt must be joinable back to its implementation and PR."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (
+                    "task_class: publication\n"
+                    "required_receipt: phosphene-publication/v1\n"
+                    "implementation_task_id: t_impl1234\n",
+                    tid,
+                ),
+            )
+
+        with pytest.raises(ValueError, match="declared publication receipt"):
+            kb.complete_task(
+                conn,
+                tid,
+                result="published",
+                metadata={
+                    "handoff_version": "phosphene-publication/v1",
+                    "publication_outcome": "published_pending_founder_review",
+                    "implementation_task_id": "t_impl1234",
+                },
+            )
+
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.complete_task(
+            conn,
+            tid,
+            result="published",
+            metadata={
+                "handoff_version": "phosphene-publication/v1",
+                "publication_outcome": "published_pending_founder_review",
+                "implementation_task_id": "t_impl1234",
+                "repo": "TargiX/nuxt-flux",
+                "pr_number": 987,
+                "pr_url": "https://github.com/TargiX/nuxt-flux/pull/987",
+            },
+        )
+
+
 def test_recovery_review_separates_reviewed_implementation_from_authorized_target(
     kanban_home: Path,
 ) -> None:

@@ -5775,6 +5775,74 @@ def validate_declared_handoff(
             return "declared review receipt is incomplete: " + "; ".join(issues)
 
     if (
+        task_class == "publication"
+        and receipt.endswith("-publication/v1")
+        and action == "complete"
+    ):
+        issues = []
+        if payload.get("handoff_version") != receipt:
+            issues.append(f"metadata.handoff_version must equal {receipt!r}")
+        publication_outcome = payload.get("publication_outcome")
+        if publication_outcome not in {
+            "published_pending_founder_review",
+            "reconciled_existing_pr",
+            "externally_merged",
+        }:
+            issues.append(
+                "metadata.publication_outcome must identify a completed "
+                "publication"
+            )
+        declared_implementation = _declared_contract_value(
+            body, "implementation_task_id"
+        )
+        implementation_task_id = payload.get("implementation_task_id")
+        if not isinstance(implementation_task_id, str) or not implementation_task_id:
+            issues.append("metadata.implementation_task_id is required")
+        elif (
+            declared_implementation
+            and implementation_task_id != declared_implementation
+        ):
+            issues.append(
+                "metadata.implementation_task_id must equal declared "
+                f"implementation {declared_implementation!r}"
+            )
+        repo = payload.get("repo")
+        if not isinstance(repo, str) or not re.fullmatch(
+            r"[^/\s]+/[^/\s]+", repo
+        ):
+            issues.append("metadata.repo must be an exact owner/repository")
+        pr_number = payload.get("pr_number")
+        if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
+            issues.append("metadata.pr_number must be a positive integer")
+        pr_url = payload.get("pr_url")
+        pr_match = (
+            re.fullmatch(
+                r"https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)",
+                pr_url,
+                re.IGNORECASE,
+            )
+            if isinstance(pr_url, str)
+            else None
+        )
+        if pr_match is None:
+            issues.append("metadata.pr_url must be an exact GitHub pull-request URL")
+        elif (
+            isinstance(repo, str)
+            and pr_match.group(1).casefold() != repo.casefold()
+        ):
+            issues.append("metadata.pr_url repository must equal metadata.repo")
+        elif (
+            isinstance(pr_number, int)
+            and not isinstance(pr_number, bool)
+            and int(pr_match.group(2)) != pr_number
+        ):
+            issues.append("metadata.pr_url number must equal metadata.pr_number")
+        if issues:
+            return "declared publication receipt is incomplete: " + "; ".join(
+                issues
+            )
+
+    if (
         receipt.endswith("-implementation/v1")
         and action == "block"
         and block_kind == "review_required"
