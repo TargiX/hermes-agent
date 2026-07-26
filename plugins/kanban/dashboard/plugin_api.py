@@ -440,6 +440,30 @@ def _latest_running_activity_notes(
         note = " ".join(str(payload.get("note") or "").split())
         if note:
             notes[task_id] = note[:240]
+
+    # Heartbeat prose is rare — roughly one beat in ten carries a note, and the
+    # first minute of a run carries none at all, which is why the bubble read
+    # empty on a worker that was plainly busy. A worker's own comment is the
+    # same kind of evidence, already written, and there are an order of
+    # magnitude more of them. Used only where no heartbeat note exists, so the
+    # explicit progress receipt still wins.
+    missing = conn.execute(
+        """
+        SELECT c.task_id, c.body
+          FROM task_comments c
+          JOIN tasks t ON t.id = c.task_id
+         WHERE t.status = 'running'
+           AND c.author NOT IN ('founder', 'system')
+         ORDER BY c.id DESC
+        """
+    ).fetchall()
+    for row in missing:
+        task_id = str(row["task_id"])
+        if task_id in notes:
+            continue
+        body = " ".join(str(row["body"] or "").split())
+        if body:
+            notes[task_id] = body[:240]
     return notes
 
 
@@ -449,6 +473,326 @@ def _positive_epoch(raw: Any) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
+
+
+# Where the pipeline actually stopped, in the reader's words rather than the
+# board's enum. This queue is read by someone who wants to know which of his
+# own decisions is holding the factory.
+_FOUNDER_STAGE_LABELS = (
+    (
+        re.compile(
+            r"^publication$|^pr_metadata_repair$|^review_thread_metadata_closeout$"
+        ),
+        "Waiting to publish",
+    ),
+    (re.compile(r"review"), "Waiting on review"),
+    (re.compile(r"^implementation$|^correction$|^integration$"), "Built, not shipped"),
+    (re.compile(r"evidence|^reproduction$"), "Waiting on proof"),
+    (re.compile(r"^capability"), "Missing a capability"),
+)
+
+_FOUNDER_PR_URL = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
+_FOUNDER_PR_NUMBER = re.compile(r"(?:^|\s)PR #(\d+)\b")
+# A card body declares its own subject PR. Reading that first matters: a reason
+# often mentions a second PR it is collision-free with, and taking the first
+# number in the text pointed the founder at the wrong pull request.
+_FOUNDER_PR_DECLARED = re.compile(
+    r"(?mi)^\s*-?\s*(?:existing_pr|pr_url)\s*:\s*(\S+)\s*$"
+)
+_FOUNDER_PR_DECLARED_NUMBER = re.compile(r"(?mi)^\s*-?\s*pr_number\s*:\s*(\d+)\s*$")
+_FOUNDER_PR_DECLARED_REPO = re.compile(r"(?mi)^\s*-?\s*repo\s*:\s*([\w.-]+/[\w.-]+)\s*$")
+
+# The sentence a founder needs is the one naming the decision. Workers write it
+# last, after the evidence that earned it, so the tail of the reason carries the
+# actionable half.
+_FOUNDER_DECISION_HINT = re.compile(
+    r"\b(needs? to|must|should|awaiting|requires?|pending|manually)\b",
+    re.IGNORECASE,
+)
+
+
+def _founder_stage(task_class: str, title: str, reason: str) -> str:
+    # What the worker said it is waiting for beats any class the card declares,
+    # because most of the older cards carry no class at all and the reason is
+    # the only place the stop is described.
+    if re.search(r"\bmerge\b", reason, re.IGNORECASE):
+        return "Ready to merge"
+    if re.search(r"\breview\b", reason, re.IGNORECASE):
+        return "Waiting on review"
+    for pattern, label in _FOUNDER_STAGE_LABELS:
+        if task_class and pattern.search(task_class):
+            return label
+    if re.search(r"publish|publication", title, re.IGNORECASE):
+        return "Waiting to publish"
+    return "Waiting on a decision"
+
+
+def _founder_pull_request(body: str, reason: str) -> Optional[dict[str, Any]]:
+    """Resolve the pull request this card is actually about.
+
+    Order matters. The card's declared subject wins over any number found in
+    prose, because a reason routinely names a second PR it is collision-free
+    with, and taking the first match sent the founder to the wrong review.
+    """
+    declared = _FOUNDER_PR_DECLARED.search(body)
+    if declared:
+        url_match = _FOUNDER_PR_URL.search(declared.group(1))
+        if url_match:
+            return {
+                "number": int(url_match.group(2)),
+                "url": url_match.group(0),
+                "repo": url_match.group(1),
+            }
+    declared_number = _FOUNDER_PR_DECLARED_NUMBER.search(body)
+    if declared_number:
+        repo_match = _FOUNDER_PR_DECLARED_REPO.search(body)
+        repo = repo_match.group(1) if repo_match else None
+        return {
+            "number": int(declared_number.group(1)),
+            "url": (
+                f"https://github.com/{repo}/pull/{declared_number.group(1)}"
+                if repo
+                else None
+            ),
+            "repo": repo,
+        }
+    # Nothing declared: the reason is closer to the decision than the body is.
+    for text in (reason, body):
+        url_match = _FOUNDER_PR_URL.search(text)
+        if url_match:
+            return {
+                "number": int(url_match.group(2)),
+                "url": url_match.group(0),
+                "repo": url_match.group(1),
+            }
+        number_match = _FOUNDER_PR_NUMBER.search(text)
+        if number_match:
+            # A bare "PR #931" names no repository, so the queue shows the
+            # number without inventing a link to a possibly wrong project.
+            return {"number": int(number_match.group(1)), "url": None, "repo": None}
+    return None
+
+
+def _founder_question(reason: str) -> str:
+    """Return the one sentence that states the pending decision."""
+    sentences = [
+        part.strip() for part in re.split(r"(?<=[.;])\s+", reason) if part.strip()
+    ]
+    if not sentences:
+        return ""
+    for sentence in reversed(sentences):
+        if _FOUNDER_DECISION_HINT.search(sentence):
+            return sentence[:220]
+    return sentences[-1][:220]
+
+
+# Why a card exists, as opposed to which stage it is in.
+#
+# A reader watching the floor wants to know whether the factory is placing a
+# product bet or shoring up what already exists — and no field on the board
+# says so. `bet_kind` appears on six cards out of eleven hundred, so it cannot
+# carry this. Lineage can: an implementation born from a product idea gate is a
+# bet no matter what its own class says, and 66 of 141 implementations have
+# exactly that parent.
+_INTENT_BET_CLASSES = frozenset({
+    "product_ideation",
+    "product_idea_critique",
+    "product_idea_revision",
+    "product_idea_gate",
+    "work_candidate",
+    "product_opportunity_research",
+})
+_INTENT_HARDENING_CLASSES = frozenset({
+    "reproduction",
+    "correction",
+    "correction_evidence",
+    "control_plane_recovery",
+    "control_plane_correction",
+    "control_plane_configuration",
+    "agency_control_plane_fix",
+    "pr_metadata_repair",
+    "pr_readiness_retraction",
+    "review_thread_metadata_closeout",
+    "capability",
+    "capability_scout",
+    "capability-scout",
+    "learning_promotion",
+})
+# Relations whose source is the parent of the target. Walking these upward is
+# what lets a review card inherit the intent of the work it reviews.
+_INTENT_LINEAGE_RELATIONS = (
+    "implements",
+    "reviews",
+    "publishes",
+    "challenges",
+    "promotes",
+    "revises",
+)
+_TASK_CLASS_RE = re.compile(r"(?mi)^\s*-?\s*task_class\s*:\s*([a-z0-9_-]+)\s*$")
+
+
+def _declared_task_class(body: str) -> str:
+    match = _TASK_CLASS_RE.search(body or "")
+    return match.group(1).lower() if match else ""
+
+
+def _task_intents(conn: sqlite3.Connection) -> dict[str, str]:
+    """Label each card a product bet, hardening, or neither.
+
+    Neither is a real answer. A card whose class says nothing and whose lineage
+    reaches no labelled ancestor stays unlabelled rather than being guessed
+    into a bucket — a wrong badge here is worse than no badge, because the
+    whole point is to be trusted at a glance.
+    """
+    classes: dict[str, str] = {}
+    for row in conn.execute("SELECT id, body FROM tasks"):
+        classes[str(row["id"])] = _declared_task_class(str(row["body"] or ""))
+
+    parents: dict[str, str] = {}
+    placeholders = ",".join("?" for _ in _INTENT_LINEAGE_RELATIONS)
+    for row in conn.execute(
+        f"""
+        SELECT source_task_id, target_task_id
+          FROM task_relations
+         WHERE relation IN ({placeholders})
+        """,
+        list(_INTENT_LINEAGE_RELATIONS),
+    ):
+        target = str(row["target_task_id"] or "")
+        # First parent wins; a card reached by two lineages keeps the older.
+        if target and target not in parents:
+            parents[target] = str(row["source_task_id"] or "")
+
+    def direct(task_id: str) -> str:
+        task_class = classes.get(task_id, "")
+        if task_class in _INTENT_BET_CLASSES:
+            return "bet"
+        if task_class in _INTENT_HARDENING_CLASSES:
+            return "hardening"
+        return ""
+
+    intents: dict[str, str] = {}
+    for task_id in classes:
+        seen: set[str] = set()
+        cursor = task_id
+        intent = ""
+        # Bounded by `seen`, so a relation cycle cannot hang the board.
+        while cursor and cursor not in seen:
+            seen.add(cursor)
+            intent = direct(cursor)
+            if intent:
+                break
+            cursor = parents.get(cursor, "")
+        intents[task_id] = intent
+    return intents
+
+
+def _pull_request_states() -> dict[str, dict[str, Any]]:
+    """Read what GitHub last said about each card's pull request.
+
+    Written by the PR reconciler, not fetched here: a board render must not
+    make three dozen network calls. It is keyed by task because resolving a
+    bare "PR #31" to a repository needs the card's lane, and the reconciler
+    already did that and verified the answer against GitHub. Absent or stale,
+    the queue simply shows no state — it must never guess, because guessing is
+    how it presented sixteen already-merged pull requests as decisions the
+    founder still owed.
+    """
+    path = Path.home() / ".hermes" / "runtime" / "pr-state.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    entries = payload.get("by_task")
+    if not isinstance(entries, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in entries.items()
+        if isinstance(value, dict)
+    }
+
+
+def _founder_decision_queue(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+) -> list[dict[str, Any]]:
+    """Return every card whose next move belongs to the founder.
+
+    These cards are invisible on the floor — they hold no worker and occupy no
+    station — yet they are the queue that decides whether the factory ships.
+    Each entry carries the sentence the worker wrote when it stopped, so the
+    whole queue can be triaged without opening a single card body.
+    """
+    rows = conn.execute(
+        """
+        SELECT t.id, t.title, t.body, t.assignee, t.created_at,
+               (SELECT e.payload FROM task_events e
+                 WHERE e.task_id = t.id AND e.kind = 'blocked'
+                 ORDER BY e.id DESC LIMIT 1) AS block_payload
+          FROM tasks t
+         WHERE t.status = 'blocked' AND t.block_kind = 'needs_input'
+        """
+    ).fetchall()
+
+    pr_states = _pull_request_states()
+    queue: list[dict[str, Any]] = []
+    for row in rows:
+        body = str(row["body"] or "")
+        reason = " ".join(
+            str(_json_object(row["block_payload"]).get("reason") or "").split()
+        )
+        # "review-required: " is a routing prefix, not part of the sentence.
+        reason = re.sub(r"^[a-z-]+:\s*", "", reason)
+        declared = re.search(
+            r"(?mi)^\s*-?\s*task_class\s*:\s*([a-z0-9_-]+)\s*$", body
+        )
+        task_class = declared.group(1).lower() if declared else ""
+        created = _positive_epoch(row["created_at"])
+        pull_request = _founder_pull_request(body, reason)
+        # A card whose pull request is already merged or closed is not a
+        # decision the founder owes; it is a card nobody told about a decision
+        # he already made. Saying so is the difference between a queue and a
+        # graveyard presented as a queue.
+        observed = pr_states.get(str(row["id"])) or {}
+        pr_state = str(observed.get("state") or "").upper()
+        if pr_state == "UNKNOWN":
+            pr_state = ""
+        settled = pr_state in {"MERGED", "CLOSED"}
+        # The reconciler resolved the repository this card's number belongs to;
+        # prefer its verified reference over the one read from prose here.
+        if observed.get("url") and (not pull_request or not pull_request.get("url")):
+            pull_request = {
+                "number": observed.get("number"),
+                "url": observed.get("url"),
+                "repo": observed.get("repo"),
+            }
+        queue.append(
+            {
+                "task_id": str(row["id"]),
+                "title": str(row["title"] or ""),
+                "assignee": str(row["assignee"] or ""),
+                "pr_state": pr_state,
+                "settled": settled,
+                "stage": (
+                    "Already merged" if pr_state == "MERGED"
+                    else "PR closed" if pr_state == "CLOSED"
+                    else _founder_stage(task_class, str(row["title"] or ""), reason)
+                ),
+                "task_class": task_class,
+                "question": _founder_question(reason),
+                "context": reason[:400],
+                "pull_request": pull_request,
+                "waiting_seconds": (now - created) if created else None,
+            }
+        )
+    # Live decisions first, then settled corpses; within each, oldest first,
+    # because the queue is a debt and should be met in the order incurred.
+    queue.sort(
+        key=lambda item: (item["settled"], -(item["waiting_seconds"] or 0))
+    )
+    return queue
 
 
 def _running_activity_pulse(
@@ -1020,6 +1364,22 @@ def _conn(board: Optional[str] = None):
 BOARD_COLUMNS: list[str] = [
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
 ]
+
+
+def _board_column(status: str, block_kind: str | None) -> str:
+    """Column a card renders in, which is not always its stored status.
+
+    A finished slice waiting for its reviewer is stored as ``blocked`` with
+    ``block_kind = review_required``, because the DB's real ``review`` status
+    auto-dispatches a reviewer onto the same card while this factory reviews
+    through separate child cards. That storage detail made the board show a
+    wall of red: on 2026-07-26, 69 of 94 "blocked" cards were healthy
+    handoffs. Render them in Review; leave their status untouched so the
+    lifecycle machinery keeps working on the real state.
+    """
+    if status == "blocked" and (block_kind or "") == "review_required":
+        return "review"
+    return status
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
@@ -1906,6 +2266,7 @@ def get_board(
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
         activity_notes = _latest_running_activity_notes(conn)
         activity_pulse = _running_activity_pulse(conn)
+        intents = _task_intents(conn)
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -1915,6 +2276,7 @@ def get_board(
             d = _task_dict(t, latest_summary=preview)
             d["live_activity_note"] = activity_notes.get(t.id)
             d["live_activity_pulse"] = activity_pulse.get(t.id)
+            d["intent"] = intents.get(t.id) or ""
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -1925,7 +2287,8 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "todo"
+            col = _board_column(t.status, t.block_kind)
+            col = col if col in columns else "todo"
             columns[col].append(d)
 
         # Stable per-column ordering already applied by list_tasks
@@ -1976,6 +2339,7 @@ def get_board(
             },
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
+            "founder_queue": _founder_decision_queue(conn, now=int(time.time())),
         }
     finally:
         conn.close()
@@ -2025,7 +2389,8 @@ def get_agency_overview():
                 item["live_activity_pulse"] = activity_pulse.get(task.id)
                 item["board_slug"] = slug
                 item["board_name"] = name
-                column = task.status if task.status in columns else "todo"
+                column = _board_column(task.status, task.block_kind)
+                column = column if column in columns else "todo"
                 columns[column].append(item)
 
             def task_key(task_id: str) -> str:

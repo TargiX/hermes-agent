@@ -97,6 +97,7 @@
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
+    review: "Review",
     done: "Done",
     archived: "Archived",
   };
@@ -106,6 +107,7 @@
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
+    review: "Finished work waiting on its independent reviewer — a handoff, not a failure",
     done: "Completed",
     archived: "Archived",
   };
@@ -1622,6 +1624,1120 @@
     return { rows, openTasks };
   }
 
+  // -------------------------------------------------------------------------
+  // Task lanes — the floor as places an agent stands, not a diagram of stages.
+  //
+  // The canvas conveyor answers "what stage is this in". The question a person
+  // glancing at the screen actually asks is "who is doing what right now, and
+  // is anyone stuck". These lanes answer that, in DOM rather than on canvas,
+  // for three reasons the canvas cannot meet: text must inherit the board's
+  // reading face and scale, the technical receipt must be collapsible instead
+  // of always shouting, and a plain sentence must be selectable.
+  //
+  // Nothing here invents state. Every phase is read off the task's own event
+  // stream, and every sentence comes from a heartbeat note, a receipt summary,
+  // or a block reason that the worker actually wrote.
+  // -------------------------------------------------------------------------
+
+  const LANE_PHASES = [
+    { key: "intake", label: "Picked up" },
+    { key: "orient", label: "Read the card" },
+    { key: "work", label: "Working" },
+    { key: "receipt", label: "Writing up" },
+    { key: "verdict", label: "Verdict" },
+  ];
+
+  // Colour carries the kind of work, so a glance separates product bets from
+  // housekeeping without reading a word.
+  // Every class the board actually writes, grouped so that two different
+  // kinds of work never share a colour. The first version collapsed
+  // `capability` and everything unlabelled into the same grey, which made a
+  // blocked capability look like an unclassified chore.
+  //
+  // Order matters: the first match wins, so the narrow patterns come before
+  // the broad ones (`correction_evidence` is evidence, not a correction).
+  const LANE_KINDS = [
+    { match: /^product_ideation$|^product_idea_revision$/, key: "idea", label: "Idea" },
+    { match: /^product_idea_critique$/, key: "critique", label: "Critique" },
+    { match: /^product_idea_gate$|work_candidate/, key: "gate", label: "Gate" },
+    { match: /^capability/, key: "capability", label: "Capability" },
+    { match: /evidence|^reproduction$/, key: "evidence", label: "Evidence" },
+    { match: /review/, key: "review", label: "Review" },
+    { match: /^publication$|^pr_metadata_repair$|^pr_readiness_retraction$/, key: "publish", label: "Publish" },
+    { match: /^implementation$|^correction$|^integration$/, key: "build", label: "Build" },
+    { match: /strateg|^market_|scout|opportunity_research/, key: "strategy", label: "Strategy" },
+    { match: /control_plane|learning_promotion/, key: "control", label: "Upkeep" },
+  ];
+
+  // Why the card exists, next to what stage it is in. A reader scanning the
+  // floor wants to separate "we are betting on something new" from "we are
+  // shoring up what exists" — the stage colour cannot carry that, because a
+  // build is a build either way. Unlabelled stays blank: a wrong badge here is
+  // worse than none, since the whole value is being trusted at a glance.
+  const INTENT_BADGES = {
+    bet: { label: "ИДЕЯ", className: "is-bet" },
+    hardening: { label: "УКРЕПЛЕНИЕ", className: "is-hardening" },
+  };
+
+  function intentBadge(intent) {
+    const badge = INTENT_BADGES[String(intent || "")];
+    if (!badge) return null;
+    return h("span", {
+      className: cn("hermes-intent", badge.className),
+    }, badge.label);
+  }
+
+  function laneKind(body) {
+    const declared = /(?:^|\n)\s*-?\s*task_class\s*:\s*([a-z_]+)/i.exec(
+      String(body || ""),
+    );
+    const taskClass = declared ? declared[1].toLowerCase() : "";
+    for (const kind of LANE_KINDS) {
+      if (kind.match.test(taskClass)) return kind;
+    }
+    return { key: "other", label: taskClass ? taskClass.replace(/_/g, " ") : "Работа" };
+  }
+
+  // How far the card actually got, read from what happened to it rather than
+  // from its column. A card can sit in `blocked` having reached the verdict,
+  // and a card can sit in `running` having never produced a heartbeat.
+  function lanePhaseIndex(object) {
+    const events = Array.isArray(object.events) ? object.events : [];
+    const kinds = new Set(events.map(function (event) { return event.kind; }));
+    const lifecycle = object.lifecycle || {};
+    // A live task arrives without an event list; its pulse carries the same
+    // facts. A heartbeat means the worker is past orientation and working.
+    if (!events.length && (object.task || {}).live_activity_pulse) {
+      const pulse = object.task.live_activity_pulse;
+      return Number(pulse.heartbeat_count) > 0 ? 2 : 1;
+    }
+    // A card that reached a verdict is past the last step, not standing on
+    // it. Returning the length rather than the last index leaves `is-now`
+    // empty so a settled lane stops reading as still deciding.
+    if (kinds.has("completed") || kinds.has("blocked") || lifecycle.status === "done") {
+      return LANE_PHASES.length;
+    }
+    if (object.workbench_receipt || object.artifact) return 3;
+    if (kinds.has("heartbeat")) return 2;
+    if (kinds.has("spawned") || kinds.has("run_session_bound")) return 1;
+    return 0;
+  }
+
+  // Workers open a block reason with a SCREAMING_CODE label. That label is
+  // real and stays available under the fold — but as the opening words of a
+  // sentence meant for a person it is noise, so the lane leads with the gloss
+  // and drops the token.
+  //
+  // Glossed codes are only the ones this board actually emits, counted from
+  // its own event history. An unknown code keeps its raw text rather than
+  // being guessed at: a wrong plain sentence is worse than an honest opaque
+  // one.
+  const LANE_CODE_GLOSS = {
+    COLLISION: "чужая работа уже держит эти файлы",
+    COLLISION_GATED: "чужая работа уже держит эти файлы",
+    OPEN_PR_MANIFEST_COLLISION: "открытый пулл-реквест держит эти файлы",
+    CAPABILITY_BLOCK: "не хватает возможности в окружении",
+    CAPABILITY_BLOCKED: "не хватает возможности в окружении",
+    CAPABILITY_GAP: "не хватает возможности в окружении",
+    CAPABILITY_GAP_GLOBAL: "возможности нет нигде во флоте",
+    CAPABILITY_STILL_BLOCKED: "возможность так и не восстановилась",
+    CAPABILITY_UNAVAILABLE: "инструмент недоступен",
+    INSTRUMENTATION_GAP: "нечем измерить результат",
+    INVALID_WORKSPACE_BINDING: "рабочее дерево привязано неверно",
+    INVALID_PARENT_RECEIPT_V1: "у родительской карточки нет годной квитанции",
+    INVALID_EXTERNAL_SIGNAL_IDENTITY: "внешний сигнал не опознан",
+    CONTROL_PLANE_INPUT_SUPERSEDED: "вводные устарели, появились новее",
+    SUPERSEDED_DUPLICATE: "эту работу уже сделали в другой карточке",
+    SUPERSEDED_CHALLENGE_SELECTION: "выбор оспорен и заменён",
+    PROVENANCE_LINEAGE_MISSING_OR_AMBIGUOUS:
+      "не доказать, кто именно это выпустил",
+    ROLLOUT_PROOF_INCOMPLETE_OR_BLOCKED: "выкатку нечем подтвердить",
+    CLOSEOUT_BLOCK: "не удалось закрыть карточку по протоколу",
+  };
+
+  function laneHumanise(text) {
+    const clean = String(text || "").replace(/\s+/g, " ").trim();
+    if (!clean) return { text: "", code: null };
+    const match = /^([A-Z][A-Z0-9_]{5,})\s*[:\-—]?\s*(.*)$/.exec(clean);
+    if (!match) return { text: clean, code: null };
+    const code = match[1];
+    const gloss = LANE_CODE_GLOSS[code];
+    if (!gloss) return { text: clean, code: code };
+    const rest = match[2].trim();
+    return { text: rest ? `${gloss} — ${rest}` : gloss, code: code };
+  }
+
+  function laneFirstSentence(text) {
+    const humanised = laneHumanise(text);
+    const clean = humanised.text;
+    if (!clean) return "";
+    const stop = clean.search(/[.;](\s|$)/);
+    const sentence = stop > 24 ? clean.slice(0, stop) : clean;
+    return sentence.length > 220 ? `${sentence.slice(0, 217)}…` : sentence;
+  }
+
+  // One sentence a person can act on. Preference order is deliberate: what the
+  // worker said most recently beats what the board inferred about it.
+  function laneNarrative(object) {
+    const task = object.task || {};
+    const blocker = object.blocker;
+    const carry = function (raw, source) {
+      return {
+        text: laneFirstSentence(raw),
+        source: source,
+        code: laneHumanise(raw).code,
+      };
+    };
+    if (task.live_activity_note) {
+      return carry(task.live_activity_note, "живая заметка");
+    }
+    if (blocker && (task.result || object.workbench_receipt)) {
+      const raw = task.result || (object.workbench_receipt || {}).summary;
+      const reason = carry(raw, "причина остановки");
+      if (reason.text) return reason;
+    }
+    const receipt = object.workbench_receipt || {};
+    if (receipt.summary) return carry(receipt.summary, "квитанция");
+    if (task.latest_summary) return carry(task.latest_summary, "квитанция");
+    if (task.result) return carry(task.result, "результат");
+    return { text: "", source: "", code: null };
+  }
+
+  function laneClock(seconds) {
+    const total = Math.max(0, Math.round(Number(seconds) || 0));
+    if (total < 90) return `${total}s`;
+    const minutes = Math.round(total / 60);
+    if (minutes < 90) return `${minutes}m`;
+    return `${(minutes / 60).toFixed(1)}h`;
+  }
+
+  // Stuck is a claim, so it needs evidence. Three separate proofs, each one
+  // a fact the board recorded: a live block, a heartbeat that stopped, or a
+  // run past the budget the card itself declared.
+  // An agent is only standing on the floor while a run is actually in flight.
+  // A blocked or finished card has no one at it — the worker exited — and
+  // drawing a token there would claim attention that is not being spent.
+  function laneHasStander(object) {
+    const task = object.task || {};
+    return task.status === "running" || Boolean(task.live_activity_pulse);
+  }
+
+  function laneAttention(object) {
+    const task = object.task || {};
+    const pulse = task.live_activity_pulse || null;
+    if ((object.lifecycle || {}).status === "blocked" || object.blocker) {
+      return { tone: "stuck", label: "stuck" };
+    }
+    // `triage` is the board's dead-letter lane: nothing promotes out of it on
+    // its own, so a card resting there is stalled even though its status is
+    // not `blocked`.
+    if (task.status === "triage") {
+      return { tone: "stuck", label: "needs re-triage" };
+    }
+    if (pulse) {
+      const beat = Number(pulse.heartbeat_age_seconds);
+      if (Number.isFinite(beat) && beat > YARD_STALE_BEAT_SECONDS) {
+        return { tone: "stuck", label: `silent for ${laneClock(beat)}` };
+      }
+      const elapsed = Number(pulse.elapsed_seconds);
+      const budget = Number(pulse.budget_seconds);
+      if (Number.isFinite(elapsed) && Number.isFinite(budget) && budget > 0
+        && elapsed > budget) {
+        return { tone: "stuck", label: "over budget" };
+      }
+      return { tone: "live", label: "alive" };
+    }
+    return null;
+  }
+
+  function FactoryLane(props) {
+    const object = props.object;
+    const task = object.task || {};
+    const kind = laneKind(task.body);
+    const phaseIndex = lanePhaseIndex(object);
+    const narrative = laneNarrative(object);
+    const attention = laneAttention(object);
+    const pulse = task.live_activity_pulse || null;
+    const agentName = String(task.assignee || "").trim();
+
+    const clockParts = [];
+    if (pulse && Number.isFinite(Number(pulse.elapsed_seconds))) {
+      clockParts.push(`идёт ${laneClock(pulse.elapsed_seconds)}`);
+    }
+    if (pulse && Number.isFinite(Number(pulse.budget_seconds))
+      && Number(pulse.budget_seconds) > 0) {
+      clockParts.push(`из ${laneClock(pulse.budget_seconds)}`);
+    }
+
+    const artifact = object.artifact || null;
+    const outcome = artifact && (artifact.outcome || artifact.label);
+
+    return h("article", {
+      className: cn(
+        "hermes-lane",
+        `hermes-lane--${kind.key}`,
+        attention && attention.tone === "stuck" && "is-stuck",
+      ),
+    },
+      h("div", { className: "hermes-lane-head" },
+        h("span", { className: "hermes-lane-kind" }, kind.label),
+        h("span", { className: "hermes-lane-id" }, task.id || ""),
+      ),
+      h("h4", { className: "hermes-lane-title" }, task.title || "Без названия"),
+
+      h("div", { className: "hermes-lane-track", "aria-label": "Шаги задачи" },
+        LANE_PHASES.map(function (phase, index) {
+          const done = index < phaseIndex;
+          const now = index === phaseIndex;
+          return h("div", {
+            key: phase.key,
+            className: cn(
+              "hermes-lane-step",
+              done && "is-done",
+              now && "is-now",
+            ),
+          },
+            now && agentName && laneHasStander(object)
+              ? h("span", { className: "hermes-lane-stander" },
+                  h("span", {
+                    className: cn(
+                      "hermes-lane-mark",
+                      attention && attention.tone === "stuck" && "is-stuck",
+                    ),
+                    title: `@${agentName}`,
+                  }, yardInitials(agentName)),
+                  h("span", { className: "hermes-lane-tick" }),
+                )
+              : null,
+            h("span", { className: "hermes-lane-node" }),
+            h("span", { className: "hermes-lane-step-name" }, phase.label),
+          );
+        }),
+      ),
+
+      h("div", { className: "hermes-lane-doing" },
+        attention
+          ? h("span", {
+              className: cn(
+                "hermes-lane-flag",
+                attention.tone === "live" && "is-calm",
+              ),
+            }, attention.label)
+          : null,
+        h("span", { className: "hermes-lane-said" },
+          agentName ? h("strong", null, `@${agentName}`) : null,
+          narrative.text ? ` ${narrative.text}` : " пока ничего не сообщил",
+        ),
+        clockParts.length
+          ? h("span", { className: "hermes-lane-clock" }, clockParts.join(" · "))
+          : null,
+      ),
+
+      // Everything a machine wrote for a machine lives behind this, so the
+      // lane above stays a sentence a person can read.
+      h("details", { className: "hermes-lane-log" },
+        h("summary", null, "Технический след"),
+        h("div", { className: "hermes-lane-log-body" },
+          [
+            outcome ? `outcome: ${outcome}` : null,
+            // The lane above drops the machine label so the sentence reads;
+            // it must still be recoverable, or the gloss becomes a lie by
+            // omission.
+            narrative.code ? `код: ${narrative.code}` : null,
+            object.blocker ? `block: ${object.blocker.label || object.blocker.kind}` : null,
+            task.status ? `status: ${task.status}` : null,
+            narrative.source ? `источник строки: ${narrative.source}` : null,
+            artifact && artifact.outcome_detail
+              ? `detail: ${artifact.outcome_detail}`
+              : null,
+            pulse && Number.isFinite(Number(pulse.heartbeat_count))
+              ? `ударов сердца: ${pulse.heartbeat_count}`
+              : null,
+          ].filter(Boolean).join("\n") || "нет записей",
+        ),
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // The floor, as one place.
+  //
+  // The first attempt split it: a canvas scene on top, a list of lanes below.
+  // Both were truthful and together they were worse than either, because the
+  // same task appeared twice and the reader had to join them by eye across a
+  // scroll. A floor is a floor — the agent is at a bench, and the belt runs
+  // through the bench they are standing at.
+  //
+  // So: bases on the left, benches on the right, and the phase belt lives on
+  // the bench rather than in a second list. DOM rather than canvas, because
+  // every remaining requirement is a text requirement — a sentence a person
+  // can read, a receipt that stays folded, type that scales.
+  // -------------------------------------------------------------------------
+
+  // A stable look per agent, so it is recognised before it is read. Hue comes
+  // from the name so it never shifts between renders; the silhouette comes
+  // from the agency, so a glance also says which team is at the bench.
+  const FLOOR_SHAPES = {
+    development: "box",
+    marketing: "pill",
+    unassigned: "cut",
+  };
+
+  function floorHue(name) {
+    let hash = 0;
+    const text = String(name || "");
+    for (let i = 0; i < text.length; i++) {
+      hash = (hash * 31 + text.charCodeAt(i)) % 360;
+    }
+    return hash;
+  }
+
+  function floorAgentStyle(row) {
+    return { "--agent-hue": `${floorHue(row.name)}` };
+  }
+
+  function floorShape(row) {
+    return FLOOR_SHAPES[(row.agency || {}).key] || "disc";
+  }
+
+  // A person, not a swatch.
+  //
+  // The first pass drew agents as monogram squares, which reads as a legend
+  // key rather than as someone at a bench — a step back from the figures the
+  // canvas had. These are small silhouettes: same head, a torso that differs
+  // by agency, and a hue fixed by name. Recognisable at 26px, and still just
+  // DOM, so the label under it stays real selectable text.
+  //
+  // They stand; they do not yet walk. Walking needs positions and durations
+  // that survive between frames, which is the scene model, not a drawing
+  // problem — see docs/phosphene-factory-canvas-simulation-spec.md.
+  const FLOOR_TORSOS = {
+    // Broad shoulders: the build agencies.
+    box: "M4 15c0-3.3 2.7-6 6-6s6 2.7 6 6v5H4z",
+    // Narrow, slightly flared: growth.
+    pill: "M5 20c0-4.4 2.2-8 5-8s5 3.6 5 8z",
+    // Cloaked: the product roles that only ever advise.
+    cut: "M10 9c3.3 0 6 3.1 6 7v4H4v-4c0-3.9 2.7-7 6-7z",
+    // Round-shouldered default: control.
+    disc: "M10 9a6 6 0 0 1 6 6v5H4v-5a6 6 0 0 1 6-6z",
+  };
+
+  function AgentChip(props) {
+    const row = props.row;
+    const shape = floorShape(row);
+    const size = props.large ? 30 : 22;
+    return h("span", {
+      className: cn(
+        "hermes-floor-chip",
+        props.out && "is-out",
+        props.large && "is-large",
+      ),
+      style: floorAgentStyle(row),
+      title: `@${row.name}`,
+      "aria-label": `@${row.name}`,
+    },
+      h("svg", {
+        viewBox: "0 0 20 20",
+        width: size,
+        height: size,
+        role: "img",
+        focusable: "false",
+        "aria-hidden": "true",
+      },
+        h("circle", { cx: 10, cy: 5.4, r: 3.4, className: "hermes-figure-head" }),
+        h("path", {
+          d: FLOOR_TORSOS[shape] || FLOOR_TORSOS.disc,
+          className: "hermes-figure-body",
+        }),
+      ),
+      props.large
+        ? h("span", { className: "hermes-figure-tag" }, yardInitials(row.name))
+        : null,
+    );
+  }
+
+  // Live output, above the head.
+  //
+  // A heartbeat is the worker telling the board it is still producing. Its
+  // count is how many times it has said so, its age is how long since the
+  // last one, and a fresh age is the only honest way this screen can claim
+  // that tokens are flowing right now — the dashboard never sees the stream
+  // itself, so it must not animate as though it does when the beat is stale.
+  function LiveBubble(props) {
+    const pulse = props.pulse;
+    const note = props.note;
+    if (!pulse && !note) return null;
+    const beatAge = pulse ? Number(pulse.heartbeat_age_seconds) : NaN;
+    const fresh = Number.isFinite(beatAge) && beatAge <= YARD_STALE_BEAT_SECONDS;
+    const beats = pulse && Number.isFinite(Number(pulse.heartbeat_count))
+      ? Number(pulse.heartbeat_count)
+      : null;
+    const meter = [];
+    if (beats != null) meter.push(`удар ${beats}`);
+    if (pulse && Number.isFinite(Number(pulse.elapsed_seconds))) {
+      meter.push(
+        Number(pulse.budget_seconds) > 0
+          ? `${laneClock(pulse.elapsed_seconds)} / ${laneClock(pulse.budget_seconds)}`
+          : laneClock(pulse.elapsed_seconds),
+      );
+    }
+    return h("div", {
+      className: cn("hermes-bubble", fresh ? "is-live" : "is-quiet"),
+    },
+      h("div", { className: "hermes-bubble-head" },
+        h("span", {
+          className: cn("hermes-bubble-dot", fresh && "is-beating"),
+          "aria-hidden": "true",
+        }),
+        h("span", { className: "hermes-bubble-state" },
+          fresh ? "выдаёт сейчас" : "тишина в эфире"),
+      ),
+      note
+        ? h("p", { className: "hermes-bubble-note" }, laneFirstSentence(note))
+        : null,
+      meter.length
+        ? h("p", { className: "hermes-bubble-meter" }, meter.join(" · "))
+        : null,
+      Number.isFinite(beatAge) && !fresh
+        ? h("p", { className: "hermes-bubble-meter" },
+            `последний удар ${laneClock(beatAge)} назад`)
+        : null,
+      h("span", { className: "hermes-bubble-tail", "aria-hidden": "true" }),
+    );
+  }
+
+  // A bench: who is at it, which task, which step, and what they last said.
+  function FloorBench(props) {
+    const row = props.row;
+    // A supervising row has no Kanban card at all — it is a cron controller
+    // run. Feeding that record through the task path produced a bench titled
+    // "Без названия" with an empty belt, which is worse than saying plainly
+    // that this agent is supervising rather than building.
+    const task = row.focus || null;
+    const controller = (row.activeControllers || [])[0] || null;
+    if (!task && controller) {
+      const activity = yardAgentActivity(row);
+      return h("article", { className: "hermes-bench is-supervising" },
+        h("div", { className: "hermes-bench-who" },
+          h(AgentChip, { row: row, large: true }),
+          h("span", { className: "hermes-bench-name" }, `@${row.name}`),
+          h("span", { className: "hermes-bench-from" },
+            `из ${(row.agency || {}).label || "агентства"}`),
+        ),
+        h("div", { className: "hermes-bench-work" },
+          h("div", { className: "hermes-lane-head" },
+            h("span", { className: "hermes-lane-kind" }, "Надзор"),
+          ),
+          h("h4", { className: "hermes-lane-title" },
+            (activity && activity.text) || "Управляет сменой"),
+          h("p", { className: "hermes-bench-note" },
+            "Не карточка борда, а управляющий прогон: этот агент не строит, а решает, что запускать дальше."),
+        ),
+      );
+    }
+    if (!task) return null;
+    const object = {
+      id: `bench:${row.name}`,
+      task: task,
+      events: [],
+      lifecycle: { status: task.status, visibility: "live" },
+      workbench_receipt: null,
+      artifact: null,
+      blocker: null,
+    };
+    const kind = laneKind(task.body);
+    const phaseIndex = lanePhaseIndex(object);
+    const narrative = laneNarrative(object);
+    const attention = laneAttention(object);
+    const pulse = task.live_activity_pulse || null;
+
+    const clock = [];
+    if (pulse && Number.isFinite(Number(pulse.elapsed_seconds))) {
+      clock.push(`идёт ${laneClock(pulse.elapsed_seconds)}`);
+    }
+    if (pulse && Number(pulse.budget_seconds) > 0) {
+      clock.push(`из ${laneClock(pulse.budget_seconds)}`);
+    }
+
+    return h("article", {
+      className: cn(
+        "hermes-bench",
+        `hermes-lane--${kind.key}`,
+        attention && attention.tone === "stuck" && "is-stuck",
+      ),
+      onClick: props.onOpen ? function () { props.onOpen(task); } : null,
+    },
+      h("div", { className: "hermes-bench-who" },
+        // The bubble the canvas used to carry, and the reason to keep looking
+        // at the screen: not the assignment, which barely changes, but the
+        // sentence the worker wrote on its last heartbeat, and proof that
+        // tokens are still moving through it right now.
+        h(LiveBubble, { pulse: pulse, note: task.live_activity_note }),
+        h(AgentChip, { row: row, large: true }),
+        h("span", { className: "hermes-bench-name" }, `@${row.name}`),
+        h("span", { className: "hermes-bench-from" },
+          `из ${(row.agency || {}).label || "агентства"}`),
+      ),
+      h("div", { className: "hermes-bench-work" },
+        h("div", { className: "hermes-lane-head" },
+          h("span", { className: "hermes-lane-kind" }, kind.label),
+          h("span", { className: "hermes-lane-id" }, task.id || ""),
+        ),
+        h("h4", { className: "hermes-lane-title" }, task.title || "Без названия"),
+        h("div", { className: "hermes-lane-track", "aria-label": "Шаги задачи" },
+          LANE_PHASES.map(function (phase, index) {
+            const now = index === phaseIndex;
+            return h("div", {
+              key: phase.key,
+              className: cn(
+                "hermes-lane-step",
+                index < phaseIndex && "is-done",
+                now && "is-now",
+              ),
+            },
+              now
+                ? h("span", { className: "hermes-lane-stander" },
+                    h(AgentChip, {
+                      row: row,
+                      out: attention && attention.tone === "stuck",
+                    }),
+                    h("span", { className: "hermes-lane-tick" }),
+                  )
+                : null,
+              h("span", { className: "hermes-lane-node" }),
+              h("span", { className: "hermes-lane-step-name" }, phase.label),
+            );
+          }),
+        ),
+        h("div", { className: "hermes-lane-doing" },
+          attention
+            ? h("span", {
+                className: cn(
+                  "hermes-lane-flag",
+                  attention.tone === "live" && "is-calm",
+                ),
+              }, attention.label)
+            : null,
+          h("span", { className: "hermes-lane-said" },
+            narrative.text || "пока ничего не сообщил"),
+          clock.length
+            ? h("span", { className: "hermes-lane-clock" }, clock.join(" · "))
+            : null,
+        ),
+        h("details", { className: "hermes-lane-log" },
+          h("summary", null, "Технический след"),
+          h("div", { className: "hermes-lane-log-body" },
+            [
+              narrative.code ? `код: ${narrative.code}` : null,
+              task.status ? `status: ${task.status}` : null,
+              narrative.source ? `источник строки: ${narrative.source}` : null,
+              pulse && Number.isFinite(Number(pulse.heartbeat_count))
+                ? `ударов сердца: ${pulse.heartbeat_count}`
+                : null,
+            ].filter(Boolean).join("\n") || "нет записей",
+          ),
+        ),
+      ),
+    );
+  }
+
+  function FloorBase(props) {
+    const base = props.base;
+    const away = base.rows.filter(function (row) {
+      return row.placement !== "base";
+    }).length;
+    return h("div", { className: "hermes-floor-base" },
+      h("div", { className: cn("hermes-floor-house", `is-${base.agency.key}`) },
+        h("span", { className: "hermes-floor-roof" }),
+        h("span", { className: "hermes-floor-plate" }, base.agency.shortLabel),
+      ),
+      h("div", { className: "hermes-floor-base-name" }, base.agency.label),
+      h("div", { className: "hermes-floor-base-count" },
+        away > 0
+          ? `${base.rows.length - away} дома · ${away} в цеху`
+          : `${base.rows.length} дома`),
+      // Names belong under the figures. A silhouette says which team and
+      // whether the seat is empty; only the name says who.
+      h("div", { className: "hermes-floor-chips" },
+        base.rows.map(function (row) {
+          return h("span", {
+            key: row.name,
+            className: cn(
+              "hermes-floor-resident",
+              row.placement !== "base" && "is-out",
+            ),
+          },
+            h(AgentChip, { row: row, out: row.placement !== "base" }),
+            h("span", { className: "hermes-floor-resident-name" }, `@${row.name}`),
+          );
+        }),
+      ),
+    );
+  }
+
+  const SHELF_WAIT = {
+    ready: "waiting for a worker",
+    todo: "queued",
+    triage: "needs re-triage",
+  };
+
+  function TaskShelf(props) {
+    const tasks = Array.isArray(props.tasks) ? props.tasks : [];
+    if (tasks.length === 0) return null;
+    const shown = tasks.slice(0, 8);
+    return h("div", { className: "hermes-shelf" },
+      h("p", { className: "hermes-lanes-label" },
+        `Полка задач · ${tasks.length} ${tasks.length === 1 ? "ждёт" : "ждут"}`),
+      h("div", { className: "hermes-shelf-rack" },
+        shown.map(function (task) {
+          const kind = laneKind(task.body);
+          return h("div", {
+            key: task.id,
+            className: cn("hermes-shelf-card", `hermes-lane--${kind.key}`,
+              task.status === "triage" && "is-stalled"),
+            title: task.title || "",
+            onClick: props.onOpen ? function () { props.onOpen(task); } : null,
+          },
+            h("span", { className: "hermes-shelf-kind" },
+              kind.label,
+              intentBadge(task.intent),
+            ),
+            h("span", { className: "hermes-shelf-title" }, task.title || "Без названия"),
+            h("span", { className: "hermes-shelf-wait" },
+              task.assignee ? `@${task.assignee} · ` : "",
+              SHELF_WAIT[task.status] || task.status),
+          );
+        }),
+      ),
+      tasks.length > shown.length
+        ? h("p", { className: "hermes-shelf-more" },
+            `и ещё ${tasks.length - shown.length} на борде`)
+        : null,
+    );
+  }
+
+  // The plugin bundle is served as a classic script, not a module, so
+  // `import.meta` is a syntax error here — one that takes the whole file with
+  // it. Sibling assets are resolved from the tag that loaded this file
+  // instead, which also keeps the path correct if the dashboard is ever
+  // mounted under a prefix.
+  function pluginAsset(name) {
+    const scripts = document.getElementsByTagName("script");
+    for (let i = scripts.length - 1; i >= 0; i--) {
+      const src = scripts[i].src || "";
+      if (/\/dashboard-plugins\/kanban\/dist\/index\.js/.test(src)) {
+        return new URL(name, src).href;
+      }
+    }
+    return `/dashboard-plugins/kanban/dist/${name}`;
+  }
+
+  // Board → scene snapshot.
+  //
+  // The renderer never sees a task; it sees places and intent. Everything
+  // here is a straight read of what the board already reports — no field is
+  // synthesised, and a missing one leaves its part of the floor empty rather
+  // than filled with a plausible guess.
+  function buildFloorSnapshot(scene) {
+    const benchRows = scene.roster.rows.filter(function (row) {
+      return row.state === "running" && row.focus;
+    });
+    const benches = benchRows.map(function (row) {
+      const task = row.focus;
+      const object = {
+        id: `bench:${row.name}`,
+        task: task,
+        events: [],
+        lifecycle: { status: task.status, visibility: "live" },
+        workbench_receipt: null,
+        artifact: null,
+        blocker: null,
+      };
+      const kind = laneKind(task.body);
+      const pulse = task.live_activity_pulse || null;
+      const beat = pulse ? Number(pulse.heartbeat_age_seconds) : NaN;
+      const attention = laneAttention(object);
+      return {
+        id: `bench:${row.name}`,
+        agentName: row.name,
+        cardId: task.id,
+        kind: kind.key,
+        kindLabel: kind.label,
+        // Why this work exists, carried onto the canvas beside what it is.
+        intent: task.intent || "",
+        title: task.title || "Без названия",
+        phases: LANE_PHASES.map(function (phase) { return phase.label; }),
+        phaseIndex: lanePhaseIndex(object),
+        beating: Number.isFinite(beat) && beat <= YARD_STALE_BEAT_SECONDS,
+        stuck: Boolean(attention && attention.tone === "stuck"),
+        live: {
+          beating: Number.isFinite(beat) && beat <= YARD_STALE_BEAT_SECONDS,
+          note: laneFirstSentence(task.live_activity_note || ""),
+          meter: pulse
+            ? (function () {
+                const parts = [];
+                const updates = Number(pulse.heartbeat_count);
+                if (Number.isFinite(updates)) {
+                  parts.push(updates === 1 ? "1 update" : `${updates} updates`);
+                }
+                const elapsed = Number(pulse.elapsed_seconds);
+                const budget = Number(pulse.budget_seconds);
+                if (Number.isFinite(elapsed)) {
+                  parts.push(budget > 0
+                    ? `running ${laneClock(elapsed)} of ${laneClock(budget)}`
+                    : `running ${laneClock(elapsed)}`);
+                }
+                return parts.join(" · ");
+              })()
+            : "",
+        },
+        task: task,
+      };
+    });
+    const benchByAgent = {};
+    benches.forEach(function (bench) { benchByAgent[bench.agentName] = bench.id; });
+
+    const bases = scene.bases.map(function (base) {
+      const away = base.rows.filter(function (row) {
+        return row.placement !== "base";
+      }).length;
+      return {
+        key: base.agency.key,
+        label: base.agency.label,
+        residents: base.rows.length,
+        caption: away > 0
+          ? `${base.rows.length - away} дома · ${away} в цеху`
+          : `${base.rows.length} дома`,
+      };
+    });
+
+    const seatIndex = {};
+    const agents = scene.roster.rows.map(function (row) {
+      const key = row.agency.key;
+      const seat = seatIndex[key] = (seatIndex[key] == null ? 0 : seatIndex[key] + 1);
+      const bench = benches.find(function (item) { return item.agentName === row.name; });
+      return {
+        name: row.name,
+        label: yardInitials(row.name),
+        hue: floorHue(row.name),
+        shape: floorShape(row),
+        baseKey: key,
+        // A grid wide enough that a fourteen-strong base does not pile up.
+        // Names hang under the figure, so rows need vertical room for both.
+        seat: { dx: -105 + (seat % 3) * 105, dy: 152 + Math.floor(seat / 3) * 58 },
+        benchId: benchByAgent[row.name] || null,
+        working: row.state === "running",
+        beating: Boolean(bench && bench.beating),
+        // The bubble over the head: the sentence the worker wrote on its last
+        // heartbeat, which is the only live proof this screen has that tokens
+        // are still moving through it.
+        note: bench && bench.task
+          ? laneFirstSentence(bench.task.live_activity_note || "")
+          : "",
+        // "beat 0 · 2m" told the reader nothing. Name what is counted and
+        // what the time is measured against.
+        meter: bench && bench.task && bench.task.live_activity_pulse
+          ? (function (pulse) {
+              const parts = [];
+              const updates = Number(pulse.heartbeat_count);
+              if (Number.isFinite(updates)) {
+                parts.push(updates === 1 ? "1 update" : `${updates} updates`);
+              }
+              const elapsed = Number(pulse.elapsed_seconds);
+              const budget = Number(pulse.budget_seconds);
+              if (Number.isFinite(elapsed)) {
+                parts.push(budget > 0
+                  ? `running ${laneClock(elapsed)} of ${laneClock(budget)}`
+                  : `running ${laneClock(elapsed)}`);
+              }
+              return parts.join(" · ");
+            })(bench.task.live_activity_pulse)
+          : "",
+      };
+    });
+
+    const shelf = (scene.shelfTasks || []).slice(0, 12).map(function (task) {
+      const kind = laneKind(task.body);
+      return {
+        id: task.id,
+        kind: kind.key,
+        kindLabel: kind.label,
+        intent: task.intent || "",
+        title: task.title || "Без названия",
+        wait: task.assignee
+          ? `@${task.assignee} · ${SHELF_WAIT[task.status] || task.status}`
+          : (SHELF_WAIT[task.status] || task.status),
+        // The bench needs the same words the card carries, or a task docked
+        // at a bench renders as "no title" — which is what shipped.
+      };
+    });
+
+    return {
+      bases,
+      benches,
+      agents,
+      shelf,
+      // Left to right, the way the work actually flows.
+      stageOrder: [
+        "strategy", "idea", "critique", "gate",
+        "evidence", "build", "review", "publish",
+        "capability", "upkeep", "control", "other",
+      ],
+    };
+  }
+
+  function PixiFloor(props) {
+    const hostRef = useRef(null);
+    const rendererRef = useRef(null);
+    const [failed, setFailed] = useState(false);
+
+    useEffect(function () {
+      let cancelled = false;
+      import(pluginAsset("floor-render.js"))
+        .then(function (module) {
+          if (cancelled || !hostRef.current) return null;
+          return module.createFloorRenderer(hostRef.current, {});
+        })
+        .then(function (renderer) {
+          if (!renderer) return;
+          if (cancelled) { renderer.destroy(); return; }
+          rendererRef.current = renderer;
+          renderer.update(buildFloorSnapshot(props.scene));
+        })
+        .catch(function (error) {
+          // The scene is a view, not the truth. If WebGL or the vendored
+          // bundle is unavailable the board must still be readable, so fall
+          // back rather than leaving a blank rectangle.
+          if (!cancelled) setFailed(true);
+          if (typeof console !== "undefined") {
+            console.warn("floor scene unavailable, falling back", error);
+          }
+        });
+      return function () {
+        cancelled = true;
+        if (rendererRef.current) {
+          rendererRef.current.destroy();
+          rendererRef.current = null;
+        }
+      };
+    }, []);
+
+    useEffect(function () {
+      if (rendererRef.current) {
+        rendererRef.current.update(buildFloorSnapshot(props.scene));
+      }
+    }, [props.scene]);
+
+    useEffect(function () {
+      if (rendererRef.current) rendererRef.current.setOnOpen(props.onOpen);
+    }, [props.onOpen]);
+
+    if (failed) return h(FactoryFloor, { scene: props.scene, onOpen: props.onOpen });
+    return h("div", { className: "hermes-scene", ref: hostRef });
+  }
+
+  // ---------------------------------------------------------------------
+  // The founder's queue.
+  //
+  // These cards hold no worker and occupy no station, so the floor never drew
+  // them — yet they are the only queue whose next move belongs to the reader.
+  // Twenty-eight of them sat unseen for a median of five days while the floor
+  // showed three busy agents and read as "nothing is happening".
+  //
+  // It lives in DOM rather than on the canvas because every line here is a
+  // sentence to read and a link to follow: the text must be selectable, the
+  // pull request must be a real anchor, and the list must scroll.
+  // ---------------------------------------------------------------------
+
+  function founderWaitLabel(seconds) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value <= 0) return "";
+    const hours = Math.floor(value / 3600);
+    if (hours < 24) return `${hours} ч`;
+    return `${Math.floor(hours / 24)} дн`;
+  }
+
+  // Stale before urgent: the queue is a debt, and the oldest item has been
+  // costing the longest.
+  const FOUNDER_STALE_SECONDS = 48 * 3600;
+
+  function FounderQueue(props) {
+    const items = Array.isArray(props.items) ? props.items : [];
+    const [open, setOpen] = useState(false);
+    if (!items.length) return null;
+
+    // A card whose pull request is already merged is not a decision owed. The
+    // headline counts only what the reader can still act on; the settled ones
+    // stay in the list, greyed, so the backlog is visible without inflating
+    // the number that drives his attention.
+    const live = items.filter(function (item) { return !item.settled; });
+    const settled = items.length - live.length;
+    const readyToMerge = live.filter(function (item) {
+      return item.stage === "Ready to merge";
+    }).length;
+
+    return h("section", { className: cn("hermes-founder", open && "is-open") },
+      h("button", {
+        type: "button",
+        className: "hermes-founder-pill",
+        "aria-expanded": open ? "true" : "false",
+        onClick: function () { setOpen(!open); },
+      },
+        h("span", { className: "hermes-founder-count" }, String(live.length)),
+        h("span", { className: "hermes-founder-pill-text" },
+          live.length === 1
+            ? "задача ждёт твоего решения"
+            : "задач ждут твоего решения"),
+        h("span", { className: "hermes-founder-ready" },
+          [
+            readyToMerge ? `${readyToMerge} готовы к мержу` : "",
+            settled ? `${settled} уже закрыты на GitHub` : "",
+          ].filter(Boolean).join(" · ")),
+        h("span", { className: "hermes-founder-caret", "aria-hidden": "true" },
+          open ? "▾" : "▸"),
+      ),
+      open
+        ? h("ul", { className: "hermes-founder-list" },
+            items.map(function (item) {
+              const pr = item.pull_request;
+              const stale = Number(item.waiting_seconds) >= FOUNDER_STALE_SECONDS;
+              return h("li", {
+                key: item.task_id,
+                className: cn(
+                  "hermes-founder-item",
+                  stale && !item.settled && "is-stale",
+                  item.settled && "is-settled",
+                ),
+              },
+                h("div", { className: "hermes-founder-item-head" },
+                  h("span", {
+                    className: cn(
+                      "hermes-founder-stage",
+                      `is-${String(item.stage || "").toLowerCase()
+                        .replace(/[^a-z]+/g, "-")}`,
+                    ),
+                  }, item.stage),
+                  h("span", { className: "hermes-founder-wait" },
+                    founderWaitLabel(item.waiting_seconds)),
+                ),
+                h("button", {
+                  type: "button",
+                  className: "hermes-founder-title",
+                  onClick: function () {
+                    // The board's opener takes a task, not an id.
+                    if (props.onOpen) props.onOpen({ id: item.task_id });
+                  },
+                }, item.title || item.task_id),
+                item.question
+                  ? h("p", { className: "hermes-founder-question" }, item.question)
+                  : null,
+                pr
+                  ? (pr.url
+                      ? h("a", {
+                          className: "hermes-founder-link",
+                          href: pr.url,
+                          target: "_blank",
+                          rel: "noreferrer noopener",
+                        }, `PR #${pr.number} →`)
+                      // A bare number carries no repository. Showing it plain
+                      // beats a guessed link to the wrong project.
+                      : h("span", { className: "hermes-founder-link is-plain" },
+                          `PR #${pr.number}`))
+                  : null,
+              );
+            }),
+          )
+        : null,
+    );
+  }
+
+  function FactoryFloor(props) {
+    const scene = props.scene;
+    const benchRows = scene.roster.rows.filter(function (row) {
+      return row.state === "running" || row.state === "supervising";
+    });
+    const settled = (scene.factoryObjects || []).filter(function (object) {
+      return (object.lifecycle || {}).visibility === "recent_outcome";
+    });
+    return h("div", { className: "hermes-floor" },
+      h("aside", { className: "hermes-floor-bases" },
+        h("p", { className: "hermes-lanes-label" }, "Дома"),
+        scene.bases.map(function (base) {
+          return h(FloorBase, { key: base.agency.key, base: base });
+        }),
+      ),
+      h("div", { className: "hermes-floor-stations" },
+        h(TaskShelf, { tasks: scene.shelfTasks, onOpen: props.onOpen }),
+        h("p", { className: "hermes-lanes-label" },
+          benchRows.length
+            ? `Рабочие места · ${benchRows.length} за работой`
+            : "Рабочие места"),
+        benchRows.length
+          ? benchRows.map(function (row) {
+              return h(FloorBench, {
+                key: row.name,
+                row: row,
+                onOpen: props.onOpen,
+              });
+            })
+          : h("div", { className: "hermes-floor-empty" },
+              "Все дома. Ни одна задача сейчас не выполняется."),
+        settled.length
+          ? h("div", { className: "hermes-floor-settled" },
+              h("p", { className: "hermes-lanes-label" }, "Только что закончили"),
+              settled.map(function (object) {
+                return h(FactoryLane, { key: object.id, object: object });
+              }),
+            )
+          : null,
+      ),
+    );
+  }
+
+  function FactoryLanes(props) {
+    const objects = Array.isArray(props.objects) ? props.objects : [];
+    const running = (Array.isArray(props.liveTasks) ? props.liveTasks : []).map(
+      function (task) {
+        return {
+          id: `live:${task.id}`,
+          task: task,
+          events: [],
+          lifecycle: { status: task.status, visibility: "live" },
+          workbench_receipt: null,
+          artifact: null,
+          blocker: null,
+        };
+      },
+    );
+    if (objects.length === 0 && running.length === 0) return null;
+    const live = running.concat(
+      objects.filter(function (object) {
+        return (object.lifecycle || {}).visibility !== "recent_outcome";
+      }),
+    );
+    const settled = objects.filter(function (object) {
+      return (object.lifecycle || {}).visibility === "recent_outcome";
+    });
+    return h("div", { className: "hermes-lanes" },
+      live.length
+        ? h("div", null,
+            h("p", { className: "hermes-lanes-label" }, "Что делается прямо сейчас"),
+            live.map(function (object) {
+              return h(FactoryLane, { key: object.id, object: object });
+            }),
+          )
+        : null,
+      settled.length
+        ? h("div", { className: "hermes-lanes-settled" },
+            h("p", { className: "hermes-lanes-label" }, "Только что закончили"),
+            settled.map(function (object) {
+              return h(FactoryLane, { key: object.id, object: object });
+            }),
+          )
+        : null,
+    );
+  }
+
   function YardMetric(props) {
     return h("div", {
       className: cn("hermes-yard-metric", `hermes-yard-metric--${props.tone}`),
@@ -1669,6 +2785,21 @@
   function agencyHealthVerdict(health) {
     if (!health) return "Loading durable agency receipts…";
     const signals = health.signals || {};
+    // Fewer faults is only good news if the work did not shrink with them.
+    // The cheapest way to drive a failure rate to zero is to attempt nothing,
+    // and a rate-only panel rewards exactly that. Say it out loud instead.
+    const completed = Number((health.current || {}).completed_runs) || 0;
+    const priorCompleted = Number((health.previous || {}).completed_runs) || 0;
+    const throughputCollapsed = (
+      priorCompleted >= 10 && completed <= priorCompleted * 0.6
+    );
+    if (throughputCollapsed && signals.failure_rate === "improving") {
+      return "Faults fell, but so did output — this is a quieter window, "
+        + "not a better one.";
+    }
+    if (throughputCollapsed) {
+      return "Output dropped sharply against the preceding window.";
+    }
     if (signals.failure_rate === "improving" &&
         signals.intervention_rate === "regressing") {
       return "Execution faults are falling, but intervention load is rising.";
@@ -1709,6 +2840,11 @@
         day.failure_rate_per_10 || 0,
         day.interventions_per_10 || 0,
       );
+    }));
+    // Counts, not rates: they cannot share the axis above without one of the
+    // two series flattening into a line.
+    const volumeMax = Math.max(1, ...daily.map(function (day) {
+      return Number(day.completed_runs) || 0;
     }));
     const recoverySignal = (
       current.median_recovery_minutes == null ||
@@ -1789,12 +2925,26 @@
             const interventionHeight = Math.round(
               ((day.interventions_per_10 || 0) / dailyMax) * 100,
             );
+            // Volume gets its own scale and its own layer. Both other series
+            // are rates per ten runs, so a day of near-zero faults looks
+            // identical whether the agency worked well or barely worked at
+            // all. The backdrop is what separates those two: short backdrop
+            // with short bars is a quiet day, not a good one. Drawn behind
+            // rather than beside because it answers a different question and
+            // must never be read off the same axis.
+            const completed = Number(day.completed_runs) || 0;
+            const volumeHeight = Math.round((completed / volumeMax) * 100);
             return h("div", {
               className: "hermes-agency-health-day",
               key: day.date,
-              title: `${day.date}: ${day.failure_rate_per_10 == null ? "—" : day.failure_rate_per_10} faults and ${day.interventions_per_10 == null ? "—" : day.interventions_per_10} interventions per 10`,
+              title: `${day.date}: ${completed} completed · ${day.failed_runs || 0} failed · ${day.failure_rate_per_10 == null ? "—" : day.failure_rate_per_10} faults and ${day.interventions_per_10 == null ? "—" : day.interventions_per_10} interventions per 10`,
             },
               h("div", { className: "hermes-agency-health-bars" },
+                h("i", {
+                  className: "is-volume",
+                  style: { height: `${volumeHeight}%` },
+                  "aria-hidden": "true",
+                }),
                 h("i", {
                   className: "is-fault",
                   style: { height: `${faultHeight}%` },
@@ -1840,9 +2990,12 @@
         ),
       ),
       h("div", { className: "hermes-agency-health-legend" },
+        h("span", null, h("i", { className: "is-volume" }), "Completed runs (own scale)"),
         h("span", null, h("i", { className: "is-fault" }), "Execution faults / 10"),
         h("span", null, h("i", { className: "is-intervention" }), "Explicit interventions / 10"),
-        h("strong", null, "Lower is better. Review-required handoffs are not errors."),
+        h("strong", null,
+          "Lower bars are better only while the backdrop holds up. " +
+          "Review-required handoffs are not errors."),
       ),
     );
   }
@@ -2252,6 +3405,31 @@
       }).length,
       fieldMissionCount: fieldMissions.length,
       totalMissionCount: missions.length,
+      // Running tasks are deliberately absent from `factoryObjects` — the
+      // canvas draws them as agents on the floor. The lanes need them too,
+      // and for the opposite reason: the floor shows that someone is there,
+      // the lane shows which step they are on and what they just said.
+      liveTasks: floorTasks,
+      // The shelf: cards that exist and are waiting for someone to pick them
+      // up. Without it the floor answers "who is working" but never "what is
+      // queued", and work appears out of nowhere the moment it starts.
+      //
+      // `ready` is the dispatcher's own queue. `triage` and `todo` are on the
+      // shelf too, but they are not waiting for a worker — they are waiting
+      // for the Lead, and the shelf says so rather than implying a agent will
+      // wander over and take one.
+      shelfTasks: allTasks
+        .filter(function (task) {
+          return task.status === "ready"
+            || task.status === "todo"
+            || task.status === "triage";
+        })
+        .sort(function (a, b) {
+          const rank = { ready: 0, todo: 1, triage: 2 };
+          const byStatus = (rank[a.status] || 9) - (rank[b.status] || 9);
+          if (byStatus !== 0) return byStatus;
+          return (b.priority || 0) - (a.priority || 0);
+        }),
       factoryObjects,
       factoryWindowSeconds: Number(factoryFlow.window_seconds || 0),
       factoryOutcomeGraceSeconds: Number(
@@ -3059,7 +4237,13 @@
       ? top + rows * rowHeight + 24
       : 62;
     const missionHeight = top + rows * rowHeight + 72;
-    const visibleFactoryCount = Math.min(factoryCount, compact ? 4 : 6);
+    // The conveyor is drawn in DOM now (see `FactoryLanes`), where the phase
+    // an agent stands on, the plain sentence, and the folded receipt can all
+    // exist. Keeping the canvas copy as well would state the same handoffs
+    // twice and worse — so the canvas keeps only what it is genuinely better
+    // at: the bases and the agents standing on the floor.
+    const visibleFactoryCount = 0;
+    void factoryCount;
     const factoryRowHeight = compact ? 118 : 112;
     // The band above the first row has to hold the section header, the stage
     // labels, and a two-line row title before the stage boxes start at y-27.
@@ -4335,17 +5519,12 @@
     };
 
     return h("section", { className: "hermes-agency-yard", "aria-labelledby": "agency-yard-title" },
-      h("div", { className: "hermes-yard-masthead" },
-        h("div", { className: "hermes-yard-title-block" },
-          h("div", { className: "hermes-yard-kicker" },
-            h("span", { className: "hermes-yard-live-dot", "aria-hidden": "true" }),
-            "LIVE FROM THE BOARD",
-          ),
-          h("h2", { id: "agency-yard-title" }, "The agencies, on one floor"),
-          h("p", null,
-            "Agents show who is working now. The factory shows current handoffs and keeps completed outcomes for ten minutes—historical comments never revive them.",
-          ),
-        ),
+      // The tab already says Kanban and the board picker already names the
+      // agency. A title, a kicker and a paragraph explaining the picture were
+      // three rows of chrome above the only thing worth the space — the floor.
+      h("div", { className: "hermes-yard-masthead is-slim" },
+        h("h2", { id: "agency-yard-title", className: "hermes-yard-quiet-title" },
+          "Цех"),
         h("div", { className: "hermes-yard-actions" },
           h("button", {
             type: "button",
@@ -4385,22 +5564,32 @@
         }),
       ),
       h(AgencyHealthPanel, { health: agencyHealth }),
+      // Above the floor, because a decision the reader owes is more urgent
+      // than the shift he is only watching.
+      h(FounderQueue, {
+        items: (props.board || {}).founder_queue,
+        onOpen: props.onOpen,
+      }),
       scene.roster.rows.length === 0
         ? h("div", { className: "hermes-yard-empty" },
             "No installed profiles or assigned open tasks were found on this board.")
-        : h(AgencyCanvas, {
-            scene,
-            onOpen: props.onOpen,
-          }),
-      h("div", { className: "hermes-yard-legend", "aria-label": "Map legend" },
-        h("span", null, h("i", { className: "is-supervising" }), "Planning, review, or control work"),
-        h("span", null, h("i", { className: "is-idle" }), "Agent at home base"),
-        h("span", null, h("i", { className: "is-running" }), "Product implementation"),
-        h("span", null, h("i", { className: "is-ready" }), "Task object"),
-        h("span", null, h("i", { className: "is-review" }), "PR, patch, or result"),
-        h("span", null, h("i", { className: "is-blocked" }), "Blocked transformation"),
+        // One floor, one frame. `AgencyCanvas` stays in the file: it is the
+        // scene layer a future renderer takes over, and the DOM floor below
+        // is what it will draw labels on top of. It is not rendered today
+        // because two pictures of the same shift is worse than one.
+        : h(PixiFloor, { scene: scene, onOpen: props.onOpen }),
+
+      // The legend has to describe what is on the screen. The old one still
+      // named canvas objects — task papers, transformation arrows — that the
+      // floor no longer draws, which is worse than no legend at all.
+      h("div", { className: "hermes-yard-legend", "aria-label": "Легенда" },
+        h("span", null, h("i", { className: "is-running" }), "Занятая ячейка — агент дома"),
+        h("span", null, h("i", { className: "is-idle" }), "Пустой контур — агент в цеху"),
+        h("span", null, h("i", { className: "is-supervising" }), "Форма значка — агентство"),
+        h("span", null, h("i", { className: "is-ready" }), "Цвет полосы — род работы"),
+        h("span", null, h("i", { className: "is-blocked" }), "Красная рамка — задача встала"),
         h("strong", null,
-          "Only agents outside a base are live. Factory rows are current handoffs or outcomes within the ten-minute grace window."),
+          "Агент стоит на том шаге, который выполняет сейчас. Машинные коды и квитанции — под «Технический след»."),
       ),
     );
   }
