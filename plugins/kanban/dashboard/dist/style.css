@@ -32,6 +32,29 @@
 .hermes-kanban {
   --hermes-kanban-sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
+  --hermes-kanban-mono: "JetBrains Mono", ui-monospace, SFMono-Regular,
+    "SF Mono", Menlo, Consolas, monospace;
+
+  /* The decisive override.
+   *
+   * Declaring a family on this container and on `h1..h6, p, …` was not
+   * enough: the app paints headings and body copy through
+   * `font-family: var(--font-sans)`, and `--font-sans` is globally
+   * `"Collapse", sans-serif` — a brand display face whose name says sans
+   * and whose shapes read as a serif. A selector duel cannot win that,
+   * because the winning rule is not ours and its layer may outrank ours.
+   *
+   * Redefining the variables here settles it without a duel: their rule
+   * still applies, it just resolves a different value inside the board.
+   * Verified on the live dashboard — `h2` went `Collapse` → `Inter`,
+   * `.hermes-yard-kicker` went `"Courier Prime"` → `JetBrains Mono`.
+   *
+   * The board is scanned, not read. A display face at 11px is decoration
+   * charged to legibility, and this surface cannot afford it.
+   */
+  --font-sans: var(--hermes-kanban-sans);
+  --font-mono: var(--hermes-kanban-mono);
+
   font-family: var(--hermes-kanban-sans);
   font-size: 0.938rem;
   line-height: 1.5;
@@ -2910,4 +2933,867 @@
   .hermes-kanban-view-button {
     transition: none;
   }
+}
+
+/* ---- Task lanes ------------------------------------------------------ *
+ *
+ * The canvas above still draws the bases and the live agents, which read
+ * well as a place. What it could not do is words: a phase label that scales,
+ * a plain sentence a person can select, and a receipt that stays folded until
+ * asked for. Those live here, in DOM, and inherit the board's reading face.
+ *
+ * Colour is information, not decoration: the left edge carries the kind of
+ * work, so product bets separate from housekeeping before a word is read.
+ */
+
+.hermes-lanes {
+  margin-top: 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.hermes-lanes-label {
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--muted-fg, #8a98a8);
+  margin: 0 0 10px;
+}
+
+.hermes-lane {
+  --lane-hue: var(--border, #2a3440);
+  background: var(--card-bg, rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--border, #2a3440);
+  border-left: 3px solid var(--lane-hue);
+  border-radius: 10px;
+  padding: 14px 17px 12px;
+  margin-bottom: 10px;
+}
+
+.hermes-lane--idea      { --lane-hue: #9b7de0; }
+.hermes-lane--critique  { --lane-hue: #e0a458; }
+.hermes-lane--gate      { --lane-hue: #4fd1c5; }
+.hermes-lane--build     { --lane-hue: #5b9be0; }
+.hermes-lane--review    { --lane-hue: #5fbf8f; }
+.hermes-lane--publish   { --lane-hue: #4bb0a4; }
+.hermes-lane--evidence  { --lane-hue: #c98bd8; }
+
+.hermes-lane.is-stuck { border-color: color-mix(in srgb, #e0645f 45%, var(--border, #2a3440)); }
+
+.hermes-lane-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 2px;
+}
+
+.hermes-lane-kind {
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--lane-hue);
+}
+
+.hermes-lane-id {
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.62rem;
+  color: var(--muted-fg, #8a98a8);
+  margin-left: auto;
+}
+
+.hermes-lane-title {
+  font-size: 0.94rem;
+  font-weight: 550;
+  margin: 0 0 16px;
+  text-wrap: balance;
+}
+
+/* The track. Each step owns a segment of the rail so the agent can stand on
+ * one of them rather than float above the whole row. */
+.hermes-lane-track {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  margin-bottom: 11px;
+}
+
+.hermes-lane-step {
+  position: relative;
+  padding-top: 26px;
+  text-align: center;
+  min-width: 0;
+}
+
+.hermes-lane-step::before {
+  content: "";
+  position: absolute;
+  top: 9px;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--border, #2a3440);
+}
+
+.hermes-lane-step:first-child::before { left: 50%; }
+.hermes-lane-step:last-child::before { right: 50%; }
+.hermes-lane-step.is-done::before { background: color-mix(in srgb, var(--lane-hue) 55%, var(--border, #2a3440)); }
+.hermes-lane-step.is-now::before {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--lane-hue) 55%, var(--border, #2a3440)) 50%,
+    var(--border, #2a3440) 50%
+  );
+}
+
+.hermes-lane-node {
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--bg, #0b0f14);
+  border: 2px solid var(--border, #2a3440);
+}
+
+.hermes-lane-step.is-done .hermes-lane-node {
+  background: var(--lane-hue);
+  border-color: var(--lane-hue);
+}
+.hermes-lane-step.is-now .hermes-lane-node { border-color: var(--lane-hue); }
+
+.hermes-lane-step-name {
+  display: block;
+  font-size: 0.71rem;
+  color: var(--muted-fg, #8a98a8);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hermes-lane-step.is-now .hermes-lane-step-name {
+  color: var(--fg, #dae3ed);
+  font-weight: 550;
+}
+
+/* The agent, standing on its step. */
+.hermes-lane-stander {
+  position: absolute;
+  top: -21px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.hermes-lane-mark {
+  width: 25px;
+  height: 25px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--lane-hue);
+  color: var(--bg, #0b0f14);
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.57rem;
+  font-weight: 700;
+}
+.hermes-lane-mark.is-stuck { background: #e0645f; }
+
+.hermes-lane-tick {
+  width: 2px;
+  height: 6px;
+  background: var(--lane-hue);
+}
+
+.hermes-lane-doing {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+  color: var(--muted-fg, #8a98a8);
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--border, #2a3440) 55%, transparent);
+}
+
+.hermes-lane-said { flex: 1 1 320px; min-width: 0; }
+.hermes-lane-said strong { color: var(--fg, #dae3ed); font-weight: 550; }
+
+.hermes-lane-clock {
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.7rem;
+  color: var(--muted-fg, #8a98a8);
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+}
+
+.hermes-lane-flag {
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 20px;
+  border: 1px solid color-mix(in srgb, #e0645f 50%, transparent);
+  color: #e0645f;
+  white-space: nowrap;
+}
+.hermes-lane-flag.is-calm {
+  border-color: color-mix(in srgb, #4fd1c5 40%, transparent);
+  color: #4fd1c5;
+}
+
+.hermes-lane-log { margin-top: 9px; }
+.hermes-lane-log > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 0.73rem;
+  color: var(--muted-fg, #8a98a8);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.hermes-lane-log > summary::-webkit-details-marker { display: none; }
+.hermes-lane-log > summary::before {
+  content: "▸";
+  font-size: 0.64rem;
+  transition: transform 0.15s ease;
+}
+.hermes-lane-log[open] > summary::before { transform: rotate(90deg); }
+.hermes-lane-log > summary:hover { color: var(--fg, #dae3ed); }
+
+.hermes-lane-log-body {
+  margin-top: 7px;
+  padding: 10px 12px;
+  border-radius: 7px;
+  background: var(--bg, #0b0f14);
+  border: 1px solid color-mix(in srgb, var(--border, #2a3440) 55%, transparent);
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.69rem;
+  line-height: 1.6;
+  color: var(--muted-fg, #8a98a8);
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hermes-lane-log > summary::before { transition: none; }
+}
+
+/* Settled work reads as history, not as a second demand on attention. */
+.hermes-lanes-settled { opacity: 0.72; }
+.hermes-lanes-settled:hover,
+.hermes-lanes-settled:focus-within { opacity: 1; }
+
+/* ---- The floor as one place ------------------------------------------ *
+ *
+ * Bases on the left, benches on the right, in a single frame. The belt lives
+ * on the bench the agent is standing at, so nothing has to be joined by eye
+ * across a scroll.
+ */
+
+.hermes-floor {
+  display: grid;
+  grid-template-columns: 216px minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+  margin-top: 18px;
+}
+
+@media (max-width: 900px) {
+  .hermes-floor { grid-template-columns: 1fr; }
+}
+
+/* ---- bases ---- */
+
+.hermes-floor-base { margin-bottom: 26px; }
+
+.hermes-floor-house {
+  position: relative;
+  height: 58px;
+  display: grid;
+  place-items: end center;
+  margin-bottom: 9px;
+}
+
+/* The roof is a shape, not an image: it survives every theme and costs
+ * nothing to render. */
+.hermes-floor-roof {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 46px solid transparent;
+  border-right: 46px solid transparent;
+  border-bottom: 26px solid var(--house-hue, #4a5a6a);
+  opacity: 0.55;
+}
+
+.hermes-floor-plate {
+  position: relative;
+  z-index: 1;
+  min-width: 74px;
+  text-align: center;
+  padding: 5px 9px;
+  border: 1px solid var(--house-hue, #4a5a6a);
+  border-radius: 5px;
+  background: var(--card-bg, rgba(255, 255, 255, 0.02));
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.56rem;
+  letter-spacing: 0.06em;
+  color: var(--house-hue, #4a5a6a);
+}
+
+.hermes-floor-house.is-development { --house-hue: #5b9be0; }
+.hermes-floor-house.is-marketing { --house-hue: #b98bd8; }
+.hermes-floor-house.is-unassigned { --house-hue: #7a8899; }
+
+.hermes-floor-base-name {
+  font-size: 0.82rem;
+  font-weight: 600;
+  text-align: center;
+}
+
+.hermes-floor-base-count {
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.63rem;
+  color: var(--muted-fg, #8a98a8);
+  text-align: center;
+  margin-bottom: 9px;
+}
+
+.hermes-floor-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  justify-content: center;
+}
+
+/* ---- the agent ---- */
+
+.hermes-floor-chip {
+  position: relative;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  line-height: 1;
+  flex: none;
+  color: hsl(var(--agent-hue, 200) 48% 64%);
+}
+
+.hermes-figure-head,
+.hermes-figure-body {
+  fill: currentColor;
+}
+
+/* Away from base: the figure is drawn hollow, so an empty seat still says
+ * which of them is missing rather than simply vanishing. */
+.hermes-floor-chip.is-out {
+  opacity: 0.85;
+}
+.hermes-floor-chip.is-out .hermes-figure-head,
+.hermes-floor-chip.is-out .hermes-figure-body {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+}
+
+.hermes-figure-tag {
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.52rem;
+  letter-spacing: 0.04em;
+  color: var(--muted-fg, #8a98a8);
+  margin-top: 2px;
+}
+
+/* ---- benches ---- */
+
+.hermes-floor-stations { min-width: 0; }
+
+.hermes-bench {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 16px;
+  background: var(--card-bg, rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--border, #2a3440);
+  border-left: 3px solid var(--lane-hue, #4a5a6a);
+  border-radius: 10px;
+  padding: 15px 17px 12px;
+  margin-bottom: 12px;
+}
+
+.hermes-bench.is-stuck {
+  border-color: color-mix(in srgb, #e0645f 45%, var(--border, #2a3440));
+}
+
+@media (max-width: 720px) {
+  .hermes-bench { grid-template-columns: 1fr; }
+}
+
+.hermes-bench-who {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding-top: 2px;
+}
+
+.hermes-bench-name {
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.66rem;
+  text-align: center;
+  word-break: break-all;
+}
+
+.hermes-bench-from {
+  font-size: 0.63rem;
+  color: var(--muted-fg, #8a98a8);
+  text-align: center;
+}
+
+.hermes-bench-work { min-width: 0; }
+.hermes-bench .hermes-lane-title { margin-bottom: 18px; }
+
+.hermes-floor-empty {
+  border: 1px dashed var(--border, #2a3440);
+  border-radius: 10px;
+  padding: 26px 18px;
+  text-align: center;
+  color: var(--muted-fg, #8a98a8);
+  font-size: 0.86rem;
+}
+
+.hermes-floor-settled { margin-top: 26px; opacity: 0.72; }
+.hermes-floor-settled:hover,
+.hermes-floor-settled:focus-within { opacity: 1; }
+
+.hermes-floor-bases {
+  border-right: 1px solid color-mix(in srgb, var(--border, #2a3440) 60%, transparent);
+  padding-right: 18px;
+}
+@media (max-width: 900px) {
+  .hermes-floor-bases {
+    border-right: 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--border, #2a3440) 60%, transparent);
+    padding: 0 0 18px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+  }
+}
+
+/* ---- names under the figures ----------------------------------------- */
+
+.hermes-floor-chips {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px 6px;
+}
+
+.hermes-floor-resident {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+}
+
+.hermes-floor-resident-name {
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.55rem;
+  color: var(--muted-fg, #8a98a8);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hermes-floor-resident.is-out .hermes-floor-resident-name {
+  color: var(--fg, #dae3ed);
+}
+
+/* ---- the shelf -------------------------------------------------------- */
+
+.hermes-shelf { margin-bottom: 26px; }
+
+.hermes-shelf-rack {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 8px;
+}
+
+/* Cards resting on a shelf: a thin top edge in the work's colour, so the
+ * queue reads as the same material as the benches it feeds. */
+.hermes-shelf-card {
+  border: 1px solid var(--border, #2a3440);
+  border-top: 2px solid var(--lane-hue, #4a5a6a);
+  border-radius: 3px 3px 7px 7px;
+  padding: 8px 10px 9px;
+  background: var(--card-bg, rgba(255, 255, 255, 0.02));
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.hermes-shelf-card.is-stalled { border-color: color-mix(in srgb, #e0645f 40%, var(--border, #2a3440)); }
+
+.hermes-shelf-kind {
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.55rem;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--lane-hue, #8a98a8);
+}
+
+.hermes-shelf-title {
+  font-size: 0.78rem;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.hermes-shelf-wait {
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.56rem;
+  color: var(--muted-fg, #8a98a8);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hermes-shelf-more {
+  font-size: 0.72rem;
+  color: var(--muted-fg, #8a98a8);
+  margin: 8px 0 0;
+}
+
+/* ---- the live bubble -------------------------------------------------- */
+
+.hermes-bench-who { position: relative; }
+
+.hermes-bubble {
+  position: relative;
+  width: 100%;
+  border: 1px solid var(--border, #2a3440);
+  border-radius: 8px;
+  padding: 8px 10px 9px;
+  margin-bottom: 12px;
+  background: var(--card-bg, rgba(255, 255, 255, 0.03));
+  text-align: left;
+}
+
+.hermes-bubble.is-live { border-color: color-mix(in srgb, #4fd1c5 42%, var(--border, #2a3440)); }
+.hermes-bubble.is-quiet { opacity: 0.78; }
+
+.hermes-bubble-tail {
+  position: absolute;
+  bottom: -5px;
+  left: 18px;
+  width: 8px;
+  height: 8px;
+  transform: rotate(45deg);
+  background: var(--card-bg, rgba(255, 255, 255, 0.03));
+  border-right: 1px solid var(--border, #2a3440);
+  border-bottom: 1px solid var(--border, #2a3440);
+}
+.hermes-bubble.is-live .hermes-bubble-tail {
+  border-color: color-mix(in srgb, #4fd1c5 42%, var(--border, #2a3440));
+}
+
+.hermes-bubble-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.hermes-bubble-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted-fg, #8a98a8);
+  flex: none;
+}
+
+/* The pulse only animates while the heartbeat is fresh. A stale beat that
+ * kept blinking would be the screen claiming output that stopped. */
+.hermes-bubble-dot.is-beating {
+  background: #4fd1c5;
+  animation: hermes-bubble-beat 1.6s ease-in-out infinite;
+}
+
+@keyframes hermes-bubble-beat {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(79, 209, 197, 0.55); }
+  50% { box-shadow: 0 0 0 5px rgba(79, 209, 197, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hermes-bubble-dot.is-beating { animation: none; }
+}
+
+.hermes-bubble-state {
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.56rem;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted-fg, #8a98a8);
+}
+.hermes-bubble.is-live .hermes-bubble-state { color: #4fd1c5; }
+
+.hermes-bubble-note {
+  font-size: 0.74rem;
+  line-height: 1.45;
+  margin: 0 0 4px;
+}
+
+.hermes-bubble-meter {
+  font-family: var(--hermes-kanban-mono);
+  font-size: 0.58rem;
+  color: var(--muted-fg, #8a98a8);
+  font-variant-numeric: tabular-nums;
+  margin: 0;
+}
+
+.hermes-bench-note {
+  font-size: 0.8rem;
+  color: var(--muted-fg, #8a98a8);
+  margin: 0;
+}
+
+/* The scene canvas. It scales to the panel width and keeps its aspect, so a
+ * bench never lands half off-screen on a narrow window. */
+.hermes-scene {
+  margin-top: 18px;
+  border: 1px solid var(--border, #2a3440);
+  border-radius: 10px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--bg, #0b0f14) 92%, transparent);
+}
+.hermes-scene canvas { width: 100%; height: auto; display: block; }
+
+/* A slim masthead: the tab and the board picker already say where you are,
+ * so this row carries the refresh control and nothing else that competes
+ * with the floor for height. */
+.hermes-yard-masthead.is-slim {
+  align-items: center;
+  margin-bottom: 10px;
+}
+.hermes-yard-quiet-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0;
+  color: var(--muted-fg, #8a98a8);
+}
+
+/* ---------------------------------------------------------------------------
+   The founder's queue.
+
+   Cards whose next move belongs to the reader. They hold no worker and stand
+   on no station, so the floor never showed them; this is the one panel that
+   answers "what is waiting on me". It sits above the floor because a decision
+   owed outranks a shift merely watched.
+   --------------------------------------------------------------------------- */
+
+.hermes-kanban .hermes-founder {
+  --founder-accent: #e8b04b;
+  display: flex;
+  flex-direction: column;
+  gap: var(--hermes-space-sm, 8px);
+  margin: 0 0 14px;
+}
+
+.hermes-kanban .hermes-founder-pill {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--founder-accent) 45%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--founder-accent) 10%, transparent);
+  color: inherit;
+  font-family: var(--hermes-kanban-sans);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.hermes-kanban .hermes-founder-pill:hover {
+  background: color-mix(in srgb, var(--founder-accent) 16%, transparent);
+}
+
+.hermes-kanban .hermes-founder-count {
+  min-width: 30px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--founder-accent);
+  color: #1b1408;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  text-align: center;
+}
+
+.hermes-kanban .hermes-founder-pill-text { font-weight: 550; }
+
+.hermes-kanban .hermes-founder-ready {
+  margin-left: auto;
+  opacity: 0.75;
+  font-size: 12px;
+}
+
+.hermes-kanban .hermes-founder-caret { opacity: 0.6; }
+
+.hermes-kanban .hermes-founder-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 52vh;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.hermes-kanban .hermes-founder-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+  /* The stripe is the age, not decoration: a queue is a debt. */
+  border-left: 3px solid color-mix(in srgb, currentColor 22%, transparent);
+  border-radius: 8px;
+}
+
+.hermes-kanban .hermes-founder-item.is-stale {
+  border-left-color: var(--founder-accent);
+}
+
+.hermes-kanban .hermes-founder-item-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.hermes-kanban .hermes-founder-stage { opacity: 0.8; font-weight: 600; }
+.hermes-kanban .hermes-founder-stage.is-ready-to-merge { color: var(--founder-accent); }
+
+.hermes-kanban .hermes-founder-wait {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.55;
+}
+
+.hermes-kanban .hermes-founder-title {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-family: var(--hermes-kanban-sans);
+  font-size: 13.5px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.hermes-kanban .hermes-founder-title:hover { text-decoration: underline; }
+
+.hermes-kanban .hermes-founder-question {
+  margin: 0;
+  max-width: 78ch;
+  font-size: 12.5px;
+  line-height: 1.5;
+  opacity: 0.82;
+}
+
+.hermes-kanban .hermes-founder-link {
+  align-self: flex-start;
+  font-family: var(--hermes-kanban-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--founder-accent);
+  text-decoration: none;
+}
+
+.hermes-kanban .hermes-founder-link:hover { text-decoration: underline; }
+.hermes-kanban .hermes-founder-link.is-plain {
+  color: inherit;
+  opacity: 0.55;
+}
+
+/* A card whose pull request is already merged or closed. It stays visible —
+   the backlog is real — but it must not compete with a live decision. */
+.hermes-kanban .hermes-founder-item.is-settled {
+  border-left-color: color-mix(in srgb, currentColor 14%, transparent);
+  opacity: 0.5;
+}
+
+.hermes-kanban .hermes-founder-item.is-settled .hermes-founder-stage {
+  color: inherit;
+}
+
+/* Why a card exists, beside what stage it is in. Two values and silence:
+   an unlabelled card gets no badge rather than a guessed one. */
+.hermes-kanban .hermes-intent {
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--hermes-kanban-mono);
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.hermes-kanban .hermes-intent.is-bet {
+  color: #b49af0;
+  background: color-mix(in srgb, #9b7de0 16%, transparent);
+}
+
+.hermes-kanban .hermes-intent.is-hardening {
+  color: #9aa5b1;
+  background: color-mix(in srgb, #8d97a3 14%, transparent);
+}
+
+/* Completed volume behind the two rate bars.
+   It is a backdrop rather than a third bar because it answers a different
+   question on a different scale: the rates say how well the work went, this
+   says whether there was any. A short backdrop under short bars is a quiet
+   window, not a healthy one — which is the failure mode a rate-only chart
+   silently rewards. */
+.hermes-agency-health-bars {
+  position: relative;
+}
+
+.hermes-agency-health-bars i.is-volume {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  z-index: 0;
+  width: 78%;
+  transform: translateX(-50%);
+  border-radius: 0.2rem 0.2rem 0 0;
+  background: color-mix(in srgb, var(--yard-fog) 12%, transparent);
+}
+
+.hermes-agency-health-bars i.is-fault,
+.hermes-agency-health-bars i.is-intervention {
+  position: relative;
+  z-index: 1;
+}
+
+.hermes-agency-health-legend i.is-volume {
+  background: color-mix(in srgb, var(--yard-fog) 22%, transparent);
 }
