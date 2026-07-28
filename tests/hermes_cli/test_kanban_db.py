@@ -89,6 +89,50 @@ def test_create_accepts_machine_enforced_lifecycle_receipt(kanban_home):
     assert task_id
 
 
+def test_implementation_cannot_complete_with_an_incomplete_receipt(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="bounded implementation",
+            body=(
+                "task_class: implementation\n"
+                "required_receipt: phosphene-implementation/v1\n"
+            ),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="must use kanban_block",
+        ):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="Budget ended before the UI and tests were finished.",
+                metadata={
+                    "handoff_version": "phosphene-implementation/v1",
+                    "outcome": "INCOMPLETE_BUDGET_EXHAUSTED",
+                },
+            )
+
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Budget ended before the UI and tests were finished.",
+            kind="transient",
+            metadata={
+                "handoff_version": "phosphene-implementation/v1",
+                "outcome": "INCOMPLETE_BUDGET_EXHAUSTED",
+                "next_owner": "builder",
+                "reopen_condition": "Resume the same card with a fresh budget.",
+            },
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.block_kind == "transient"
+
+
 def test_init_creates_expected_tables(kanban_home):
     with kb.connect() as conn:
         rows = conn.execute(

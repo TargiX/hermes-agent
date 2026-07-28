@@ -5918,6 +5918,14 @@ def validate_declared_handoff(
         if issues:
             return "declared implementation receipt is incomplete: " + "; ".join(issues)
 
+    if receipt.endswith("-implementation/v1") and action == "complete":
+        return (
+            "declared implementation lifecycle cannot complete directly; "
+            "review-ready work must use kanban_block(kind='review_required') "
+            "with its frozen artifact receipt, and incomplete work must use "
+            "kanban_block with an explicit reopen condition"
+        )
+
     if (
         receipt == "phosphene-implementation/v1"
         and action == "block"
@@ -5927,11 +5935,31 @@ def validate_declared_handoff(
         if payload.get("handoff_version") != receipt:
             issues.append(f"metadata.handoff_version must equal {receipt!r}")
         outcome = str(payload.get("outcome") or "").upper()
-        if outcome not in {"COLLISION", "SCOPE_FALSIFIED"}:
+        incomplete_outcomes = {
+            "INCOMPLETE_BUDGET_EXHAUSTED",
+            "INCOMPLETE_CLOSEOUT_REQUIRED",
+        }
+        if outcome not in {
+            "COLLISION",
+            "SCOPE_FALSIFIED",
+            *incomplete_outcomes,
+        }:
             issues.append(
-                "metadata.outcome must be COLLISION or SCOPE_FALSIFIED for a "
-                "non-review implementation block"
+                "metadata.outcome must be COLLISION, SCOPE_FALSIFIED, or an "
+                "explicit INCOMPLETE_* continuation for a non-review "
+                "implementation block"
             )
+        if outcome in incomplete_outcomes:
+            if not str(payload.get("reopen_condition") or "").strip():
+                issues.append(
+                    "metadata.reopen_condition is required for an incomplete "
+                    "implementation block"
+                )
+            if not str(payload.get("next_owner") or "").strip():
+                issues.append(
+                    "metadata.next_owner is required for an incomplete "
+                    "implementation block"
+                )
         collision_kind = str(payload.get("collision_kind") or "")
         if outcome == "COLLISION" and "open_pr" in collision_kind:
             proof = payload.get("current_base_manifest_verification")
