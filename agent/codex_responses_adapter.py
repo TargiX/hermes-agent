@@ -233,6 +233,27 @@ def _normalize_responses_call_id(raw_call_id: str) -> str:
     prefix_length = _MAX_RESPONSES_CALL_ID_LENGTH - len(digest) - 1
     return f"{call_id[:prefix_length]}_{digest}"
 
+def _clamp_responses_call_id(call_id: str) -> str:
+    """Keep a ``call_id`` within the Responses API's 64-char limit (#73492).
+
+    The codex app-server namespaces MCP tool call ids as
+    ``codex_mcp__<server>__<tool>_<codex_call_id>``; with an ``exec-<uuid>``
+    component the built-in ``hermes-tools`` server already overflows 64 chars,
+    and the Responses API rejects the whole payload with a non-retryable HTTP
+    400 that then replays every turn — permanently bricking the session.
+
+    Sibling defect to #10788 (which clamped ``input[*].id``), applied here to
+    ``call_id``. The surrogate is a pure, deterministic function of the
+    original, so the ``function_call`` and its matching ``function_call_output``
+    — which carry the same original id — map to the same surrogate and stay
+    paired without correlating the two items. Short ids pass through unchanged,
+    preserving prompt-cache prefixes.
+    """
+    if len(call_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
+        return call_id
+    digest = hashlib.sha256(call_id.encode("utf-8", errors="replace")).hexdigest()[:32]
+    return f"call_{digest}"
+
 
 def _split_responses_tool_id(raw_id: Any) -> tuple[Optional[str], Optional[str]]:
     """Split a stored tool id into (call_id, response_item_id)."""
@@ -578,7 +599,7 @@ def _chat_messages_to_responses_input(
                             else:
                                 _raw_args = str(fn.get("arguments", "{}"))
                                 call_id = _deterministic_call_id(fn_name, _raw_args, len(items))
-                        call_id = _normalize_responses_call_id(call_id)
+                        call_id = _clamp_responses_call_id(_normalize_responses_call_id(call_id))
 
                         arguments = fn.get("arguments", "{}")
                         if isinstance(arguments, dict):
@@ -633,7 +654,7 @@ def _chat_messages_to_responses_input(
 
             items.append({
                 "type": "function_call_output",
-                "call_id": call_id,
+                "call_id": _clamp_responses_call_id(call_id),
                 "output": output_value,
             })
 

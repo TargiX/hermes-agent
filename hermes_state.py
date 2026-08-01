@@ -749,6 +749,76 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
         return None
 
 
+def preflight_db_writability(
+    db_path: Path,
+    *,
+    db_label: str = "state.db",
+) -> None:
+    """Repair or reject read-only database files before opening SQLite.
+
+    Hermes-owned files are repaired in place; paths outside ``HERMES_HOME``
+    fail with an actionable error. WAL sidecars are never deleted because
+    they may contain committed transactions waiting for a checkpoint.
+    """
+    raw = str(db_path)
+    if raw == ":memory:" or raw.startswith("file:"):
+        return
+
+    try:
+        home: Optional[Path] = Path(get_hermes_home()).resolve()
+    except Exception:  # pragma: no cover - defensive
+        home = None
+
+    def _in_repair_scope(path: Path) -> bool:
+        if home is None:
+            return False
+        try:
+            return path.resolve().is_relative_to(home)
+        except (OSError, ValueError):
+            return False
+
+    def _ensure_writable(path: Path, *, is_dir: bool = False) -> None:
+        import stat as _stat
+
+        if os.access(path, os.R_OK | os.W_OK):
+            return
+        if _in_repair_scope(path):
+            try:
+                add = _stat.S_IRUSR | _stat.S_IWUSR
+                if is_dir:
+                    add |= _stat.S_IXUSR
+                os.chmod(path, path.stat().st_mode | add)
+            except OSError:
+                pass
+            if os.access(path, os.R_OK | os.W_OK):
+                logger.info(
+                    "%s preflight: repaired read-only %s (chmod u+rw%s)",
+                    db_label,
+                    path,
+                    "x" if is_dir else "",
+                )
+                return
+        kind = "directory" if is_dir else "file"
+        wal_note = (
+            " Do NOT delete the -wal file — it may contain committed data."
+            if path.name.endswith("-wal")
+            else ""
+        )
+        raise sqlite3.OperationalError(
+            f"{db_label} is not writable: {kind} {path} is read-only for this "
+            f"user. Fix with: chmod u+rw{'x' if is_dir else ''} '{path}'"
+            f" (files owned by another user may need sudo/chown).{wal_note}"
+        )
+
+    parent = db_path.parent
+    if parent.is_dir():
+        _ensure_writable(parent, is_dir=True)
+    for suffix in ("", "-wal", "-shm"):
+        path = db_path.with_name(db_path.name + suffix) if suffix else db_path
+        if path.is_file():
+            _ensure_writable(path)
+
+
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
@@ -1804,6 +1874,10 @@ class SessionDB:
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Repair-or-refuse read-only state DB files before the first
+            # connection opens, matching the kanban DB preflight contract.
+            preflight_db_writability(self.db_path, db_label="state.db")
 
             # #68474: zeroed state.db (size>0, all-NUL header) used to fail as a
             # generic "file is not a database" with no recovery path. Quarantine

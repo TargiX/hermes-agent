@@ -597,6 +597,19 @@ def host_mandated_api_mode(base_url: str = "") -> Optional[str]:
     return None
 
 
+def nous_api_mode(model: str = "") -> str:
+    """Resolve the wire protocol for a Nous Portal model.
+
+    Nous serves its ``anthropic/*`` catalog on a native Anthropic Messages
+    route, while the rest of the portal remains on the OpenAI-compatible
+    chat-completions route.  Keep the model-sensitive decision in the shared
+    provider module so delegation and gateway routing use the same contract.
+    """
+    if str(model or "").strip().lower().startswith("anthropic/"):
+        return "anthropic_messages"
+    return "chat_completions"
+
+
 def determine_api_mode(provider: str, base_url: str = "") -> str:
     """Determine the API mode (wire protocol) for a provider/endpoint.
 

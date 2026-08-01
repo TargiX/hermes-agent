@@ -70,6 +70,30 @@ def is_intentional_silence_response(response: Any) -> bool:
     return any(candidate in LIVE_GATEWAY_SILENT_MARKERS for candidate in _canonical_silence_candidates(stripped))
 
 
+def is_autonomous_silence_response(response: Any) -> bool:
+    """Loose silence matcher for autonomous lanes (cron, webhook).
+
+    Autonomous lanes may emit a marker on its own line or as a bracketed
+    prefix with a short explanation. A marker buried in ordinary prose is
+    still delivered.
+    """
+    if not isinstance(response, str):
+        return False
+    stripped = response.strip()
+    if not stripped:
+        return False
+
+    def _is_token(line: str) -> bool:
+        return _canonical_silence_candidate(line) in LIVE_GATEWAY_SILENT_MARKERS
+
+    if _is_token(stripped):
+        return True
+    lines = [ln for ln in stripped.splitlines() if ln.strip()]
+    if lines and (_is_token(lines[0]) or _is_token(lines[-1])):
+        return True
+    return stripped.upper().startswith("[SILENT]")
+
+
 def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
     """Silence markers suppress delivery only for successful agent turns."""
     if not isinstance(agent_result, dict):
