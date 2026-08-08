@@ -85,7 +85,7 @@ import threading
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -122,7 +122,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "review"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -4878,6 +4878,7 @@ def complete_task(
     # tiny dedicated txn, then raise. The caller is responsible for
     # surfacing HallucinatedCardsError to the worker; this function
     # never mutates task state on a phantom-card rejection.
+    created_cards = list(created_cards or ())
     if created_cards:
         verified_cards, phantom_cards = _verify_created_cards(
             conn, task_id, created_cards
@@ -4900,10 +4901,30 @@ def complete_task(
     else:
         verified_cards = []
 
-    metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
-    )
+    from hermes_cli.middleware import apply_kanban_transition_middleware
+
     with write_txn(conn):
+        task_snapshot = get_task(conn, task_id)
+        if task_snapshot is not None:
+            proposal = apply_kanban_transition_middleware(
+                "complete",
+                {
+                    "result": result,
+                    "summary": summary,
+                    "metadata": metadata,
+                    "created_cards": created_cards,
+                    "expected_run_id": expected_run_id,
+                },
+                task=asdict(task_snapshot),
+                board=get_current_board(),
+            ).payload
+            result = proposal.get("result")
+            summary = proposal.get("summary")
+            metadata = proposal.get("metadata")
+
+        metadata = _merge_completion_prose_artifacts(
+            conn, task_id, metadata, summary=summary, result=result,
+        )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5621,6 +5642,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -5654,8 +5676,33 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    from hermes_cli.middleware import apply_kanban_transition_middleware
+
     recurrences = 0
     with write_txn(conn):
+        task_snapshot = get_task(conn, task_id)
+        transition_assignee = None
+        if task_snapshot is not None:
+            proposal = apply_kanban_transition_middleware(
+                "block",
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "metadata": metadata,
+                    "expected_run_id": expected_run_id,
+                    "assignee": None,
+                },
+                task=asdict(task_snapshot),
+                board=get_current_board(),
+            ).payload
+            reason = proposal.get("reason")
+            kind = proposal.get("kind")
+            metadata = proposal.get("metadata")
+            transition_assignee = proposal.get("assignee")
+            if kind is not None and kind not in VALID_BLOCK_KINDS:
+                raise ValueError(
+                    f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
+                )
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -5670,11 +5717,57 @@ def block_task(
             else 0
         )
 
+        # A review handoff is a non-terminal pause, not a failure. Route it to
+        # the first-class review column so the review dispatcher can claim it.
+        if kind == "review":
+            reviewer = _canonical_assignee(transition_assignee)
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'review',
+                       assignee      = COALESCE(?, assignee),
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL,
+                       block_kind    = NULL
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                (reviewer, task_id) if expected_run_id is None
+                else (reviewer, task_id, int(expected_run_id)),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn, task_id,
+                outcome="review_required", status="review",
+                summary=reason,
+                metadata=metadata,
+            )
+            if run_id is None and reason:
+                run_id = _synthesize_ended_run(
+                    conn, task_id, outcome="review_required", summary=reason,
+                    metadata=metadata,
+                )
+            _append_event(
+                conn, task_id, "review_requested",
+                {"reason": reason, "assignee": reviewer}, run_id=run_id,
+            )
+            _blocked_task = get_task(conn, task_id)
+            _fire_kanban_lifecycle_hook(
+                "kanban_task_blocked",
+                task_id,
+                board=get_current_board(),
+                assignee=_blocked_task.assignee if _blocked_task else None,
+                run_id=run_id,
+                reason=reason,
+            )
+            return True
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
-        if kind == "dependency":
+        elif kind == "dependency":
             cur = conn.execute(
                 """
                 UPDATE tasks

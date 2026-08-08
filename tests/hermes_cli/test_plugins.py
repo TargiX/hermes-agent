@@ -264,6 +264,7 @@ class TestPluginDiscovery:
 
         assert "llm_request" in VALID_MIDDLEWARE
         assert "tool_request" in VALID_MIDDLEWARE
+        assert "kanban_transition" in VALID_MIDDLEWARE
         assert set(mgr._plugins["mw_plugin"].middleware_registered) == {"llm_request", "tool_request"}
         assert mgr.invoke_middleware("llm_request", request={"messages": []}) == [
             {"request": {"messages": [], "mw": True}}

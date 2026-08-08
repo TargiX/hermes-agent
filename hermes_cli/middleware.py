@@ -21,6 +21,7 @@ TOOL_REQUEST_MIDDLEWARE = "tool_request"
 TOOL_EXECUTION_MIDDLEWARE = "tool_execution"
 LLM_REQUEST_MIDDLEWARE = "llm_request"
 LLM_EXECUTION_MIDDLEWARE = "llm_execution"
+KANBAN_TRANSITION_MIDDLEWARE = "kanban_transition"
 
 # Back-compat aliases for older PoC branches that used API terminology.
 API_REQUEST_MIDDLEWARE = LLM_REQUEST_MIDDLEWARE
@@ -31,6 +32,7 @@ VALID_MIDDLEWARE: set[str] = {
     TOOL_EXECUTION_MIDDLEWARE,
     LLM_REQUEST_MIDDLEWARE,
     LLM_EXECUTION_MIDDLEWARE,
+    KANBAN_TRANSITION_MIDDLEWARE,
 }
 
 
@@ -42,6 +44,15 @@ class RequestMiddlewareResult:
     original_payload: Any
     changed: bool = False
     trace: List[Dict[str, Any]] = field(default_factory=list)
+
+
+class KanbanTransitionDenied(PermissionError):
+    """Raised when policy middleware rejects a Kanban state transition."""
+
+    def __init__(self, reason: str, *, source: str = "plugin") -> None:
+        self.reason = reason
+        self.source = source
+        super().__init__(f"Kanban transition denied by {source}: {reason}")
 
 
 def observer_payload(**kwargs: Any) -> Dict[str, Any]:
@@ -171,6 +182,61 @@ def apply_tool_request_middleware(
     return RequestMiddlewareResult(
         payload=current_args,
         original_payload=original_args,
+        changed=bool(trace),
+        trace=trace,
+    )
+
+
+def apply_kanban_transition_middleware(
+    transition: str,
+    payload: Dict[str, Any],
+    *,
+    task: Dict[str, Any],
+    **context: Any,
+) -> RequestMiddlewareResult:
+    """Apply policy before a Kanban mutation becomes durable.
+
+    Callbacks receive ``transition``, a JSON-shaped ``task`` snapshot, and
+    the proposed ``payload``. They may return ``{"payload": {...}}`` to
+    normalize the proposal or ``{"decision": "deny", "reason": "..."}``
+    to reject it. Policy callbacks must be fast and side-effect free: Kanban
+    callers invoke this while holding the write transaction immediately before
+    the state mutation.
+    """
+    if not _has_middleware(KANBAN_TRANSITION_MIDDLEWARE):
+        return RequestMiddlewareResult(
+            payload=payload,
+            original_payload=payload,
+            changed=False,
+            trace=[],
+        )
+
+    original_payload = _safe_copy(payload)
+    current_payload = _safe_copy(original_payload)
+    trace: List[Dict[str, Any]] = []
+    for result in _invoke_middleware(
+        KANBAN_TRANSITION_MIDDLEWARE,
+        transition=transition,
+        task=_safe_copy(task),
+        payload=current_payload,
+        original_payload=original_payload,
+        **context,
+    ):
+        if not isinstance(result, dict):
+            continue
+        decision = str(result.get("decision") or "").strip().lower()
+        if decision in {"deny", "reject", "block"}:
+            reason = str(result.get("reason") or "policy rejected transition").strip()
+            source = str(result.get("source") or "plugin").strip()
+            raise KanbanTransitionDenied(reason, source=source)
+        next_payload = result.get("payload")
+        if isinstance(next_payload, dict):
+            current_payload = _safe_copy(next_payload)
+            trace.append(_trace_entry(result))
+
+    return RequestMiddlewareResult(
+        payload=current_payload,
+        original_payload=original_payload,
         changed=bool(trace),
         trace=trace,
     )
