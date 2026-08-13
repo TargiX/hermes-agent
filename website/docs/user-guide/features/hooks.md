@@ -441,6 +441,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `post_tool_call` | Observer | After blocked, error, or successful result; return ignored. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace` | Result/error text may contain arbitrary tool or user content and secrets. |
 | `transform_tool_result` | Transform | After `post_tool_call`, before conversation append; first string replaces the result. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Exposes the full model-bound result and arguments. |
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
+| `pre_transcription` | Transform | Fired by the STT dispatcher after provider resolution and before any backend (built-in, command-type, or plugin-registered) is invoked; dict results are applied in registration order, last-writer-wins per field (`prompt`, `language`, `model`; `file_path` is read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | The final prompt is uploaded to the configured STT provider with the audio — keep secrets out of hook returns. |
 | `pre_llm_call` | Directive/control | Once per turn before the loop; all valid string/`{"context": ...}` returns are joined and injected into the user message. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | Full user message and conversation history. |
 | `post_llm_call` | Observer | Successful, non-interrupted turn finalization; return ignored. | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform` | Full prompt, response, and history. |
 | `transform_llm_output` | Transform | Before `post_llm_call` and final delivery; first non-empty string replaces the response. | `response_text`, `session_id`, `model`, `platform` | Full final assistant text. |
@@ -461,6 +462,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `subagent_stop` | Observer | Child exit; return ignored. | `parent_session_id`, `parent_turn_id`, `child_session_id`, `child_role`, `child_summary`, `child_status`, `tool_call_history`, `duration_ms` | Summary and redacted tool-history metadata may reveal project structure. |
 | `pre_gateway_dispatch` | Directive/control | Incoming non-internal message before auth/pairing/dispatch; first valid `skip`, `rewrite`, or `allow` controls flow. | `event`, `gateway`, `session_store` | Extremely privileged in-process objects expose inbound user/routing data and host handles. |
 | `gateway_platform_event` | Observer | After the gateway's profile-scoped authorization succeeds, when a supported platform-native event is normalized at the gateway boundary (Telegram reactions currently); return ignored. | `platform`, `event_type`, `payload` (reactions: `emojis`, `custom_emoji_ids`, `chat_id`, `message_id`, `thread_id`) | Normalized plain-dict envelope only; raw SDK objects, adapter handles, and bot clients are never exposed. |
+| `pre_command` | Observer | Recognized slash command about to be dispatched, before the handler runs, on CLI and gateway cold-path dispatch; return ignored in v1 (directive-shaped dicts are logged at debug). Gateway running-agent intercept commands (`/stop`, `/approve` during an active run) are deliberately excluded — control-plane escape hatches must stay outside plugin reach. | `surface` (`"cli"` \| `"gateway"`), `command` (canonical name), `alias_used`, `args_raw`, `session_key`, `platform` | `args_raw` may contain user content or secrets typed after the command. |
 | `pre_approval_request` | Observer | Before prompted or smart approval; return ignored. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id` | Command may contain secrets; smart observer preparation force-redacts, but surfaces do not all have identical redaction. |
 | `post_approval_response` | Observer | After a decision, timeout, or gateway notification failure; return ignored. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id`, `choice`; smart path may add `decided_by` | Same command sensitivity plus decision metadata. |
 | `kanban_task_claimed` | Observer | After claim commit, in dispatcher process before worker spawn; return ignored. | `task_id`, `profile_name`, `board`, `assignee`, `run_id` | Board/task/profile/assignee identifiers. |
@@ -1299,6 +1301,53 @@ def log_decision(command, choice, session_key, **kwargs):
 def register(ctx):
     ctx.register_hook("post_approval_response", log_decision)
 ```
+
+---
+
+### `pre_transcription`
+
+Fires inside the STT dispatcher (`tools.transcription_tools.transcribe_audio`) **after** the provider has been resolved and **before** any backend is invoked, whether that backend is built-in, a `type: command` provider, or a plugin-registered provider. Lets a plugin steer the transcription request itself instead of only observing the transcript afterwards.
+
+**Callback signature:**
+
+```python
+def my_callback(
+    file_path: str,
+    provider: str,
+    model: str | None,
+    language: str | None,
+    prompt: str | None,
+    source: str | None,
+    **kwargs,
+) -> dict | None:
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `file_path` | `str` | Absolute path to the audio file about to be transcribed. Read-only. |
+| `provider` | `str` | Resolved STT provider (`local`, `groq`, `openai`, `mistral`, `xai`, `elevenlabs`, `deepinfra`, `local_command`, a command provider name, or a plugin provider name). |
+| `model` | `str \| None` | Model resolved so far, or `None` when the backend default applies. |
+| `language` | `str \| None` | Language from the provider's config section, or `None`. |
+| `prompt` | `str \| None` | The static [`stt.prompt`](/user-guide/configuration#transcription-prompt-vocabulary-hints) value, or `None`. |
+| `source` | `str \| None` | Caller surface label (`gateway`, `voice_mode`, …). Observability only, not used for dispatch. |
+
+**Return value:** a `dict` with any of `"prompt"`, `"language"`, `"model"` mapped to strings, or `None` to leave the request unchanged. Non-string values, unknown keys, and `file_path` are ignored (`file_path` attempts are logged as a warning). Results are applied in **registration order, last-writer-wins per field**, on top of the `stt.prompt` config value. Returning `""` for `prompt` clears the configured prompt for that request.
+
+**Use cases:** Inject a per-user or per-chat vocabulary list before the audio is uploaded, force `language` from the caller's locale, downgrade `model` for long recordings, route noisy sources to a different model.
+
+```python
+VOCAB = "Hermes, Teknium, Nous Research, kanban"
+
+def add_vocab(provider, prompt, source, **kwargs):
+    if source != "gateway":
+        return None
+    return {"prompt": f"{prompt}. {VOCAB}" if prompt else VOCAB}
+
+def register(ctx):
+    ctx.register_hook("pre_transcription", add_vocab)
+```
+
+Not every backend accepts a prompt. `local` maps it to faster-whisper's `initial_prompt`; `openai`, `groq`, `mistral`, and `deepinfra` send it as `prompt`; `xai`, `elevenlabs`, `local_command`, and `type: command` providers log at DEBUG and transcribe without it. See the [provider support table](/user-guide/configuration#transcription-prompt-vocabulary-hints) for the full matrix and the privacy boundary. Hook-plumbing errors are fail-open: the dispatch continues with the unmodified request.
 
 ---
 
