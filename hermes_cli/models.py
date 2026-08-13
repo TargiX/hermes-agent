@@ -69,7 +69,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("google/gemini-3.1-pro-preview",          ""),
     ("google/gemini-3.6-flash",                ""),
     # xAI
-    ("x-ai/grok-4.5",                          ""),
+    ("x-ai/grok-4.6",                          ""),
     # DeepSeek
     ("deepseek/deepseek-v4-pro",               ""),
     ("deepseek/deepseek-v4-flash",             ""),
@@ -155,6 +155,7 @@ def _codex_curated_models() -> list[str]:
 #  grok-4-1-fast{,-reasoning,-non-reasoning}, grok-code-fast-1 → grok-4.3).
 _XAI_STATIC_FALLBACK: list[str] = [
     "grok-build-0.1",
+    "grok-4.6",
     "grok-4.5",
     "grok-4.3",
     "grok-4.20-0309-reasoning",
@@ -164,6 +165,7 @@ _XAI_STATIC_FALLBACK: list[str] = [
 
 # Callable via xAI OAuth but omitted from models.dev and /v1/models listings.
 _XAI_CURATED_EXTRAS: list[str] = [
+    "grok-4.6",  # GA 2026-08 — kept until the models.dev disk cache refreshes
     "grok-4.5",  # GA 2026-07 — kept until the models.dev disk cache refreshes
     "grok-composer-2.5-fast",
 ]
@@ -241,7 +243,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "google/gemini-3.1-pro-preview",
         "google/gemini-3.6-flash",
         # xAI
-        "x-ai/grok-4.5",
+        "x-ai/grok-4.6",
         # DeepSeek
         "deepseek/deepseek-v4-pro",
         "deepseek/deepseek-v4-flash",
@@ -1695,6 +1697,43 @@ def ai_gateway_model_ids(*, force_refresh: bool = False) -> list[str]:
 # Cache: maps model_id → {"prompt": str, "completion": str} per endpoint
 _pricing_cache: dict[str, dict[str, dict[str, str]]] = {}
 
+# A failed fetch caches its empty result too, so an unreachable endpoint isn't
+# re-dialed on every call — but only until this deadline. Cached forever, one
+# bad moment (a blip during startup, a key that hadn't been written yet) turns
+# into no live model discovery for the life of the process, and the processes
+# that read this most are the ones that run for weeks: the gateway, the desktop
+# backend. Every caller falls back to a curated list meanwhile, so the cost of
+# the stale entry is silent and invisible.
+_FAILED_CATALOG_TTL_SECONDS = 120.0
+_pricing_cache_retry_after: dict[str, float] = {}
+
+
+def _cached_catalog(cache_key: str) -> Optional[dict[str, dict[str, Any]]]:
+    """The cached catalog for *cache_key*, or None to go fetch it."""
+    cached = _pricing_cache.get(cache_key)
+    if cached is None:
+        return None
+    retry_after = _pricing_cache_retry_after.get(cache_key)
+    if retry_after is not None and time.monotonic() >= retry_after:
+        _pricing_cache.pop(cache_key, None)
+        _pricing_cache_retry_after.pop(cache_key, None)
+        return None
+    return cached
+
+
+def _cache_catalog(
+    cache_key: str, result: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Cache a catalog result, giving an empty one an expiry."""
+    _pricing_cache[cache_key] = result
+    if result:
+        _pricing_cache_retry_after.pop(cache_key, None)
+    else:
+        _pricing_cache_retry_after[cache_key] = (
+            time.monotonic() + _FAILED_CATALOG_TTL_SECONDS
+        )
+    return result
+
 
 def _format_price_per_mtok(per_token_str: str) -> str:
     """Convert a per-token price string to a human-friendly $/Mtok string.
@@ -1831,8 +1870,10 @@ def fetch_models_with_pricing(
     ``original``.
     """
     cache_key = (base_url or "").rstrip("/")
-    if not force_refresh and cache_key in _pricing_cache:
-        return _pricing_cache[cache_key]
+    if not force_refresh:
+        cached = _cached_catalog(cache_key)
+        if cached is not None:
+            return cached
 
     url = cache_key + "/v1/models"
     headers: dict[str, str] = {
@@ -1847,8 +1888,7 @@ def fetch_models_with_pricing(
         with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode())
     except Exception:
-        _pricing_cache[cache_key] = {}
-        return {}
+        return _cache_catalog(cache_key, {})
 
     result: dict[str, dict[str, Any]] = {}
     for item in payload.get("data", []):
@@ -1881,8 +1921,7 @@ def fetch_models_with_pricing(
                         entry["original"] = orig_entry
             result[mid] = entry
 
-    _pricing_cache[cache_key] = result
-    return result
+    return _cache_catalog(cache_key, result)
 
 
 def fetch_ai_gateway_pricing(
@@ -1899,8 +1938,10 @@ def fetch_ai_gateway_pricing(
     from hermes_constants import AI_GATEWAY_BASE_URL
 
     cache_key = AI_GATEWAY_BASE_URL.rstrip("/")
-    if not force_refresh and cache_key in _pricing_cache:
-        return _pricing_cache[cache_key]
+    if not force_refresh:
+        cached = _cached_catalog(cache_key)
+        if cached is not None:
+            return cached
 
     try:
         req = urllib.request.Request(
@@ -1910,8 +1951,7 @@ def fetch_ai_gateway_pricing(
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode())
     except Exception:
-        _pricing_cache[cache_key] = {}
-        return {}
+        return _cache_catalog(cache_key, {})
 
     result: dict[str, dict[str, str]] = {}
     for item in payload.get("data", []):
@@ -1931,8 +1971,7 @@ def fetch_ai_gateway_pricing(
             entry["input_cache_write"] = str(pricing["input_cache_write"])
         result[mid] = entry
 
-    _pricing_cache[cache_key] = result
-    return result
+    return _cache_catalog(cache_key, result)
 
 
 def _resolve_openrouter_api_key() -> str:
@@ -2039,8 +2078,10 @@ def _fireworks_pricing_from_models_dev(
     pricing formatter expects per-token strings, so divide by 1M.
     """
     cache_key = "models.dev/fireworks"
-    if not force_refresh and cache_key in _pricing_cache:
-        return _pricing_cache[cache_key]
+    if not force_refresh:
+        cached = _cached_catalog(cache_key)
+        if cached is not None:
+            return cached
 
     result: dict[str, dict[str, str]] = {}
     try:
@@ -2068,8 +2109,7 @@ def _fireworks_pricing_from_models_dev(
     except Exception:
         result = {}
 
-    _pricing_cache[cache_key] = result
-    return result
+    return _cache_catalog(cache_key, result)
 
 
 def _fetch_novita_pricing(
@@ -2093,8 +2133,10 @@ def _fetch_novita_pricing(
 
     base_url = os.getenv("NOVITA_BASE_URL", "").strip() or "https://api.novita.ai/openai/v1"
     cache_key = base_url.rstrip("/")
-    if not force_refresh and cache_key in _pricing_cache:
-        return _pricing_cache[cache_key]
+    if not force_refresh:
+        cached = _cached_catalog(cache_key)
+        if cached is not None:
+            return cached
 
     url = cache_key + "/models"
     headers = {
@@ -2108,8 +2150,7 @@ def _fetch_novita_pricing(
         with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode())
     except Exception:
-        _pricing_cache[cache_key] = {}
-        return {}
+        return _cache_catalog(cache_key, {})
 
     result: dict[str, dict[str, str]] = {}
     for item in payload.get("data", []):
@@ -2127,8 +2168,7 @@ def _fetch_novita_pricing(
             "completion": str(float(out or 0) / 10_000 / 1_000_000),
         }
 
-    _pricing_cache[cache_key] = result
-    return result
+    return _cache_catalog(cache_key, result)
 
 
 # All provider IDs and aliases that are valid for the provider:model syntax.
