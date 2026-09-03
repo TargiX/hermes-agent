@@ -251,10 +251,16 @@ def _goal_judge_available() -> bool:
     return client is not None and bool(model)
 
 
-def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
-    """Return a rejection reason when a goal-mode terminal handoff is premature."""
+def _goal_mode_handoff_rejection(task, evidence: str):
+    """Return ``(verdict, reason_or_None)`` for a goal-mode terminal handoff.
+
+    ``{"done", None}`` means the judge allows the handoff; anything else is
+    a rejection whose verdict disambiguates the guidance the caller gives
+    the worker (``continue`` = not done yet, ``blocked`` = judged
+    unachievable — see #100954).
+    """
     if not task or not task.goal_mode or not _goal_judge_available():
-        return None
+        return ("done", None)
     verdict = "done"
     reason = ""
     try:
@@ -270,7 +276,7 @@ def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
             judge_exc,
             exc_info=True,
         )
-    return reason if verdict != "done" else None
+    return (verdict, None if verdict == "done" else reason)
 
 
 # ---------------------------------------------------------------------------
@@ -752,10 +758,18 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+            gate_verdict, rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
             )
+            if gate_verdict == "blocked":
+                return tool_error(
+                    f"Goal completion rejected: judge ruled the goal "
+                    f"unachievable — {rejection}. The task will NOT complete "
+                    f"silently. Either re-scope the task with kanban_edit, "
+                    f"or record the block with kanban_block and hand the "
+                    f"decision to a human / reviewer."
+                )
             if rejection is not None:
                 return tool_error(
                     f"Goal completion rejected by judge: {rejection}. "
@@ -837,6 +851,12 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    if metadata is not None:
+        metadata_json = redact_sensitive_text(json.dumps(metadata), force=True)
+        try:
+            metadata = json.loads(metadata_json)
+        except json.JSONDecodeError:
+            return tool_error("metadata could not be safely serialized")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -943,7 +963,13 @@ def _handle_request_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
+            gate_verdict, rejection = _goal_mode_handoff_rejection(task, summary)
+            if gate_verdict == "blocked":
+                return tool_error(
+                    f"Goal review handoff rejected: judge ruled the goal "
+                    f"unachievable — {rejection}. Record the block with "
+                    f"kanban_block instead of requesting review."
+                )
             if rejection is not None:
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "
@@ -996,6 +1022,17 @@ def _handle_request_changes(args: dict, **kw) -> str:
     if not reason or not str(reason).strip():
         return tool_error("reason is required — describe the changes needed")
     reason = redact_sensitive_text(str(reason), force=True)
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error(
+            f"metadata must be an object/dict, got {type(metadata).__name__}"
+        )
+    if metadata is not None:
+        metadata_json = redact_sensitive_text(json.dumps(metadata), force=True)
+        try:
+            metadata = json.loads(metadata_json)
+        except json.JSONDecodeError:
+            return tool_error("metadata could not be safely serialized")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1004,6 +1041,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 conn,
                 tid,
                 reason=reason,
+                metadata=metadata,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1866,8 +1904,7 @@ KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
         "Stop work on this task and route it according to WHY you're stuck. "
-        "Set ``kind`` to say which: 'review' (a structured handoff ready for "
-        "review), 'dependency' (waiting on another task — "
+        "Set ``kind`` to say which: 'dependency' (waiting on another task — "
         "goes to todo and auto-resumes when that task finishes, no human "
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
@@ -1894,10 +1931,9 @@ KANBAN_BLOCK_SCHEMA = {
             },
             "kind": {
                 "type": "string",
-                "enum": ["review", "dependency", "needs_input", "capability", "transient"],
+                "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
-                    "Why work is pausing. 'review' enters the review queue; "
-                    "'dependency' waits in todo and "
+                    "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
                 ),
@@ -1905,9 +1941,11 @@ KANBAN_BLOCK_SCHEMA = {
             "metadata": {
                 "type": "object",
                 "description": (
-                    "Optional structured transition handoff. Plugins may "
-                    "validate it atomically before the task state changes."
+                    "Optional structured blocker facts, such as attempted "
+                    "actions, observed errors, or the exact external input "
+                    "required. Plugins may validate this receipt."
                 ),
+                "additionalProperties": True,
             },
             "board": _board_schema_prop(),
         },
@@ -1985,6 +2023,14 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
                     "Specific, actionable changes the implementer must make "
                     "before requesting another review."
                 ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Optional structured review verdict. Plugins may validate "
+                    "it atomically before the task returns for rework."
+                ),
+                "additionalProperties": True,
             },
             "board": _board_schema_prop(),
         },

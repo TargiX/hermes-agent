@@ -23,7 +23,22 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-def test_transition_middleware_can_rewrite_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+def _deny_transition(monkeypatch: pytest.MonkeyPatch, reason: str) -> None:
+    monkeypatch.setattr(
+        "hermes_cli.middleware._has_middleware",
+        lambda kind: kind == "kanban_transition",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.middleware._invoke_middleware",
+        lambda _kind, **_kwargs: [
+            {"decision": "deny", "reason": reason, "source": "test"}
+        ],
+    )
+
+
+def test_transition_middleware_can_rewrite_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         "hermes_cli.middleware._has_middleware",
         lambda kind: kind == "kanban_transition",
@@ -79,19 +94,12 @@ def test_complete_task_denial_is_atomic(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "hermes_cli.middleware._has_middleware",
-        lambda kind: kind == "kanban_transition",
-    )
-    monkeypatch.setattr(
-        "hermes_cli.middleware._invoke_middleware",
-        lambda _kind, **_kwargs: [
-            {"decision": "deny", "reason": "receipt required", "source": "test"}
-        ],
-    )
+    _deny_transition(monkeypatch, "receipt required")
     conn = kb.connect()
     try:
-        task_id = kb.create_task(conn, title="guarded", body="required_receipt: test/v1")
+        task_id = kb.create_task(
+            conn, title="guarded", body="required_receipt: test/v1"
+        )
         original_status = kb.get_task(conn, task_id).status
         with pytest.raises(KanbanTransitionDenied, match="receipt required"):
             kb.complete_task(conn, task_id, summary="done", metadata={})
@@ -104,26 +112,43 @@ def test_complete_task_denial_is_atomic(
         conn.close()
 
 
+def test_request_review_denial_is_atomic(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _deny_transition(monkeypatch, "invalid handoff")
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="guarded", assignee="implementer")
+        original_status = kb.get_task(conn, task_id).status
+        with pytest.raises(KanbanTransitionDenied, match="invalid handoff"):
+            kb.request_review(conn, task_id, summary="ready")
+        assert kb.get_task(conn, task_id).status == original_status
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'review_requested'",
+            (task_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
 def test_block_task_denial_is_atomic(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "hermes_cli.middleware._has_middleware",
-        lambda kind: kind == "kanban_transition",
-    )
-    monkeypatch.setattr(
-        "hermes_cli.middleware._invoke_middleware",
-        lambda _kind, **_kwargs: [
-            {"decision": "deny", "reason": "invalid handoff", "source": "test"}
-        ],
-    )
+    _deny_transition(monkeypatch, "block receipt required")
     conn = kb.connect()
     try:
         task_id = kb.create_task(conn, title="guarded")
         original_status = kb.get_task(conn, task_id).status
-        with pytest.raises(KanbanTransitionDenied, match="invalid handoff"):
-            kb.block_task(conn, task_id, reason="review")
+        with pytest.raises(KanbanTransitionDenied, match="block receipt required"):
+            kb.block_task(
+                conn,
+                task_id,
+                reason="external input missing",
+                kind="needs_input",
+                metadata={},
+            )
         assert kb.get_task(conn, task_id).status == original_status
         assert not conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'blocked'",
@@ -133,7 +158,7 @@ def test_block_task_denial_is_atomic(
         conn.close()
 
 
-def test_review_transition_routes_to_review_column_and_reviewer(
+def test_request_review_middleware_routes_reviewer(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -145,7 +170,7 @@ def test_review_transition_routes_to_review_column_and_reviewer(
         "hermes_cli.middleware._invoke_middleware",
         lambda _kind, **kwargs: [
             {
-                "payload": {**kwargs["payload"], "assignee": "reviewer"},
+                "payload": {**kwargs["payload"], "reviewer": "reviewer"},
                 "source": "test",
             }
         ],
@@ -154,23 +179,91 @@ def test_review_transition_routes_to_review_column_and_reviewer(
     try:
         task_id = kb.create_task(conn, title="review me", assignee="implementer")
         metadata = {"handoff_version": "example/v1"}
-        assert kb.block_task(
-            conn,
-            task_id,
-            reason="ready",
-            kind="review",
-            metadata=metadata,
-        ) is True
+        assert (
+            kb.request_review(
+                conn,
+                task_id,
+                summary="ready",
+                metadata=metadata,
+            )
+            is True
+        )
         task = kb.get_task(conn, task_id)
         assert task.status == "review"
         assert task.assignee == "reviewer"
         run = kb.latest_run(conn, task_id)
         assert run is not None
         assert run.metadata == metadata
-        event = conn.execute(
-            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+    finally:
+        conn.close()
+
+
+def test_request_changes_denial_is_atomic(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="review me", assignee="implementer")
+        implementation = kb.claim_task(conn, task_id, claimer="implementer:test")
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready",
+            reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="reviewer:test")
+        assert review is not None
+        _deny_transition(monkeypatch, "review receipt required")
+        with pytest.raises(KanbanTransitionDenied, match="review receipt required"):
+            kb.request_changes(
+                conn,
+                task_id,
+                reason="fix this",
+                metadata={},
+                expected_run_id=review.current_run_id,
+            )
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"
+        assert task.current_run_id == review.current_run_id
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'",
             (task_id,),
         ).fetchone()
-        assert event["kind"] == "review_requested"
+    finally:
+        conn.close()
+
+
+def test_complete_middleware_sees_review_source_status(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[dict] = []
+    monkeypatch.setattr(
+        "hermes_cli.middleware._has_middleware",
+        lambda kind: kind == "kanban_transition",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.middleware._invoke_middleware",
+        lambda _kind, **kwargs: observed.append(kwargs["payload"]) or [],
+    )
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="review me", assignee="implementer")
+        assert kb.request_review(conn, task_id, reviewer="reviewer")
+        review = kb.claim_review_task(conn, task_id, claimer="reviewer:test")
+        assert review is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="approved",
+            expected_run_id=review.current_run_id,
+        )
+        complete_payload = next(
+            payload for payload in observed if payload.get("summary") == "approved"
+        )
+        assert complete_payload["source_status"] == "review"
     finally:
         conn.close()

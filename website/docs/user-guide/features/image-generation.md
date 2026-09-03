@@ -32,7 +32,7 @@ Prices are FAL's pricing at time of writing; check [fal.ai](https://fal.ai/) for
 :::tip Nous Subscribers
 If you have a paid [Nous Portal](https://portal.nousresearch.com) subscription, you can use image generation through the **[Tool Gateway](tool-gateway.md)** without a FAL API key. Your model selection persists across both paths. New installs can run `hermes setup --portal` to log in and turn on every gateway tool at once; existing installs can pick **Nous Subscription** as the image-gen backend via `hermes tools`.
 
-If the managed gateway returns `HTTP 4xx` for a specific model, that model isn't yet proxied on the portal side — the agent will tell you so, with remediation steps (set `FAL_KEY` for direct access, or pick a different model).
+If the managed gateway returns `HTTP 4xx` for a specific model, that model isn't yet proxied on the portal side — the agent will tell you so, with remediation steps (switch to FAL.ai in `hermes tools` with your own `FAL_KEY` for direct access, or pick a different model).
 :::
 
 ### Get a FAL API Key
@@ -62,10 +62,12 @@ Your selection is saved to `config.yaml`:
 
 ```yaml
 image_gen:
+  provider: fal                 # `nous` if you picked Nous Subscription
   model: fal-ai/flux-2/klein/9b
-  use_gateway: false            # true if using Nous Subscription
   max_parallel_requests: 4      # concurrent images in one tool-call batch
 ```
+
+`image_gen.provider` is the single selection key: `nous` routes through the managed Tool Gateway; a vendor name (`fal`, `openai`, `xai`, `krea`, ...) goes direct with your own key. The runtime always follows this stored selection — a `FAL_KEY` in `.env` is ignored while `provider: nous`, and `provider: fal` without `FAL_KEY` errors with `image_gen is configured to use fal (set via hermes tools), but FAL_KEY is not set. Run 'hermes tools' to change it.` rather than silently rerouting. Change providers via `hermes tools`, not by adding/removing keys. (The old `use_gateway` boolean is legacy — still read as `nous` when `true`, but never written anymore.)
 
 `max_parallel_requests` defaults to `4`. Hermes clamps it to at least one and
 to the global tool-worker limit, so image providers receive bounded parallel
@@ -101,6 +103,28 @@ image_gen:
 ### GPT-Image Quality
 
 The `fal-ai/gpt-image-1.5` and `fal-ai/gpt-image-2` request quality is pinned to `medium` (~$0.034–$0.06/image at 1024×1024). We don't expose the `low` / `high` tiers as a user-facing option so that Nous Portal billing stays predictable across all users — the cost spread between tiers is 3–22×. If you want a cheaper option, pick Klein 9B or Z-Image Turbo; if you want higher quality, use Nano Banana Pro or Recraft V4 Pro.
+
+### Meta Model API: Muse Image
+
+With `image_gen.provider: meta-ai`, images are generated through the
+[Meta Model API](https://api.meta.ai) (`https://api.meta.ai/v1`), the same
+OpenAI-compatible endpoint that serves the Muse Spark chat models. It is the
+image-gen companion to the bundled `meta-ai` chat provider.
+
+| Model | Speed | Strengths | Price |
+|---|---|---|---|
+| `muse-image-1.0` *(default)* | ~10s | Meta Model API image generation | $0.01/image |
+
+```yaml
+image_gen:
+  provider: meta-ai
+  model: muse-image-1.0
+```
+
+Auth reuses the same env vars as the Meta chat provider — `MODEL_API_KEY`
+(Meta's documented name), with `META_API_KEY` / `META_MODEL_API_KEY` accepted
+as aliases. Set `META_BASE_URL` to point at a proxy or alternate host. Text-to-image
+only for now; responses are saved to `$HERMES_HOME/cache/images/`.
 
 ## Usage
 
@@ -227,7 +251,7 @@ If upscaling fails (network issue, rate limit), the original image is returned a
 
 1. **Model resolution** — `_resolve_fal_model()` reads `image_gen.model` from `config.yaml`, falls back to the `FAL_IMAGE_MODEL` env var, then to `fal-ai/flux-2/klein/9b`.
 2. **Payload building** — `_build_fal_payload()` translates your `aspect_ratio` into the model's native format (preset enum, aspect-ratio enum, or GPT literal), merges the model's default params, applies any caller overrides, then filters to the model's `supports` whitelist so unsupported keys are never sent.
-3. **Submission** — `_submit_fal_request()` routes via direct FAL credentials or the managed Nous gateway.
+3. **Submission** — `_submit_fal_request()` routes via direct FAL credentials or the managed Nous gateway, according to the stored `image_gen.provider` selection.
 4. **Upscaling** — runs only when the agent passed `upscale: true`; every model's catalog default is off.
 5. **Delivery** — final image URL returned to the agent, which emits a `MEDIA:<url>` tag that platform adapters convert to native media.
 

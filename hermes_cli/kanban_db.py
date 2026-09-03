@@ -122,7 +122,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "review"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -1589,10 +1589,21 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
-    # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
-    # the PRAGMA explicitly so it is observable and survives future wrapper
-    # changes. Parameter binding is not supported for PRAGMA assignments.
-    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    try:
+        # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
+        # the PRAGMA explicitly so it is observable and survives future wrapper
+        # changes. Parameter binding is not supported for PRAGMA assignments.
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    except BaseException:
+        # A half-open connection abandoned here would leak its fd AND leave a
+        # stale entry in the connect_tracked live-connection registry (which
+        # only clears on close), permanently blocking byte-level probes of
+        # this database file. Close before re-raising.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
     return conn
 
 
@@ -5439,6 +5450,11 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        source_status = (
+            _retry_status_for_run(conn, task_id)
+            if prior_status == "running"
+            else prior_status
+        )
 
         # Plugins may admit or enrich the transition, but they do not replace
         # the core parent/review lifecycle invariants above.
@@ -5452,6 +5468,7 @@ def complete_task(
                     "metadata": metadata,
                     "created_cards": created_cards,
                     "expected_run_id": expected_run_id,
+                    "source_status": source_status,
                 },
                 task=asdict(task_snapshot),
                 board=get_current_board(),
@@ -6303,6 +6320,8 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    reason = redact_review_value(reason)
+    metadata = redact_review_value(metadata)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
@@ -6311,8 +6330,13 @@ def block_task(
 
     recurrences = 0
     with write_txn(conn):
+        cur_row = conn.execute(
+            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if cur_row is None:
+            return False
         task_snapshot = get_task(conn, task_id)
-        transition_assignee = None
         if task_snapshot is not None:
             proposal = apply_kanban_transition_middleware(
                 "block",
@@ -6321,25 +6345,17 @@ def block_task(
                     "kind": kind,
                     "metadata": metadata,
                     "expected_run_id": expected_run_id,
-                    "assignee": None,
                 },
                 task=asdict(task_snapshot),
                 board=get_current_board(),
             ).payload
-            reason = proposal.get("reason")
+            reason = redact_review_value(proposal.get("reason"))
             kind = proposal.get("kind")
-            metadata = proposal.get("metadata")
-            transition_assignee = proposal.get("assignee")
+            metadata = redact_review_value(proposal.get("metadata"))
             if kind is not None and kind not in VALID_BLOCK_KINDS:
                 raise ValueError(
                     f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
                 )
-        cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if cur_row is None:
-            return False
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
@@ -6353,57 +6369,11 @@ def block_task(
             else 0
         )
 
-        # A review handoff is a non-terminal pause, not a failure. Route it to
-        # the first-class review column so the review dispatcher can claim it.
-        if kind == "review":
-            reviewer = _canonical_assignee(transition_assignee)
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'review',
-                       assignee      = COALESCE(?, assignee),
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       block_kind    = NULL
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (reviewer, task_id) if expected_run_id is None
-                else (reviewer, task_id, int(expected_run_id)),
-            )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="review_required", status="review",
-                summary=reason,
-                metadata=metadata,
-            )
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="review_required", summary=reason,
-                    metadata=metadata,
-                )
-            _append_event(
-                conn, task_id, "review_requested",
-                {"reason": reason, "assignee": reviewer}, run_id=run_id,
-            )
-            _blocked_task = get_task(conn, task_id)
-            _fire_kanban_lifecycle_hook(
-                "kanban_task_blocked",
-                task_id,
-                board=get_current_board(),
-                assignee=_blocked_task.assignee if _blocked_task else None,
-                run_id=run_id,
-                reason=reason,
-            )
-            return True
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
-        elif kind == "dependency":
+        if kind == "dependency":
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6424,10 +6394,12 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
+                    metadata=metadata,
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
@@ -6482,10 +6454,12 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
+                    metadata=metadata,
                 )
             _append_event(
                 conn, task_id, "block_loop_detected",
@@ -6536,6 +6510,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
@@ -6544,6 +6519,7 @@ def block_task(
                     conn, task_id,
                     outcome="blocked",
                     summary=reason,
+                    metadata=metadata,
                 )
             _append_event(
                 conn, task_id, "blocked",
@@ -6619,6 +6595,8 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    from hermes_cli.middleware import apply_kanban_transition_middleware
+
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -6628,6 +6606,23 @@ def request_review(
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
+        task_snapshot = get_task(conn, task_id)
+        if task_snapshot is not None:
+            proposal = apply_kanban_transition_middleware(
+                "request_review",
+                {
+                    "summary": summary,
+                    "metadata": metadata,
+                    "reviewer": reviewer,
+                    "expected_run_id": expected_run_id,
+                    "force": force,
+                },
+                task=asdict(task_snapshot),
+                board=get_current_board(),
+            ).payload
+            summary = redact_review_value(proposal.get("summary"))
+            metadata = redact_review_value(proposal.get("metadata"))
+            reviewer = proposal.get("reviewer")
         # Refuse to clear a live worker's claim without proof of ownership
         # (expected_run_id) or an explicit human override (force=True).
         if (
@@ -6750,6 +6745,7 @@ def request_changes(
     task_id: str,
     *,
     reason: str,
+    metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
@@ -6761,8 +6757,11 @@ def request_changes(
     success or a diagnostic reason on failure.
     """
     reason = str(redact_review_value(reason or "")).strip()
+    metadata = redact_review_value(metadata)
     if not reason:
         return False, "reason is required"
+
+    from hermes_cli.middleware import apply_kanban_transition_middleware
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -6795,6 +6794,24 @@ def request_changes(
             claimed_payload = {}
         if claimed_payload.get("source_status") != "review":
             return False, "active run was not claimed from review"
+
+        task_snapshot = get_task(conn, task_id)
+        if task_snapshot is not None:
+            proposal = apply_kanban_transition_middleware(
+                "request_changes",
+                {
+                    "reason": reason,
+                    "metadata": metadata,
+                    "expected_run_id": expected_run_id,
+                    "source_status": "review",
+                },
+                task=asdict(task_snapshot),
+                board=get_current_board(),
+            ).payload
+            reason = str(redact_review_value(proposal.get("reason") or "")).strip()
+            metadata = redact_review_value(proposal.get("metadata"))
+            if not reason:
+                return False, "reason is required"
 
         requested_event = conn.execute(
             "SELECT payload FROM task_events "
@@ -6848,6 +6865,7 @@ def request_changes(
             outcome="changes_requested",
             status=new_status,
             summary=reason,
+            metadata=metadata,
         )
         _append_event(
             conn,
@@ -11770,8 +11788,8 @@ def purge_stale_done_notify_subs(
     *,
     max_age_days: int = 30,
 ) -> int:
-    """Delete notify subscriptions whose task has sat in ``done`` untouched
-    for longer than ``max_age_days``.
+    """Delete notify subscriptions whose task has sat in ``done`` or
+    ``blocked`` untouched for longer than ``max_age_days``.
 
     The notifier keeps subscriptions alive through ``done`` because a
     completed task can be reopened (review corrections, continuation) and
@@ -11780,7 +11798,10 @@ def purge_stale_done_notify_subs(
     subscription rows forever — each one scanned every notifier tick.
     This GC bounds that: a task that has been ``done`` with no new events
     for the retention window is treated as settled and its subscriptions
-    are purged. Age is measured from the task's most recent event
+    are purged. ``blocked`` tasks (circuit-breaker trips, dead workers)
+    are reaped on the same clock — they are abandoned, not idle, unlike a
+    ``backlog``/``ready`` card that is merely waiting for pickup (#100955).
+    Age is measured from the task's most recent event
     (falling back to ``completed_at`` then ``created_at``), so ANY
     activity — including a reopen, which also moves the task off
     ``done`` — resets or exempts it.
@@ -11799,7 +11820,7 @@ def purge_stale_done_notify_subs(
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id IN ("
             " SELECT t.id FROM tasks t"
-            " WHERE t.status = 'done'"
+            " WHERE t.status IN ('done', 'blocked')"
             " AND COALESCE("
             "  (SELECT MAX(e.created_at) FROM task_events e"
             "   WHERE e.task_id = t.id),"
