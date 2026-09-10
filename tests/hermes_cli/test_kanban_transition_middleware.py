@@ -25,11 +25,11 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _deny_transition(monkeypatch: pytest.MonkeyPatch, reason: str) -> None:
     monkeypatch.setattr(
-        "hermes_cli.middleware._has_middleware",
+        "hermes_cli.plugins.has_middleware",
         lambda kind: kind == "kanban_transition",
     )
     monkeypatch.setattr(
-        "hermes_cli.middleware._invoke_middleware",
+        "hermes_cli.plugins.invoke_middleware",
         lambda _kind, **_kwargs: [
             {"decision": "deny", "reason": reason, "source": "test"}
         ],
@@ -40,11 +40,11 @@ def test_transition_middleware_can_rewrite_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "hermes_cli.middleware._has_middleware",
+        "hermes_cli.plugins.has_middleware",
         lambda kind: kind == "kanban_transition",
     )
     monkeypatch.setattr(
-        "hermes_cli.middleware._invoke_middleware",
+        "hermes_cli.plugins.invoke_middleware",
         lambda _kind, **_kwargs: [
             {
                 "payload": {"metadata": {"validated": True}},
@@ -163,11 +163,11 @@ def test_request_review_middleware_routes_reviewer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "hermes_cli.middleware._has_middleware",
+        "hermes_cli.plugins.has_middleware",
         lambda kind: kind == "kanban_transition",
     )
     monkeypatch.setattr(
-        "hermes_cli.middleware._invoke_middleware",
+        "hermes_cli.plugins.invoke_middleware",
         lambda _kind, **kwargs: [
             {
                 "payload": {**kwargs["payload"], "reviewer": "reviewer"},
@@ -242,11 +242,11 @@ def test_complete_middleware_sees_review_source_status(
 ) -> None:
     observed: list[dict] = []
     monkeypatch.setattr(
-        "hermes_cli.middleware._has_middleware",
+        "hermes_cli.plugins.has_middleware",
         lambda kind: kind == "kanban_transition",
     )
     monkeypatch.setattr(
-        "hermes_cli.middleware._invoke_middleware",
+        "hermes_cli.plugins.invoke_middleware",
         lambda _kind, **kwargs: observed.append(kwargs["payload"]) or [],
     )
     conn = kb.connect()
