@@ -216,6 +216,8 @@ _SPECS = [
         _json_flag(help="Emit JSON output"),
     ], help="Create a Kanban Swarm v1 graph (parallel workers → verifier → synthesizer)"),
     _cmd("list", [
+        _arg("--no-refresh", action="store_true",
+             help="Observe stored task states without recomputing dependency readiness"),
         _arg("--mine", action="store_true", help="Filter by $HERMES_PROFILE as assignee"),
         _arg("--assignee"),
         _arg("--status", choices=sorted(kb.VALID_STATUSES)),
