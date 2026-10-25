@@ -306,6 +306,8 @@ hermes kanban watch
 
 # 5. See the board (you)
 hermes kanban list
+# Monitoring clients: observe stored states without promoting newly unblocked tasks
+hermes kanban list --json --no-refresh
 hermes kanban stats
 ```
 
